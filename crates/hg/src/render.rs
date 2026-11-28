@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, VecDeque};
 use slates_vcs::ContentStore;
 
 use crate::import::record::{kept, write_text};
-use crate::index::{HgIndex, Log, NONE};
+use crate::index::{EntryNumbers, HgIndex, Log, NONE};
 use crate::node::CollisionAttack;
 use crate::phases::PhaseHead;
 use crate::read::to_u64;
@@ -587,6 +587,9 @@ struct StoredLog {
   log: Walked,
   revisions: Vec<StoredRevision>,
   first: BTreeMap<[u8; 32], u32>,
+  /// Each revision's index entry as the gathering read it, one range walk of the log ([`HgIndex::numbers_from`]): what
+  /// its index row is written from, with no search of the index a row.
+  numbers: Vec<EntryNumbers>,
 }
 
 /// `stream_out`'s answer made a step at a time (A-745; §4.17.1 "A fetch's answer"), each revision sent as the changeset
@@ -617,6 +620,8 @@ pub struct Streaming {
   want: Option<Want>,
   /// The logs the asked rows are for, in order.
   wanted_logs: Vec<Walked>,
+  /// The index entries of each of those logs, as the gathering read them, in order.
+  wanted_numbers: Vec<Vec<EntryNumbers>>,
   /// The rows of the logs held, the one being walked first.
   held: VecDeque<StoredLog>,
   /// The number the next log given takes.
@@ -639,6 +644,9 @@ pub struct Streaming {
   sizing: Vec<u32>,
   /// The steps taken in each stage since the last [`Streaming::take_tally`], and the content store's reads during them.
   tally: StageTally,
+  /// The bytes one step's gathering may touch ([`Streaming::set_step_bytes`]); none for a stream its caller does not
+  /// size, which gathers [`rows_a_step`] rows a step as before.
+  step_bytes: Option<u64>,
   /// The base the last entry written names: for the changelog, its delta chain's start ([`CHANGELOG_HEADER`]).
   chain_base: u32,
 }
@@ -695,10 +703,20 @@ struct Gathering {
   logs: Vec<(Vec<u8>, Vec<Node>)>,
   /// Those logs as the walk names them.
   wanted: Vec<Walked>,
+  /// Each of those logs' index entries, in order.
+  numbers: Vec<Vec<EntryNumbers>>,
   /// What their rows will take.
   bytes: u64,
   /// The log being gathered, its next revision, and its nodes so far.
   at: (Walked, u32, Vec<Node>),
+  /// The index entries of the log being gathered, so far.
+  at_numbers: Vec<EntryNumbers>,
+  /// The length of the log being gathered, asked of the index once a log (a search of its runs, 10 to 20 reads of the
+  /// content store on a sealed history), not again at each step it resumes.
+  at_count: Option<u32>,
+  /// Where the log being gathered stands among the logs the count sized (the send's), whose order is the walk's: the
+  /// next log is the next sized one, with no search. None in the count, which sizes them as it goes.
+  sized_at: Option<usize>,
 }
 
 impl Default for Streaming {
@@ -708,6 +726,7 @@ impl Default for Streaming {
       counted: (0, 0),
       want: None,
       wanted_logs: Vec::new(),
+      wanted_numbers: Vec::new(),
       held: VecDeque::new(),
       next_seq: 0,
       wanted_chunks: Vec::new(),
@@ -720,6 +739,7 @@ impl Default for Streaming {
       sizing: Vec::new(),
       chain_base: 0,
       tally: StageTally::default(),
+      step_bytes: None,
     }
   }
 }
@@ -757,10 +777,12 @@ impl Streaming {
   pub fn give_rows(&mut self, rows: Vec<Vec<Option<StoredRevision>>>) {
     self.want = None;
     let wanted = core::mem::take(&mut self.wanted_logs);
+    let mut numbers = core::mem::take(&mut self.wanted_numbers).into_iter();
     if rows.len() != wanted.len() {
       self.not_served = true;
     }
     for (log, rows) in wanted.into_iter().zip(rows) {
+      let numbers = numbers.next().unwrap_or_default();
       let mut revisions = Vec::with_capacity(rows.len());
       let mut first = BTreeMap::new();
       for (rev, row) in (0_u32..).zip(rows) {
@@ -777,6 +799,7 @@ impl Streaming {
         log,
         revisions,
         first,
+        numbers,
       });
       self.next_seq = self.next_seq.saturating_add(1);
     }
@@ -836,9 +859,17 @@ impl Streaming {
       Stage::Index(log, rev, offset) => {
         self.index_entry(index, store, (log, rev, offset), admission, out)?
       }
-      Stage::Data(log, rev) => self.data_chunk(index, store, (log, rev), admission, out)?,
+      Stage::Data(log, rev) => self.data_chunk((log, rev), admission, out)?,
       Stage::Done => Stage::Done,
     })
+  }
+
+  /// Sizes each step's gathering of rows by the bytes it may touch, `bytes` (a caller's copy budget: the daemon's
+  /// `copy_slice_bytes`, the machine's measured memcpy rate over the copy share of its step quantum, as
+  /// `getbundle::Store::text_bytes_a_step` names it): a step's walk of the index stops once its reads (a content window
+  /// each) and its rows (their stored form each) reach it, or the room does, whichever first ([`gather_spent`]).
+  pub fn set_step_bytes(&mut self, bytes: u64) {
+    self.step_bytes = Some(bytes);
   }
 
   /// The steps taken in each stage since the last take, and the content store's reads during them, given back and
@@ -866,40 +897,89 @@ impl Streaming {
       self.gathering = Some(Gathering {
         logs: Vec::new(),
         wanted: Vec::new(),
+        numbers: Vec::new(),
         bytes: 0,
         at: (log.clone(), 0, Vec::new()),
+        at_numbers: Vec::new(),
+        at_count: None,
+        sized_at: self
+          .sized
+          .front()
+          .filter(|sized| sized.log == *log)
+          .map(|_| 0),
       });
     }
-    let row_bytes = to_u64(core::mem::size_of::<StoredRevision>());
+    // A held row is its stored form and its index entry.
+    let row_bytes = to_u64(
+      core::mem::size_of::<StoredRevision>().saturating_add(core::mem::size_of::<EntryNumbers>()),
+    );
     let mut budget = rows_a_step(store);
+    let (step_bytes, reads_at) = (self.step_bytes, store.reads());
+    let mut walked = 0_u64;
+    let sized = &self.sized;
     let Some(gathering) = self.gathering.as_mut() else {
       return Ok(false);
     };
     loop {
       let (at, rev, nodes) = &mut gathering.at;
-      let count = index.len(store, at.log());
+      let count = *gathering
+        .at_count
+        .get_or_insert_with(|| index.len(store, at.log()));
       if *rev == 0 {
         let cost = u64::from(count).saturating_mul(row_bytes);
         if !gathering.logs.is_empty() && gathering.bytes.saturating_add(cost) > self.room_hint {
           break;
         }
         gathering.bytes = gathering.bytes.saturating_add(cost);
+        let rows = usize::try_from(count).map_err(|_| Refused::TooLong)?;
         nodes
-          .try_reserve_exact(usize::try_from(count).map_err(|_| Refused::TooLong)?)
+          .try_reserve_exact(rows)
+          .map_err(|_| Refused::TooLong)?;
+        gathering
+          .at_numbers
+          .try_reserve_exact(rows)
           .map_err(|_| Refused::TooLong)?;
       }
+      // One range walk of the log from where the gathering stands, a row a step after its search, where a search a row
+      // read the index's runs each time (goal 93, hg's whole-history gap).
+      let mut walk = index.numbers_from(store, at.log(), *rev);
       while *rev < count {
-        if budget == 0 {
+        let spent = step_bytes.map(|bytes| {
+          gather_spent(store, (walked, store.reads().saturating_sub(reads_at))) >= bytes
+        });
+        // One row a step at least, so a budget below a row's cost still moves.
+        if walked > 0 && spent.unwrap_or(budget == 0) {
           return Ok(false);
         }
-        nodes.push(node_of(index, store, at, *rev)?);
+        let numbers = walk
+          .next()
+          .flatten()
+          .filter(|numbers| numbers.rev == *rev)
+          .ok_or_else(|| Refused::Unreadable {
+            log: unreadable_name(at),
+            rev: *rev,
+          })?;
+        nodes.push(numbers.node);
+        gathering.at_numbers.push(numbers);
         *rev = rev.saturating_add(1);
         budget = budget.saturating_sub(1);
+        walked = walked.saturating_add(1);
       }
-      let next = next_log(at, index, store);
+      let next = match gathering.sized_at {
+        Some(position) => {
+          let following = position.saturating_add(1);
+          gathering.sized_at = Some(following);
+          sized.get(following).map(|next| next.log.clone())
+        }
+        None => next_log(at, index, store),
+      };
       let done = core::mem::take(nodes);
       gathering.logs.push((at.stored_name(), done));
       gathering.wanted.push(at.clone());
+      gathering
+        .numbers
+        .push(core::mem::take(&mut gathering.at_numbers));
+      gathering.at_count = None;
       match next {
         Some(next) => gathering.at = (next, 0, Vec::new()),
         None => break,
@@ -910,6 +990,7 @@ impl Streaming {
         logs: gathering.logs,
       });
       self.wanted_logs = gathering.wanted;
+      self.wanted_numbers = gathering.numbers;
     }
     Ok(false)
   }
@@ -1093,8 +1174,14 @@ impl Streaming {
     Ok(first_log(index, store).map_or(Stage::Done, |log| Stage::Index(log, 0, 0)))
   }
 
-  /// The index file's next entry (its line first, at its first), followed by its chunk where the log is inline; or the
-  /// index file's end ([`Streaming::index_end`]).
+  /// The index file's next entries, a run a step (its line first, at its first), each followed by its chunk where the
+  /// log is inline; or the index file's end ([`Streaming::index_end`]). A run is the log's rows in order, written from the
+  /// entries its gathering read in one range walk ([`StoredLog::numbers`]), at most a content window's worth of them
+  /// ([`rows_a_step`]), and ends early
+  /// at the log's last row, at an inline chunk the store must be asked for, or at a row the step's room does not hold
+  /// after the first (whose refusal is the step's, as before). Before (goal 93, hg's whole-history gap; main 01a20182's
+  /// ruling of 2026-11-27 16:23), a row a step and two searches of the index a row: 1,249 steps and 5,369 reads for
+  /// 1,200 revisions.
   fn index_entry(
     &mut self,
     index: &HgIndex,
@@ -1106,16 +1193,55 @@ impl Streaming {
     if !self.rows_held(index, store, &log)? {
       return Ok(Stage::Index(log, rev, offset));
     }
+    let (_, count) = self.front_log()?;
+    if rev >= count {
+      let (inline, data, _) = self.sized_at(&log, rev)?;
+      return self.index_end((log, inline, data), admission, out);
+    }
+    let (mut rev, mut offset) = (rev, offset);
+    for written in 0..rows_a_step(store) {
+      if rev >= count {
+        break;
+      }
+      let numbers = self
+        .held
+        .front()
+        .and_then(|held| held.numbers.get(usize::try_from(rev).ok()?).copied())
+        .ok_or_else(|| Refused::Unreadable {
+          log: unreadable_name(&log),
+          rev,
+        })?;
+      match self.index_row((&log, rev, offset), numbers, written == 0, admission, out)? {
+        Some(length) => {
+          rev = rev.saturating_add(1);
+          offset = offset.saturating_add(length);
+        }
+        None => break,
+      }
+    }
+    Ok(Stage::Index(log, rev, offset))
+  }
+
+  /// Revision `rev`'s entry of `log` from its `numbers`, written to `out` with its chunk where the log is inline: its
+  /// chunk's length; or none, nothing written, where its inline chunk must be asked of the store or, not the run's
+  /// `first`, the room does not hold it.
+  fn index_row(
+    &mut self,
+    (log, rev, offset): (&Walked, u32, u64),
+    numbers: EntryNumbers,
+    first: bool,
+    admission: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<Option<u64>, Refused> {
     let unreadable = || Refused::Unreadable {
-      log: unreadable_name(&log),
+      log: unreadable_name(log),
       rev,
     };
-    // The log's length is its held rows' count: asked of the index, each entry took a search of the log's keys.
-    let (seq, count) = self.front_log()?;
-    let (inline, data, length) = self.sized_at(&log, rev)?;
-    if rev >= count {
-      return self.index_end(index, store, (log, inline, data), admission, out);
+    if numbers.rev != rev {
+      return Err(unreadable());
     }
+    let (seq, count) = self.front_log()?;
+    let (inline, data, length) = self.sized_at(log, rev)?;
     let length = u64::from(length.ok_or_else(unreadable)?);
     // An inline log's chunk is had before anything is written, so a step that must ask the store writes nothing.
     let plain = if inline {
@@ -1124,21 +1250,25 @@ impl Streaming {
       None
     };
     if inline && plain.is_none() {
-      return Ok(Stage::Index(log, rev, offset));
+      return Ok(None);
     }
-    if rev == 0 {
+    let head = if rev == 0 {
       let name = [log.radix().as_slice(), b".i"].concat();
       let entries = u64::from(count).saturating_mul(to_u64(ENTRY_BYTES));
       let chunks = plain.as_ref().map_or(0, |_| data);
-      file_head(
-        self.framing,
-        (&name, entries.saturating_add(chunks)),
-        admission,
-        out,
-      )?;
+      Some((name, entries.saturating_add(chunks)))
+    } else {
+      None
+    };
+    let charge = to_u64(ENTRY_BYTES).saturating_add(plain.as_ref().map_or(0, |_| length));
+    if !first && head.is_none() && admission.left() < charge {
+      return Ok(None);
     }
-    admission.charge(to_u64(ENTRY_BYTES).saturating_add(plain.as_ref().map_or(0, |_| length)))?;
-    let entry = self.entry_of(index, store, (&log, rev, offset), length)?;
+    if let Some((name, bytes)) = &head {
+      file_head(self.framing, (name, *bytes), admission, out)?;
+    }
+    admission.charge(charge)?;
+    let entry = self.entry_of((log, rev, offset), length, numbers)?;
     let at = out.len();
     entry.write(out)?;
     if rev == 0 {
@@ -1150,11 +1280,17 @@ impl Streaming {
     {
       return Err(unreadable());
     }
-    Ok(Stage::Index(
-      log,
-      rev.saturating_add(1),
-      offset.saturating_add(length),
-    ))
+    Ok(Some(length))
+  }
+
+  /// The send's next log, the count's next sized one in the walk's order, its index file first; or the send's end. The
+  /// count sized every log in that order, so the send searches the index for none (goal 93, hg's whole-history gap: each
+  /// log's end searched for the next file log and asked its length, 418 reads of 1,298 on a sealed history).
+  fn next_sized(&self) -> Stage {
+    self
+      .sized
+      .front()
+      .map_or(Stage::Done, |next| Stage::Index(next.log.clone(), 0, 0))
   }
 
   /// What the count gave `log`: whether it is inline, its chunks' bytes, and revision `rev`'s chunk length (none past
@@ -1176,15 +1312,13 @@ impl Streaming {
   /// data file is next, its line first.
   fn index_end(
     &mut self,
-    index: &HgIndex,
-    store: &ContentStore,
     (log, inline, data): (Walked, bool, u64),
     admission: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
     if inline || data == 0 {
       self.sized.pop_front();
-      return Ok(next_log(&log, index, store).map_or(Stage::Done, |next| Stage::Index(next, 0, 0)));
+      return Ok(self.next_sized());
     }
     let name = [log.radix().as_slice(), b".d"].concat();
     file_head(self.framing, (&name, data), admission, out)?;
@@ -1192,14 +1326,14 @@ impl Streaming {
   }
 
   /// Revision `rev`'s entry in `log`, its chunk `length` bytes at `offset` among the chunks: its row's base as the
-  /// revision of the log that first holds its base's text, its parents, link, node and flags from the index. A
+  /// revision of the log that first holds its base's text, its parents, link, node and flags from its `numbers` (the
+  /// run's read of the index, [`HgIndex::numbers_from`]). A
   /// revision against the null base is refused unreadable unless its place holds its text whole.
   fn entry_of(
     &self,
-    index: &HgIndex,
-    store: &ContentStore,
     (log, rev, offset): (&Walked, u32, u64),
     length: u64,
+    numbers: EntryNumbers,
   ) -> Result<Entry, Refused> {
     let unreadable = || Refused::Unreadable {
       log: unreadable_name(log),
@@ -1228,17 +1362,14 @@ impl Streaming {
         }
       }
     };
-    let (parents, link) = numbers(index, store, log.log(), rev).ok_or_else(unreadable)?;
-    let (node, flags, text) = match log.log() {
-      Log::Changelog => {
-        let found = index.changeset(store, rev).ok_or_else(unreadable)?;
-        (found.node, found.flags, found.len)
-      }
-      other => {
-        let found = index.revision(store, other, rev).ok_or_else(unreadable)?;
-        (found.node, found.flags, found.len)
-      }
-    };
+    let EntryNumbers {
+      parents,
+      link,
+      node,
+      flags,
+      len: text,
+      ..
+    } = numbers;
     // A revision against the null base is sent as its text alone, which a raw place holds whole (A-767 C1); a chunk's
     // place holds its stored chunk, whatever its length (ruling (b)).
     if !based && !row.place.chunk && row.place.len != text {
@@ -1260,8 +1391,6 @@ impl Streaming {
   /// count gave it, or the log's end and the next log's index file.
   fn data_chunk(
     &mut self,
-    index: &HgIndex,
-    store: &ContentStore,
     (log, rev): (Walked, u32),
     admission: &mut Admission,
     out: &mut Vec<u8>,
@@ -1274,7 +1403,7 @@ impl Streaming {
     if rev >= count {
       // The next log's rows let go of this one's ([`Streaming::rows_held`]); chunks asked for after it are kept.
       self.sized.pop_front();
-      return Ok(next_log(&log, index, store).map_or(Stage::Done, |next| Stage::Index(next, 0, 0)));
+      return Ok(self.next_sized());
     }
     let length = self
       .sized
@@ -1322,24 +1451,6 @@ fn changelog_servable(stored: &StoredLog) -> bool {
   })
 }
 
-/// A revision's node in `log`.
-fn node_of(index: &HgIndex, store: &ContentStore, log: &Walked, rev: u32) -> Result<Node, Refused> {
-  let unreadable = || Refused::Unreadable {
-    log: unreadable_name(log),
-    rev,
-  };
-  match log.log() {
-    Log::Changelog => index
-      .changeset(store, rev)
-      .map(|row| row.node)
-      .ok_or_else(unreadable),
-    other => index
-      .revision(store, other, rev)
-      .map(|row| row.node)
-      .ok_or_else(unreadable),
-  }
-}
-
 /// The first log the walk writes: the first file log, else the manifest log, else the changelog; none for an empty
 /// repository.
 fn first_log(index: &HgIndex, store: &ContentStore) -> Option<Walked> {
@@ -1347,6 +1458,21 @@ fn first_log(index: &HgIndex, store: &ContentStore) -> Option<Walked> {
     Some((path, _, _)) => Some(Walked::File(path)),
     None => next_log(&Walked::File(Vec::new()), index, store),
   }
+}
+
+/// Derived: the bytes a step's gathering has touched, `rows` walked and `reads` of the content store made: a content
+/// window a read (`ContentStore::window`, what one read may touch at most) and its stored form and index entry a row,
+/// the budget [`Streaming::set_step_bytes`] holds it to. A walk's start costs a table of each run its range meets, so
+/// stopping by bytes touched, not by rows, makes the restarts of a long log's walk as few as the budget allows whatever
+/// the index's layout (goal 93, hg's whole-history gap; main 01a20182's ruling of 2026-11-27 17:57: a 300-row log
+/// restarted about six times at a row bound, a table in each of 48 runs each time).
+fn gather_spent(store: &ContentStore, (rows, reads): (u64, u64)) -> u64 {
+  let row_bytes = to_u64(
+    core::mem::size_of::<StoredRevision>().saturating_add(core::mem::size_of::<EntryNumbers>()),
+  );
+  rows
+    .saturating_mul(row_bytes)
+    .saturating_add(reads.saturating_mul(to_u64(store.window())))
 }
 
 /// Derived: the rows a stream's step reads to gather an ask ([`Streaming::rows_held`]): a content window's worth of

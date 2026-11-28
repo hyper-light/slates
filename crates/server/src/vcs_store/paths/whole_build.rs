@@ -124,6 +124,9 @@ struct Build {
   before: Option<super::Head>,
   /// For a change build: the paths the change removes, which the map before holds a file at and the head none.
   removed: std::collections::BTreeSet<Vec<u8>>,
+  /// The windows let go that its puts brought back to read a file whole (`super::put_file`), let go again at its end,
+  /// a refusal or an abandon (`super::let_go_again_after_build`).
+  brought: Vec<slates_vcs::AwayAt>,
 }
 
 /// Whether `green`'s map is being built whole: a submit to it is parked ([`park`]).
@@ -144,7 +147,7 @@ pub(crate) fn start(
     .whole_builds
     .0
     .remove(&green)
-    .map(|old| retire(state, old))
+    .map(|old| retire(state, green, old))
     .unwrap_or_default();
   let kept = kept_at(state, repository, green) == Some(version);
   let Some(paths) = state.greens.get(&green).map(|engine| {
@@ -174,6 +177,7 @@ pub(crate) fn start(
     remade: false,
     before: None,
     removed: std::collections::BTreeSet::new(),
+    brought: Vec::new(),
   };
   state.vcs_stores.whole_builds.0.insert(green, build);
   state.count(BEGUN, 1);
@@ -210,6 +214,7 @@ pub(crate) fn start_change(
     remade: false,
     before: Some(before),
     removed: std::collections::BTreeSet::new(),
+    brought: Vec::new(),
   };
   state.vcs_stores.whole_builds.0.insert(green, build);
   state.count(CHANGE_BEGUN, 1);
@@ -296,7 +301,7 @@ fn slice(state: &mut ShardState, green: DbVolumeId, budget_ns: u64) -> bool {
       }
     }
     None => {
-      let parked = retire(state, build);
+      let parked = retire(state, green, build);
       crate::verbs::resume_all(state, parked);
       return false;
     }
@@ -312,7 +317,7 @@ fn slice(state: &mut ShardState, green: DbVolumeId, budget_ns: u64) -> bool {
     }
     Err(refused) => {
       count(state, (green, Err(refused)), BUILT);
-      let parked = retire(state, build);
+      let parked = retire(state, green, build);
       crate::verbs::resume_all(state, parked);
       false
     }
@@ -426,7 +431,9 @@ fn put_some_over(
       .stores
       .git(build.repository)
       .ok_or(StepRefused::NoMap)
-      .and_then(|(content, _)| super::put_file(content, &file, &mut build.held));
+      .and_then(|(content, _)| {
+        super::put_file(content, &file, (&mut build.held, &mut build.brought))
+      });
     match put {
       Ok(entry) => {
         build.removed.remove(map_path(path));
@@ -483,6 +490,7 @@ pub(crate) fn preview_change(
     remade: false,
     before,
     removed: std::collections::BTreeSet::new(),
+    brought: Vec::new(),
   })
 }
 
@@ -504,8 +512,15 @@ impl PreviewChange {
   }
 
   /// Its end: the change applied to the map before (or, with none, the map built of what was put), kept as `green`'s
-  /// head at its version (counted as a build's end is). Whether the map is kept.
-  pub(crate) fn finish(self, state: &mut ShardState, green: DbVolumeId) -> bool {
+  /// head at its version (counted as a build's end is). Whether the map is kept, and the windows let go its puts
+  /// brought back of `green`'s files, for its caller to let go again once the made commit has read its files
+  /// (`super::let_go_again_after_build`; a made commit reads a lacked blob's bytes from the map after its build,
+  /// `commits::Lacked`, so letting them go here refused it `Unread`).
+  pub(crate) fn finish(
+    self,
+    state: &mut ShardState,
+    green: DbVolumeId,
+  ) -> (bool, Vec<slates_vcs::AwayAt>) {
     let Build {
       repository,
       version,
@@ -513,6 +528,7 @@ impl PreviewChange {
       held,
       before,
       removed,
+      mut brought,
       ..
     } = self.0;
     let plan = match before {
@@ -532,19 +548,27 @@ impl PreviewChange {
       repository,
       (super::super::green_key(green), version),
       plan,
-      held,
+      (held, &mut brought),
     );
     if !super::super::settle_in(&mut state.store, &mut state.vcs_stores) {
       state.count(super::super::CHARGE_SHORT, 1);
     }
     let kept = answer.is_ok();
     count(state, (green, answer), BUILT);
-    kept
+    (kept, brought)
   }
 
-  /// Gives back the holds its puts took, where it ends before its finish (the made commit given up).
-  pub(crate) fn abandon(self, state: &mut ShardState) {
-    give_back(&mut state.vcs_stores, self.0.repository, &self.0.held);
+  /// Gives back the holds its puts took, where it ends before its finish (the made commit given up), and lets go again
+  /// what its puts brought back of `green`'s files.
+  pub(crate) fn abandon(self, state: &mut ShardState, green: DbVolumeId) {
+    let Build {
+      repository,
+      held,
+      brought,
+      ..
+    } = self.0;
+    super::let_go_again_after_build(state, green, brought);
+    give_back(&mut state.vcs_stores, repository, &held);
     super::super::settle(state);
   }
 }
@@ -563,6 +587,7 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
     remade,
     before,
     removed,
+    mut brought,
     ..
   } = build;
   if !kept {
@@ -584,7 +609,7 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
         ),
         None => Plan::Put(entries),
       },
-      held,
+      (held, &mut brought),
     );
     if !super::super::settle_in(&mut state.store, &mut state.vcs_stores) {
       state.count(super::super::CHARGE_SHORT, 1);
@@ -595,6 +620,7 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
       if remade { super::REMADE } else { BUILT },
     );
   }
+  super::let_go_again_after_build(state, green, brought);
   crate::verbs::resume_all(state, parked);
 }
 
@@ -659,14 +685,16 @@ pub(crate) fn abandon(state: &mut ShardState, repository: RepositoryId) {
     .collect();
   for green in greens {
     if let Some(build) = state.vcs_stores.whole_builds.0.remove(&green) {
-      let parked = retire(state, build);
+      let parked = retire(state, green, build);
       crate::verbs::resume_all(state, parked);
     }
   }
 }
 
-/// A build given up: its holds given back and its task ended; its parked submits, for the caller.
-fn retire(state: &mut ShardState, build: Build) -> Vec<ParkedSubmit> {
+/// A build of `green` given up: what its puts brought back let go again, its holds given back and its task ended; its
+/// parked submits, for the caller.
+fn retire(state: &mut ShardState, green: DbVolumeId, mut build: Build) -> Vec<ParkedSubmit> {
+  super::let_go_again_after_build(state, green, std::mem::take(&mut build.brought));
   give_back(&mut state.vcs_stores, build.repository, &build.held);
   if let Some(task) = build.task
     && slates_rt::futures::current_task() != Some(task)

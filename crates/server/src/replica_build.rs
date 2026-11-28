@@ -226,6 +226,9 @@ async fn laid_out(green: ObjectId) -> bool {
     Owed(RepositoryId, slates_merge::push::DeferredPush),
   }
   let key = crate::merge_service::replica_key(green);
+  // The build's wait on its repository's store's replay, logged as it begins and ends (main 01a20182's order of
+  // 2026-11-27 18:08: a build answered `ReplicaBuilding` at 0 turns through a push's barrier window).
+  let mut replaying_since: Option<u64> = None;
   loop {
     let found = crate::state::with_state_counted(|state| {
       let repository = state.replica_builds.building.get(&green)?.repository;
@@ -243,8 +246,18 @@ async fn laid_out(green: ObjectId) -> bool {
       Some(owed.map_or(Found::Nothing, |owed| Found::Owed(repository, owed)))
     })
     .flatten();
+    if let Some(since) = replaying_since.filter(|_| !matches!(found, Some(Found::Replaying))) {
+      log_replay_wait(green, Some(since));
+      replaying_since = None;
+    }
     match found {
-      Some(Found::Replaying) => slates_rt::futures::yield_now().await,
+      Some(Found::Replaying) => {
+        if replaying_since.is_none() {
+          log_replay_wait(green, None);
+          replaying_since = Some(slates_rt::futures::now_ns());
+        }
+        slates_rt::futures::yield_now().await;
+      }
       Some(Found::Nothing) => return true,
       Some(Found::Owed(repository, owed)) => {
         let Some(Ok(layout)) = crate::repository::hg_push::owed_layout(repository, &owed).await
@@ -261,6 +274,22 @@ async fn laid_out(green: ObjectId) -> bool {
       }
       None => return false,
     }
+  }
+}
+
+/// Logs `green`'s replica build's wait on its repository's store's replay ([`laid_out`]): as it begins, with the
+/// process's monotonic time, and as it ends, with how long it lasted from `since`, its start (`None` for the start).
+fn log_replay_wait(green: ObjectId, since: Option<u64>) {
+  let now = slates_rt::futures::now_ns();
+  match since {
+    None => slates_machine::log_line!(
+      "slates-server: a replica build of {green:?} began waiting on its repository's store's replay at {now} ns"
+    ),
+    Some(since) => slates_machine::log_line!(
+      "slates-server: a replica build of {green:?} ended its wait on its repository's store's replay at {now} ns, after \
+       {} ns",
+      now.saturating_sub(since)
+    ),
   }
 }
 

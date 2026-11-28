@@ -97,6 +97,31 @@ pub struct CommitRow {
   pub parents: Vec<u64>,
 }
 
+/// Format: the parents an object row's commit part is bounded for in [`held_bytes_per_object`]: a merge's two, so the
+/// bound holds for every commit but an octopus merge, which adds a word a further parent.
+const PARENTS_BOUNDED: usize = 2;
+
+/// Derived: the most bytes one object's rows hold in its repository's index once sealed, by the index's own layout
+/// (`slates_vcs::index::held_bytes_per_row`): its object row (key [`OBJECT_KEY`] and the id; one content named, the
+/// pack it lies in or its own; a payload of [`OBJECT_PAYLOAD_BYTES`] and a commit's part, [`COMMIT_PART_BYTES`] and
+/// [`PARENTS_BOUNDED`] parents' words, which bounds a blob's, a tree's and a tag's from above) and its position row
+/// (key [`POSITION_KEY`] and a word; no content; the id as payload). For SHA-1: 161 and 44 bytes, two filter bytes each
+/// included, 205 in all; SHA-256: 229 (held to a real index: 20,000 objects' rows hold 171 bytes an object). The `R` of
+/// C5's held bound (`2N + O × R + W`, main's ruling B of 2026-11-26), with the names row the server keeps an object
+/// beside it. Saturating where the integers cannot hold it.
+pub fn held_bytes_per_object(format: ObjectFormat) -> u64 {
+  let id = format.raw_len();
+  let object_payload = OBJECT_PAYLOAD_BYTES
+    .saturating_add(COMMIT_PART_BYTES)
+    .saturating_add(PARENTS_BOUNDED.saturating_mul(WORD_BYTES));
+  let object = slates_vcs::index::held_bytes_per_row(id.saturating_add(1), 1, object_payload);
+  let position = slates_vcs::index::held_bytes_per_row(WORD_BYTES.saturating_add(1), 0, id);
+  object
+    .zip(position)
+    .and_then(|(object, position)| object.checked_add(position))
+    .unwrap_or(u64::MAX)
+}
+
 /// The key of `id`'s object row.
 pub fn object_key(id: &ObjectId) -> Vec<u8> {
   let mut key = Vec::with_capacity(id.as_bytes().len().saturating_add(1));

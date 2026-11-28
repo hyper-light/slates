@@ -853,6 +853,11 @@ impl InTurns {
 #[test]
 fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile() {
   let (start, held, unheld) = made_pushing([git("generations")], |[(id, root)]| async move {
+    // Kind (3) (main's rule of 2026-11-27 10:33): its work and fetch are each answered in one synchronous step, which
+    // cannot await a bring-back, and its point is the fetch's generation; over let-go windows, the build:
+    // `git_push::tests::b5_a_verdicts_build_of_a_pushed_delta_over_a_let_go_base_lands`, the fetch:
+    // `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+    crate::test_store::keep_landed_here();
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (objects, first) = commit_of(&files, &[], FIRST_DATE);
     let first_tree = tree_of(&objects);
@@ -1405,6 +1410,10 @@ fn position_counts(state: &ShardState) -> PositionCounted {
 /// distinct objects, what the fetch counted ([`PositionCounted`]), and the objects its pack sent.
 fn line_fetched(name: &'static str) -> (usize, PositionCounted, usize) {
   made_pushing([git(name)], move |[made]| async move {
+    // Kind (3) (main's rule of 2026-11-27 10:33): its fetch is answered in one synchronous step, which cannot await a
+    // bring-back, and its point is the walk's counts; the fetch over let-go windows:
+    // `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+    crate::test_store::keep_landed_here();
     let (id, head, distinct) = pushed_line(made).await;
     on_state(move |state| {
       let before = position_counts(state);
@@ -1462,6 +1471,10 @@ fn a911_a_miss_into_a_slot_another_id_holds_is_counted_a_conflict() {
 /// most entries one unit of its walk took, and the longest tree one unit parsed, as the shard counted them most.
 fn line_walk_most(name: &'static str) -> (u64, u64) {
   made_pushing([git(name)], move |[made]| async move {
+    // Kind (3) (main's rule of 2026-11-27 10:33): its fetch is answered in one synchronous step, which cannot await a
+    // bring-back, and its point is the walk's counts; the fetch over let-go windows:
+    // `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+    crate::test_store::keep_landed_here();
     let (id, head, _) = pushed_line(made).await;
     on_state(move |state| {
       let asked = fetch_under_depth(head, PAST_THE_LINE);

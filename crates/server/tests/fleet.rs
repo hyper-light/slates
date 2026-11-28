@@ -37395,6 +37395,69 @@ fn a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet() {
   assert_eq!(branch, Ok(()), "the new branch's push landed");
 }
 
+/// The landed-pack let-go bytes node `node` counted: a commit's and a rebuild's let-go of a landed pack and a read's
+/// let-go of a window it brought back (`vcs_store.landed.let_go_bytes`), and its homes' of a landed pack's windows
+/// (`vcs_store.homes.landed_let_go_bytes`).
+fn landed_let_go_bytes(fleet: &GitFleet, node: usize) -> u64 {
+  [
+    "vcs_store.landed.let_go_bytes",
+    "vcs_store.homes.landed_let_go_bytes",
+  ]
+  .iter()
+  .map(|name| refusal_count(&fleet.daemons[node], name).unwrap_or(0))
+  .sum()
+}
+
+/// (d) of the landed let-go's lift, its rule checked (main 01a20182's ruling of 2026-11-27 06:00; GAPS, (d)): a holder
+/// holds no changeset row for its owner's pushes, so nothing lets a holder's pack go, and its replica builds read what
+/// it holds. Do: on a three-node `f = 1` fleet with a git repository on a and the landed let-go on, nothing let go by
+/// hand, push `main`, then the new branches `first` and `second`, then a commit on top of each (each holder building
+/// its replica of each branch); wait for a's let-go. Expect: every push lands; a let go of landed packs (more than
+/// nothing, so the rule is not vacuous); b and c let go nothing. A change that lets a holder's pack go fails this, and
+/// (d) reopens with a real red.
+#[test]
+fn a_holder_lets_no_landed_pack_go_while_its_owner_does() {
+  let _serial = serialize_fleet_tests();
+  let fleet = git_fleet("holder-let-go");
+  let pushes = [
+    fleet.push(0, ("main.txt", b"main's first history\n")),
+    fleet.push_to(0, ("first.txt", b"a first branch's own history\n"), "first"),
+    fleet.push_to(
+      0,
+      ("second.txt", b"a second branch's own history\n"),
+      "second",
+    ),
+    fleet.push_on_top_of(
+      0,
+      ("first-2.txt", b"the first branch's second version\n"),
+      "first",
+    ),
+    fleet.push_on_top_of(
+      0,
+      ("second-2.txt", b"the second branch's second version\n"),
+      "second",
+    ),
+  ];
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let _ = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    Ok(landed_let_go_bytes(&fleet, 0) > 0)
+  });
+  let let_go: Vec<u64> = (0..3)
+    .map(|node| landed_let_go_bytes(&fleet, node))
+    .collect();
+  fleet.stop();
+  eprintln!("landed let-go bytes by node: {let_go:?}");
+  assert!(
+    pushes.iter().all(Result::is_ok),
+    "every push landed: {pushes:?}"
+  );
+  assert!(
+    let_go[0] > 0,
+    "the owner let its landed packs go: {let_go:?}"
+  );
+  assert_eq!(&let_go[1..], &[0, 0], "no holder let a landed pack go");
+}
+
 /// A-908 (the successor's half) and A-909 (an owner's own hold fenced per object). Do: on a three-node `f = 1` fleet
 /// with a git repository on a, push a history to `main`; kill a; once a survivor has taken the repository over, push a
 /// fresh history to a new branch through that successor's edge. Expect the branch's push to land: the successor
@@ -38176,12 +38239,10 @@ const CREATION_WATCH_PERIODS: u64 = 20;
 /// push's `unable to commit` is the typed answer (41aa47870 run 7: the green placed at 2 of 3, the newcomer behind,
 /// `merge.behind.heard` 9). A precondition that never holds fails here, before the second death, named.
 ///
-/// A refused push during the first death fails the run at once, named, with the verdict the precondition would give 400 s
-/// later ([`first_death_push_refused`], main 01a20182's ruling of 2026-11-27 17:12, its (d2)): that push's new version is,
-/// until GAP-A9-7's record half re-ships a green's placed version, the one way the newcomer reaches the green's chain (it
-/// reads it on `Behind`, A-918 B); A-934 re-ships the state logs' parts alone. Its homing's `retry` is A-914 (c)'s prior,
-/// OPEN; any other refusal (2816da877's run 3: a's own HTTP port refusing the connection at 0 ms) is unexpected. Once
-/// the green's re-ship lands, a `retry` goes on to the precondition, which then proves the repair needs no traffic.
+/// The push during the first death must land, and a refused one fails the run at once, named (main 01a20182's rulings
+/// of 2026-11-27 17:05, 17:12 and 17:58, its (r2)): since A-914 (c) its homing's deadline follows the window as the
+/// death's stretched periods are measured, so a `retry` there is no longer the typed prior it was; and since A-935 the
+/// repair window closes with no push either way, which the precondition proves.
 #[test]
 fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first() {
   let _serial = serialize_fleet_tests();
@@ -38197,7 +38258,7 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
   let at_d = stretched_death(&mut fleet, 3, "after-d.txt");
   if let Err(refused) = &at_d.1 {
     fleet.stop();
-    first_death_push_refused(refused);
+    panic!("the first death's push landed, before f = 1's repair window is waited for: {refused}");
   }
   let (repaired, holders) = repair_window_closed(&fleet);
   let during = [at_d, stretched_death(&mut fleet, 2, "after-c.txt")];
@@ -38247,20 +38308,112 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
   );
 }
 
+/// A-914 (c) (main 01a20182's rulings of 2026-11-27 17:57 and 17:58: the first death's homing, the window fixed from
+/// periods measured before the death). Do: on a four-node `f = 1` git fleet with a repository on a, push `main`;
+/// stretch every node's coordinator periods (as [`stretched_death`] does, a load spike arriving with the death) and stop
+/// d; then, from a, push on top again and again until one push's homing has ranked its homes again after the death's
+/// install and been kept (`vcs_store.homes.homing_reranked_kept`: it waited for the install, d among its homes), or a
+/// push is refused, or the death installs at a. The death's own window bounds the pushes, so no count is chosen: each
+/// push homes two identities, its names and its pack, so it misses d with probability 1/4, and a run where none waits
+/// has probability `4^-n` over the `n` that fit, printed. Expect every push to land and one to have waited, its
+/// deadline (`vcs_store.homes.homing_deadline_ns_most`) past the window the death began with. Red before A-914 (c): the
+/// homing's deadline was the window at its start, 3.7 s against silences of 4.2 to 5.3 s, so the first push homed on d
+/// was refused `retry` before the install it waited for (a914's first death, 5 of 16 at load).
+#[test]
+fn a914c_a_push_homed_on_a_member_dying_under_load_waits_for_its_install_and_lands() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), stores, lease) =
+    started_git_fleet_of("stretched-first-death", &["a", "b", "c", "d"]);
+  let mut fleet = founded_git_fleet(
+    "stretched-first-death",
+    (daemons, hosts),
+    stores,
+    (Some(lease), None),
+  );
+  let first = fleet.push(0, ("first.txt", b"main before the death\n"));
+  for daemon in &fleet.daemons {
+    daemon.inject_period_stretch(Some(STRETCH_NS)).unwrap();
+  }
+  let gone = fleet.hosts[3];
+  fleet.daemons.remove(3).stop();
+  let window = fleet.daemons[0].homing_window();
+  let pushes = push_until_a_homing_waits(&fleet, gone);
+  let counts = homing_counts(&fleet.daemons[0]);
+  for daemon in &fleet.daemons {
+    daemon.inject_period_stretch(None).unwrap();
+  }
+  fleet.stop();
+  eprintln!(
+    "stretched-first-death: first {first:?}; the window at the death {window:?}; {} pushes {pushes:?}; a's (reranked and \
+     kept, deadline most, waited most, silence longest) {counts:?}",
+    pushes.len()
+  );
+  assert_eq!(first, Ok(()), "the push before the death landed");
+  assert!(
+    pushes.iter().all(Result::is_ok),
+    "every push during the stretched first death landed: {pushes:?}"
+  );
+  let start = window
+    .as_ref()
+    .map_or(u64::MAX, |reading| reading.window_ns);
+  assert!(
+    counts
+      .as_ref()
+      .is_ok_and(|(kept, deadline, _, _)| *kept >= 1 && *deadline > start),
+    "a push's homing waited for the install, its deadline past the window it began with ({start} ns): {counts:?}"
+  );
+}
+
+/// Pushes on top at a, a new file each time, until a push is refused, one's homing was ranked again after an install and
+/// kept, or `gone`'s death installed at a (A-914 (c)'s test): each push's answer, in order. Bounded by the death's own
+/// window and, if it never installs, by [`RETIREMENT_DEADLINE`].
+fn push_until_a_homing_waits(fleet: &GitFleet, gone: HostId) -> Vec<Result<(), String>> {
+  let began = Instant::now();
+  let mut pushes = Vec::new();
+  while began.elapsed() < RETIREMENT_DEADLINE {
+    let file = format!("during-{}.txt", pushes.len());
+    let pushed = fleet.push_on_top(0, (&file, file.as_bytes()));
+    let refused = pushed.is_err();
+    pushes.push(pushed);
+    if refused
+      || homed_past_an_install(&fleet.daemons[0])
+      || installed_without(&fleet.daemons[0], gone)
+    {
+      break;
+    }
+  }
+  pushes
+}
+
+/// Whether one of `daemon`'s homings was ranked again after an install and kept (`vcs_store.homes.homing_reranked_kept`).
+fn homed_past_an_install(daemon: &Daemon) -> bool {
+  move_counter(daemon, "vcs_store.homes.homing_reranked_kept").is_ok_and(|kept| kept >= 1)
+}
+
+/// Whether `daemon`'s council no longer seats `gone`: its death installed there.
+fn installed_without(daemon: &Daemon, gone: HostId) -> bool {
+  daemon
+    .council_members()
+    .is_ok_and(|members| !members.contains(&gone))
+}
+
+/// What A-914 (c)'s test reads of a's homings: (reranked and kept, the largest deadline one homed under, the longest one
+/// waited, the longest death's silence to its install it measured), or why they could not be read.
+type HomingCounts = Result<(u64, u64, u64, u64), ObserveError>;
+
+/// [`HomingCounts`] of `daemon`.
+fn homing_counts(daemon: &Daemon) -> HomingCounts {
+  let read = |name: &str| move_counter(daemon, name);
+  Ok((
+    read("vcs_store.homes.homing_reranked_kept")?,
+    read("vcs_store.homes.homing_deadline_ns_most")?,
+    read("vcs_store.homes.homing_waited_ns_most")?,
+    read("failover.silence_longest_ns")?,
+  ))
+}
+
 /// A node's homing window as read from its status, or why it could not be ([`stretched_death`]'s readings).
 type WindowRead = Result<HomingWindowReading, ObserveError>;
-
-/// Fails A-914 (a)'s test at the first death's refused push (its doc, main's (d2)), naming which: the homing's `retry`,
-/// told by the words the server answers it in ([`slates_server::HOMED_SHORT`]), or any other refusal, unexpected.
-fn first_death_push_refused(refused: &str) -> ! {
-  if refused.contains(slates_server::HOMED_SHORT) {
-    panic!(
-      "the first death's push refused retry (A-914 (c)'s prior, OPEN; until the green sibling lands, the newcomer reaches \
-       the green's chain only through a new version): {refused}"
-    );
-  }
-  panic!("the first death's push refused, unexpected: {refused}");
-}
 
 /// What [`repair_window_closed`] last read: a's count of its repository's holders ([`RepairWindowHolders`]) and each
 /// survivor's names-log positions but a's, or why either could not be read.
@@ -38462,6 +38615,112 @@ fn names_positions(fleet: &GitFleet) -> Vec<Result<Vec<u64>, ObserveError>> {
     .iter()
     .map(|daemon| daemon.names_log_positions(fleet.repository))
     .collect()
+}
+
+/// Derived: the record-plane passes A-935's repair path takes once a death's configuration installs, with no push: the
+/// pass that retargets the green's newest placed version to the candidate the death brought in
+/// (`merge_service::next_merge_work`'s retarget) and ships it; the newcomer's `Behind` heard on the owner and its read of
+/// the chain asked (A-918 B); the read's answers; the versions' inputs fetched from the cohort; and the rebuild that
+/// holds the version.
+const REPAIR_PATH_PASSES: u64 = 5;
+
+/// Derived: the coordinator periods each pass of [`REPAIR_PATH_PASSES`] may take: a pass whose exchange finds no session
+/// to its peer, or whose reply comes as a straggler, is run again the next period (the record plane's retry), and a
+/// fetch of inputs past one shipment's bound crosses in several; ten covers both for a green of one push's inputs.
+const PERIODS_PER_REPAIR_PASS: u64 = 10;
+
+/// A-935 (main 01a20182's rulings of 2026-11-27 17:12 and 17:29, the green sibling of A-934; GAP-A9-7's record half). Do:
+/// on a four-node `f = 1` git fleet with a repository on a, push `main` and wait for a's two remote candidates to hold
+/// its green's version; stop one of them and await its takeover and unseating, so the fourth node, which holds none of
+/// the green, becomes a candidate; push nothing. Expect the newcomer to hold the green's newest placed version within
+/// the repair path's bound ([`REPAIR_PATH_PASSES`] passes of [`PERIODS_PER_REPAIR_PASS`] periods each, in daemon
+/// periods). Red before A-935: an owner forgot a version's pending record once every candidate held it, so no record
+/// shipped to a newcomer until a new version did, and in a quiet stretch the first death's repair window never closed
+/// (2816da877's a914 run 3: the newcomer outside the green's holders for 400 s).
+#[test]
+fn a935_a_candidate_a_death_brings_in_holds_each_greens_newest_version_with_no_push() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), stores, lease) =
+    started_git_fleet_of("quiet-newcomer", &["a", "b", "c", "d"]);
+  let mut fleet = founded_git_fleet(
+    "quiet-newcomer",
+    (daemons, hosts),
+    stores,
+    (Some(lease), None),
+  );
+  let first = fleet.push(0, ("first.txt", b"main before the death, then quiet\n"));
+  let (x, y) = remote_candidates(&fleet);
+  let newcomer = fleet
+    .hosts
+    .iter()
+    .copied()
+    .find(|host| *host != fleet.hosts[0] && *host != x && *host != y)
+    .expect("a fourth node outside a's neighbourhood");
+  let held = candidates_hold_green(&fleet, [x, y]);
+  let taken = stop_and_take_over(&mut fleet, x);
+  let (reached, reading) = newcomer_holds_newest(&fleet, newcomer);
+  fleet.stop();
+  eprintln!(
+    "quiet-newcomer: push {first:?}; candidates held {held}; taken over {taken}; the newcomer {newcomer:?} held the \
+     newest version {reached}: (a's count, the newcomer's replica) {reading:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before the death landed");
+  assert!(
+    held && taken,
+    "both candidates held the green, and x was taken over"
+  );
+  assert!(
+    reached,
+    "the newcomer held the green's newest placed version with no push, within the repair path's bound: {reading:?}"
+  );
+}
+
+/// Whether, within [`RETIREMENT_DEADLINE`], each of `candidates` holds the fleet's green at the version a places
+/// (A-935's test): a's count of its holders (`Daemon::repair_window_holders`) names them all.
+fn candidates_hold_green(fleet: &GitFleet, candidates: [HostId; 2]) -> bool {
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  poll_until(&observed, RETIREMENT_DEADLINE, || {
+    let held = fleet.daemons[0].repair_window_holders(fleet.repository)?;
+    Ok(held.green.is_some_and(|(_, holders)| {
+      candidates
+        .iter()
+        .all(|candidate| holders.contains(candidate))
+    }))
+  })
+}
+
+/// What [`newcomer_holds_newest`] last read: a's count of its green's holders and the newcomer's replica of it, or why
+/// either could not be read.
+type NewcomerRead = (
+  Result<RepairWindowHolders, ObserveError>,
+  Result<slates_server::merge_service::HolderMergeState, ObserveError>,
+);
+
+/// Whether the node of `newcomer` holds the fleet's green at the newest version a placed, within the repair path's bound
+/// (A-935's test): its replica's version (`Daemon::merge_holder_state`) at or past a's placed one; with what it last read.
+fn newcomer_holds_newest(fleet: &GitFleet, newcomer: HostId) -> (bool, NewcomerRead) {
+  let green = VolumeId {
+    bytes: fleet.repository,
+  };
+  let node = fleet
+    .hosts
+    .iter()
+    .position(|host| *host == newcomer)
+    .expect("the newcomer is a node");
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let budget = REPAIR_PATH_PASSES.saturating_mul(PERIODS_PER_REPAIR_PASS);
+  let reached = poll_for_periods(&observed, RETIREMENT_DEADLINE, budget, || {
+    let placed = fleet.daemons[0]
+      .repair_window_holders(fleet.repository)?
+      .green;
+    let replica = fleet.daemons[node].merge_holder_state(green)?;
+    Ok(placed.is_some_and(|(version, _)| replica.version.is_some_and(|held| held >= version)))
+  });
+  let reading = (
+    fleet.daemons[0].repair_window_holders(fleet.repository),
+    fleet.daemons[node].merge_holder_state(green),
+  );
+  (reached, reading)
 }
 
 /// A-919 (main 01a20182's rulings of 2026-11-25: the worse failure of a candidate a death brings in). Do: on a four-node

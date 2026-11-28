@@ -669,9 +669,66 @@ struct Facts {
   rows: Vec<(ObjectId, Option<ObjectRow>)>,
   refs: Vec<RefFacts>,
   contents: Vec<(ContentId, u64)>,
-  used: u64,
+  /// The bytes the content store holds by identity: what it keeps here and what it let go to the node's store
+  /// (`ContentCensus::away_bytes`), so a store made again that let its read pack go again equals the live one holding
+  /// its own (main 01a20182's rule of 2026-11-27 10:33: judged whole by identity, never by residency).
+  held: u64,
   depth: u64,
 }
+
+/// Waits, a yield at a time within a bound, until the shard's sliced let-go has nothing queued or under way and
+/// repository `id` owes none (`VcsStores::letting_go`, `landed_owed`); then brings back from the node's store every
+/// let-go window of its packs and of `packs`, as a read's driver brings back each it meets
+/// (`upload::bring_back_within`): what a synchronous read after it reads whole, by identity.
+pub(crate) async fn brought_back_settled(id: RepositoryId, packs: &[(ContentId, u64)]) {
+  for _ in 0..LET_GO_SETTLE_YIELDS {
+    let settled = on_state(|state| {
+      state.vcs_stores.letting_go.0.is_empty()
+        && !state.vcs_stores.letting_go.1
+        && state
+          .vcs_stores
+          .landed_owed
+          .get(&id)
+          .is_none_or(Vec::is_empty)
+    });
+    if settled {
+      break;
+    }
+    slates_rt::futures::yield_now().await;
+  }
+  let waits: Vec<slates_git::store::packed::Waited> = on_state(|state| {
+    let Some((content, git)) = state.vcs_stores.git_ref(id) else {
+      return Vec::new();
+    };
+    let window = u64::try_from(content.window()).unwrap_or(u64::MAX).max(1);
+    git
+      .repository
+      .packs()
+      .chain(packs.iter().copied())
+      .flat_map(|(pack, len)| {
+        (0..len.div_ceil(window))
+          .map(move |at| slates_git::store::packed::Waited {
+            pack,
+            len,
+            offset: at * window,
+          })
+          .filter(|waited| {
+            content
+              .away_number(&waited.pack, waited.len, waited.offset)
+              .is_some()
+          })
+          .collect::<Vec<_>>()
+      })
+      .collect()
+  });
+  for waited in waits {
+    let _ = crate::vcs_store::upload::bring_back_within(waited).await;
+  }
+}
+
+/// Shape: the yields [`brought_back_settled`] waits at most for a sliced let-go to end: a let-go is a slice a turn, so
+/// a test's few packs end within far fewer.
+const LET_GO_SETTLE_YIELDS: usize = 100_000;
 
 /// [`Facts`] of `store` over `content`, for the refs keyed `greens`.
 fn facts(content: &ContentStore, store: &GitStore, greens: &[u64]) -> Facts {
@@ -694,7 +751,7 @@ fn facts(content: &ContentStore, store: &GitStore, greens: &[u64]) -> Facts {
     rows,
     refs,
     contents,
-    used: content.used(),
+    held: content.used().saturating_add(content.census().away_bytes),
     depth: store.repository.learned_depth(),
   }
 }
@@ -1628,12 +1685,38 @@ fn derive_settled(state: &mut ShardState, repository: RepositoryId) {
 }
 
 /// The store made again from the partition's log (`super::rebuild`, the recovery's own replay) equals the live one,
-/// its whole builds settled, whole over the refs keyed `greens`, every record replayed and none refused.
+/// its whole builds settled, whole over the refs keyed `greens`, every record replayed and none refused: the rebuild
+/// settled in this step ([`assert_made_again_whole_awaited`] awaits its task, which fills a let-go pack from the node's
+/// store).
 pub(crate) fn assert_made_again_whole(
   state: &mut ShardState,
   repository: RepositoryId,
   greens: &[u64],
 ) {
+  let before = made_again_begun(state, repository, greens);
+  super::settle_rebuild(state, repository);
+  made_again_equal(state, (repository, greens), before);
+}
+
+/// [`assert_made_again_whole`], its rebuild run by its own task and awaited (`vcs_store::rebuilt`), as a recovery's
+/// runs: the task reads a pack whose windows were let go from the node's store before its replay (A-767 C5), which a
+/// rebuild settled in one step never does (main 01a20182's ruling of 2026-11-27 07:21, the landed let-go's flip).
+pub(crate) async fn assert_made_again_whole_awaited(repository: RepositoryId, greens: &[u64]) {
+  let before = on_state(|state| made_again_begun(state, repository, greens));
+  super::rebuilt(repository).await;
+  on_state(|state| made_again_equal(state, (repository, greens), before));
+}
+
+/// What the live store showed before its rebuild began, for [`made_again_equal`] to hold the store made again to: its
+/// facts over `greens`, its records' count, and the replays counted so far.
+type MadeAgainBefore = (Facts, u64, u64);
+
+/// The live store's facts over `greens` settled, then its rebuild begun (`super::rebuild`): what it showed before.
+fn made_again_begun(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  greens: &[u64],
+) -> MadeAgainBefore {
   // The live store's whole builds run in slices after a push's answer, and a rebuild settles its own before it is
   // compared (`settle_rebuild`), so the live store is compared settled too: otherwise a build under way holds what it
   // has put so far and the two differ in holders and contents while their rows and refs agree.
@@ -1653,7 +1736,16 @@ pub(crate) fn assert_made_again_whole(
   let count = u64::try_from(records(state, repository).len()).expect("a count");
   let replayed = state.refusals.get(super::REPLAYED).copied().unwrap_or(0);
   super::rebuild(state, repository);
-  super::settle_rebuild(state, repository);
+  (live, count, replayed)
+}
+
+/// The store made again, its rebuild ended, equal to what the live one showed `before`: none refused, every record
+/// replayed once more.
+fn made_again_equal(
+  state: &mut ShardState,
+  (repository, greens): (RepositoryId, &[u64]),
+  (live, count, replayed): MadeAgainBefore,
+) {
   assert_eq!(state.vcs_stores.unrecovered(repository), None);
   derive_settled(state, repository);
   super::index_upkeep::merged_whole(state, repository);
@@ -1800,11 +1892,26 @@ fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
         .await
         .is_err()
     );
+    // Landed, the refused push's pack may be let go by its home (`homes::landed_pack_here`), its reads bringing it
+    // back: brought back here, as its next read's driver would, so its objects are judged by identity.
+    let pack = sealed.push.stored_pack();
+    brought_back_settled(repository, pack.as_slice()).await;
     on_state(|state| {
       // The refused push's homing left its names and pack with their region home (this shard): the home's, let go
       // here as the home lets go of content no record names; the repository holds nothing more.
       let_go_region_holds_since(state, &kept);
-      assert_eq!(state.vcs_stores.content().map(ContentStore::used), held);
+      // The push left whole as the design promises it, by identity: every object it brought read back whole through
+      // its own view; and the store holding no more than before, as no record took a hold (the first push's landed
+      // let-go between them may hold less, main's ruling of 2026-11-27 10:33: no resident-bytes equality).
+      assert!(
+        pushed_whole(state, (repository, &sealed), &second),
+        "the refused push's objects read whole"
+      );
+      let used = state.vcs_stores.content().map(ContentStore::used);
+      assert!(
+        used <= held,
+        "no more held after the refusal: {used:?} against {held:?}"
+      );
       assert_eq!(records(state, repository).len(), 1);
     });
     let changes = vec![BranchChange::Update {
@@ -1869,14 +1976,17 @@ fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
       .await,
       2
     );
+    let key = green_key(root);
     on_state(|state| {
       assert_recorded_and_charged(state, repository, root, (first.len(), second.len()));
-      let key = green_key(root);
       let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
       assert_eq!(store.version_of(content, key, &one), Some((1, first_tree)));
       assert_eq!(store.version_of(content, key, &two), Some((2, second_tree)));
       assert_eq!(store.versions(key), &[1, 2]);
-      assert_made_again_whole(state, repository, &[key]);
+    });
+    // Made again by its rebuild's own task, which fills a let-go pack from the node's store (the landed let-go's flip).
+    assert_made_again_whole_awaited(repository, &[key]).await;
+    on_state(|state| {
       // The records' own holds of their names and packs, which a free leaves (a rebuild replays the same records), let go
       // as a destroy of the repository lets them go with its records.
       super::release_record_holds(state, repository);
@@ -1888,6 +1998,27 @@ fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
       assert_eq!(state.vcs_stores.content().map(ContentStore::used), Some(0));
     });
   });
+}
+
+/// Whether every one of `objects` reads back whole, its type and bytes, by its id through `sealed`'s own view over
+/// `repository` (`views::PushedObjects`, the index first and then the push), the shard's chunk store lent to the read
+/// as every read of the repository's windows is (`vcs_store::Lent`).
+fn pushed_whole(
+  state: &mut ShardState,
+  (repository, sealed): (RepositoryId, &super::SealedPush),
+  objects: &[Brought],
+) -> bool {
+  use slates_git::receive::works::PushedBytes as _;
+  let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+  let Some((content, git)) = lent.stores.git_ref(repository) else {
+    return false;
+  };
+  let view = slates_git::store::views::PushedObjects::new(&git.repository, content, &sealed.push);
+  objects.iter().all(|(kind, id, bytes)| {
+    view
+      .pushed_object(id)
+      .is_some_and(|(read, got)| read == *kind && got.as_ref() == bytes.as_slice())
+  })
 }
 
 /// A push of `objects` to `repository` admitted and abandoned leaves nothing held or charged.
@@ -2117,6 +2248,10 @@ async fn pushed_many_awaited(name: &str, pushes: u64) -> (RepositoryId, DbVolume
 #[test]
 fn t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn() {
   let seen = crate::test_store::run_on_stored_shard(|| async {
+    // Kind (3) (main's rule of 2026-11-27 10:33): it steps the rebuild's turns itself to count them, which a task's
+    // fill of a let-go pack would take from it; made again over let-go windows:
+    // `vcs_store::tests::t_a664_a_store_made_again_compares_its_index_tables_merged_whole_on_both_sides`.
+    crate::test_store::keep_landed_here();
     let (repository, root) = pushed_many_awaited("sliced-rebuild", 5).await;
     on_state(|state| {
       let records = records(state, repository).len();
@@ -2577,6 +2712,74 @@ fn t_goal93_a_small_landed_packs_let_go_holds_the_same_rules_whatever_its_slices
   assert_let_go_sliced(&let_go_of_a_pack_of(3));
 }
 
+/// The landed let-go's flip, t_c1's rule under a pin (main 01a20182's ruling of 2026-11-27 17:55: a pin delays a
+/// replay's let-go again at the image's number, never renumbers it). Do: put a landed window in a git repository's
+/// content store and let it go as a landed pack's is, at a number; bring it back, as a warm restart's replay reads it
+/// back, and owe its let-go again at that number (`VcsStores::replay_aways`); pin it as an unlanded push of the same
+/// bytes pins it (`ContentStore::pin_unlanded`) and run the repository's owed let-go; then unpin it and run it again.
+/// Expect: pinned, the window held and its let-go counted waited, still owed; unpinned, let go at its first number,
+/// counted let go again; none renumbered (`REPLAY_KEPT_AGAIN` 0).
+#[test]
+fn a_replays_owed_window_a_push_pins_waits_and_is_let_go_at_its_image_number() {
+  let seen = crate::git_push::tests::on_stored_shard_with(["owed-pinned"], move |state, [id]| {
+    let bytes = vec![3u8; 900];
+    let window = super::within_budget(state, 900, |stores| {
+      let content = stores.content_mut().unwrap();
+      let window = content.put(&bytes).unwrap();
+      assert!(content.mark_landed(&window));
+      content.let_go_landed(&window, None).unwrap();
+      window
+    });
+    let at = *state
+      .vcs_stores
+      .content()
+      .unwrap()
+      .aways_of(&window)
+      .first()
+      .expect("let go at a number");
+    super::within_budget(state, 900, |stores| {
+      let content = stores.content_mut().unwrap();
+      content.bring_back(&window, &bytes).unwrap();
+      content.pin_unlanded(&window).unwrap();
+    });
+    state
+      .vcs_stores
+      .replay_aways
+      .entry(id)
+      .or_default()
+      .push(at);
+    let count =
+      |state: &crate::state::ShardState, name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    super::let_go_owed(state, id);
+    let pinned = (
+      state.vcs_stores.content().unwrap().is_away(&window),
+      count(state, super::REPLAY_LET_GO_WAITED),
+      state.vcs_stores.replay_aways.get(&id).cloned(),
+    );
+    super::within_budget(state, 0, |stores| {
+      stores.content_mut().unwrap().unpin_unlanded(&window)
+    });
+    super::let_go_owed(state, id);
+    let unpinned = (
+      state.vcs_stores.content().unwrap().aways_of(&window),
+      count(state, super::REPLAY_LET_GO_AGAIN),
+      count(state, super::REPLAY_KEPT_AGAIN),
+    );
+    (at, pinned, unpinned)
+  });
+  let (at, pinned, unpinned) = seen;
+  assert_eq!(
+    pinned,
+    (false, 1, Some(vec![at])),
+    "held, waited, still owed at its number"
+  );
+  assert_eq!(
+    unpinned,
+    (vec![at], 1, 0),
+    "let go at its image number, none renumbered"
+  );
+}
+
 /// What [`let_go_of_a_pack_of`] saw: the bytes let go in the step that owed it; each slice's record; the slices counted
 /// and those judged past the quantum; the bytes freed, the windows still pinned and the pack's length; whether the pack
 /// is held whole after; and the pack's windows.
@@ -2963,18 +3166,22 @@ fn t_a664_a_store_made_again_compares_its_index_tables_merged_whole_on_both_side
       .await;
       parent = Some((commit, tree));
     }
-    on_state(|state| {
-      let merged = |state: &ShardState| {
-        state
-          .refusals
-          .get(super::index_upkeep::MERGED)
-          .copied()
-          .unwrap_or(0)
-      };
+    let merged = |state: &ShardState| {
+      state
+        .refusals
+        .get(super::index_upkeep::MERGED)
+        .copied()
+        .unwrap_or(0)
+    };
+    let before = on_state(|state| {
       let before = merged(state);
       super::index_upkeep::merged_whole(state, repository);
       assert_eq!(merged(state), before + 1, "the live index merged whole");
-      assert_made_again_whole(state, repository, &[green_key(root)]);
+      before
+    });
+    // Made again by its rebuild's own task, which fills a let-go pack from the node's store (the landed let-go's flip).
+    assert_made_again_whole_awaited(repository, &[green_key(root)]).await;
+    on_state(|state| {
       assert_eq!(
         merged(state),
         before + 2,

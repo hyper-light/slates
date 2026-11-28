@@ -298,6 +298,10 @@ fn scene() -> Scene {
   crate::test_store::run_on_stored_shard_made_all(
     (&owner(), asked),
     |[(repository, main)]| async move {
+      // Kind (3) (main's rule of 2026-11-27 10:33): its views are sealed by hand, with no push's driver to bring a
+      // let-go window back, and its point is what a hook sees; a hooked push over let-go windows:
+      // `git_push::tests::b9_a_hooked_push_over_a_let_go_pack_brings_its_views_windows_back_and_lands`.
+      crate::test_store::keep_landed_here();
       let readme = |text: &[u8]| [(b"README".to_vec(), text.to_vec())];
       let (first, old) = commit_of(&readme(b"first\n"), &[], FIRST_DATE);
       let read =

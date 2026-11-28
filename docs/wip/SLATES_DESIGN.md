@@ -15239,6 +15239,12 @@ arrival. At r400 of hg's history the stream is 99 files and 466 KB against stock
 813 KB). The changelog is written without generaldelta, as 7.2 writes a new one: each delta in it against the
 revision before, its entry's base its chain's start, and a store holding another serves no stream. Still owed: the
 deltas the pinned writer would choose.
+Status (2026-11-27, the stream's index rows a run a step): the gathering reads each log's index numbers (parents,
+link, node, flags, length) in one range walk of the index, which opens only the sealed tables whose first and last
+keys can meet the log's range, and spends at most a step's bytes touched (half the step quantum at the measured copy
+rate) or the room, whichever first. The index stage then writes as many rows a step as one step's copy holds, from
+those numbers, with no lookup a row, and the next log is the count pass's next sized one. Measured on a 1,200-revision
+stock history over 48 sealed runs: 0.37 index reads a revision, from 4.47.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
@@ -58819,7 +58825,11 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > the `Repository` keeps the first such miss (`Repository::waiting`), and `vcs_store::read_through::bring_back` reads the
 > window from the node's store (`StoreHandle::piece`, the payload by its BLAKE3, `ContentStore::object_identity`) and puts
 > it back (`ContentStore::bring_back`); the driver takes the step again (w-git's, in upload and the encoding). The
-> let-go after a landing itself is item 2b, owed.
+> let-go after a landing itself is item 2b: lifted 2026-11-27 (`vcs_store::LANDED_LET_GO`, GAPS "LIFTED"), once every
+> reader that meets a let-go window stops and has it brought back, and an unlanded push's windows are pinned against
+> another push's let-go of the same bytes (`ContentStore::pin_unlanded`). A warm restart keeps every window's
+> published let-go number, a landed pack's too: the replay that reads a landed pack back lets its windows go again at
+> the image's numbers (`ContentStore::let_go_landed_again`), so no page of the Aways family moves (A-923).
 
 > **Status (2026-11-20, C5's store side: git's pack read from the store).** `crates/server/src/vcs_store/store_packs.rs`
 > (`StorePacks`): git's synchronous `PackSource::piece` over the store, which only its owner thread reads. An awaited
@@ -61663,8 +61673,8 @@ Applied in the same change to: `crates/git/src/store/packed.rs` (`PackSource::aw
 `away`), `crates/vcs/src/content.rs` (`away_window`, `object_identity`), `crates/server/src/vcs_store/read_through.rs`
 (`bring_back`), `crates/cli/tests/git_interop.rs` (the RSS test prints the memory gauges at each reading), the C5 status.
 
-Status: built 2026-11-22, macOS arm64 (focused tests); the drivers' wait (w-git) and the let-go after a landing (item 2b)
-owed.
+Status: built 2026-11-22, macOS arm64 (focused tests); the drivers' wait (w-git) built since, and the let-go after a
+landing (item 2b) lifted 2026-11-27 (GAPS "LIFTED").
 - Why: a landed push's pack is held in RAM twice, its staged copy on the repository's shard and its windows homed in
   the region (61.3 and 53.9 MB for git/git v2.0.0), while the node's store holds it durably as the changeset's
   `Payload`. Letting the windows go (A-724 piece 4's `Kept::Away`) needs a read that meets one to bring it back: a let-go
@@ -66621,3 +66631,70 @@ Applied in the same change to:
     `a_log_kept_for_its_newest_part_is_forgettable_only_once_every_candidate_holds_it`.
 - **Applied in the same change to:** `crates/server/src/{state_log,fleet,daemon}.rs`,
   `crates/server/src/state_log/tests.rs`, `crates/server/tests/fleet.rs`, GAPS.
+
+### A-935 — An owner keeps each green's newest version pending once every candidate holds it, so a candidate a death brings in is shipped it with no push (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 17:12 and 17:29; the green sibling of A-934; corrects GAP-A9-7's record half, A-918 B)
+
+- **Why.** A newcomer reads a green's chain on `Behind` (A-918 B), and it answers `Behind` only to a record shipped to
+  it. An owner released a version's pending record once every candidate held it (`record_merge_acks`), and nothing
+  ships a placed version again (A-412). So a candidate a death brought in was shipped the green only by the next push's
+  version, and in a quiet stretch the first death's repair window never closed: a second death then lost a green
+  `f = 1` keeps. 2816da877's a914 run 3: its first death's push never reached a, and the newcomer stayed outside the
+  green's holders for 400 s while it held the names log (A-934).
+- **The rule.** `PendingGreen::release_held` releases each version every candidate holds **but the newest**. The
+  newest stays pending, its placements kept; a neighbourhood change retargets it (`PendingGreen::retarget`, every pass
+  of `next_merge_work`), so it is owed to the candidate the change brought in and ships to it. The newcomer, holding
+  none of the chain, answers `Behind` and reads the chain before it from its cohort, with the versions' inputs, and
+  rebuilds (A-918 B). An older version kept is released once a later one is held everywhere. Version 0's inputs go
+  when version 0 is released.
+- **Not changed.** The settle counts each green's newest version on `f + 1` of the current cohort, the owner among
+  them (`greens_placed_on_current_cohort`), the design's settle rule (main's ruling of 17:29). What this adds is that
+  the repair window closes with no traffic, which a914's precondition tests.
+- **The bound.** One version a green this node owns beyond those still owed: its value and its two placements, dropped
+  with the green at its destroy, as the pending map always was.
+- **Tests.** Fleet `a935_a_candidate_a_death_brings_in_holds_each_greens_newest_version_with_no_push` (red first): four
+  nodes at `f = 1`, one push, both candidates holding the green, one of them stopped and taken over, nothing pushed.
+  The newcomer must hold the green's newest placed version within the repair path's bound, derived in the test
+  (the retarget's ship, the `Behind` heard and the read asked, the read's answers, the inputs fetched and the rebuild:
+  5 passes of up to 10 periods each). Red: the newcomer's replica at `None` after its 50 periods.
+  - a914 goes back to main's (d): its first death's push refused `retry` (A-914 (c)'s prior, OPEN) goes on to the
+    repair-window precondition, which then proves the repair needs no traffic; any other refusal fails at once.
+- **Applied in the same change to:** `crates/server/src/merge_service.rs`, `crates/server/tests/fleet.rs`, GAPS.
+
+### A-914 (c) — A push's homing deadline follows the homing window as it is measured during the death, held to its formula at the watchdog's window ceiling (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 17:57 and 17:58; amends A-912 and A-914 (a))
+
+- **Why.** A first death under load refused its push `retry` at the homing (A-914 (c)'s prior: 4 of 7, then 5 of 16 a914
+  runs at load). `vcs_store::homes::homed_in_region` fixed its deadline once, from `fleet::homing_budget()` at the push's
+  start: detection, confirmation and the configuration changes at the coordinator period measured before the death.
+  A load spike arrives with the death, the council's confirmation runs in the stretched periods, and the silence to the
+  install was 4.2 to 5.3 s against a window of 3.7 s; the estimate read 6 to 9 s of confirmation once those periods were
+  measured, but the homing never read it again.
+- **The rule.**
+  - The homing's deadline is its start plus the longer of the window it began with and this shard's window now
+    (`live_deadline_ns`; `refresh_failover` re-derives the window each period and fans it to every shard). It is read
+    each turn, and the wait for an install is waited again while the window grew meanwhile
+    (`install_within_live_deadline`). Still no timer: the homing waits on installs within a derived bound.
+  - The window is held to its formula at the watchdog's window ceiling (`watchdog::WINDOW_CEILING_NS`, the observation
+    budget): a coordinator or detector period longer than it is a wedge the watchdog ends, not a slow period. Each
+    coordinator period sample is clamped there (`Failover::period_began`), and `fleet::homing_window_ceiling` is the
+    formula with every period tail and the broadcast round trip at their maximum, five times the ceiling (a running
+    tail's smoothed value and deviation each at most the ceiling): `(4 (m − 1) − 1) + (max(base, floor) + 1) +
+    (2 + 2 (m − 1))` periods and a round trip, 1,550 s at four members and the floor's base. The detector's periods and
+    a learned silence are held by that maximum. So a window that keeps growing still ends, and a live deadline with it.
+  - Nothing changes below the ceiling: there the deadline follows the measured window. 1,550 s is the formula's maximum
+    with every period at the watchdog's ceiling, a cluster in wedge territory, not a wait anyone should see (main's
+    reading of 18:23).
+- **Counted.** `vcs_store.homes.homing_waited_ns_most` (the longest a homing waited before it homed) and
+  `vcs_store.homes.homing_deadline_ns_most` (the largest deadline one homed under).
+- **Tests.**
+  - Fleet `a914c_a_push_homed_on_a_member_dying_under_load_waits_for_its_install_and_lands` (red first). Four nodes at
+    `f = 1`; every node's periods stretched as a914 stretches them and d stopped; a pushes again and again until one
+    homing is ranked again after the install and kept (`homing_reranked_kept`), a push is refused, or the death
+    installs. No count is chosen: each push homes two identities, so a run where none waits has probability `4^-n`.
+    Every push must land, and one must have waited, its deadline past the window the death began with. Red: the first
+    push refused `retry`, a 3.76 s window, nothing waited.
+  - Units: `slates_cluster::failover::tests::a_period_past_the_ceiling_counts_as_the_ceiling` and
+    `fleet::tests::a_homing_window_is_held_to_its_formula_at_the_window_ceiling`.
+  - a914 now asserts its first death's push lands (main's (r2)), `retry` included; the server's `HOMED_SHORT` words
+    are no longer told apart by a test, so they go back to the crate.
+- **Applied in the same change to:** `crates/cluster/src/failover.rs`, `crates/server/src/{fleet,vcs_store/homes}.rs`,
+  `crates/server/tests/fleet.rs`, GAPS.
