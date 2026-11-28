@@ -3284,7 +3284,7 @@ async fn homed_in_region(
   deferred: Option<&mut Barrier>,
 ) -> Homed {
   let identity = source.identity();
-  let budget_ns = budget.max_deadline_ns();
+  let start_ns = budget.max_deadline_ns();
   let began = slates_rt::futures::now_ns();
   let held = matches!(source, HomeSource::Held(..));
   let mut homing = Homing {
@@ -3321,9 +3321,15 @@ async fn homed_in_region(
       if homing.reranked {
         let _ = crate::state::with_state(|state| state.count(HOMING_RERANKED_KEPT, 1));
       }
-      crate::state::with_state(|state| state.count(HOMED_IN_REGION, 1));
+      let waited = slates_rt::futures::now_ns().saturating_sub(began);
+      crate::state::with_state(|state| {
+        state.count(HOMED_IN_REGION, 1);
+        state.count_max(HOMING_WAITED_MOST, waited);
+        state.count_max(HOMING_DEADLINE_MOST, live_deadline_ns(start_ns));
+      });
       return homing.ended(Ok(identity));
     }
+    let budget_ns = live_deadline_ns(start_ns);
     let left_ns = budget_ns.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
     // No home ranked (no members known) is never homed, and never a loop.
     if left_ns == 0 || homes.is_empty() {
@@ -3349,13 +3355,49 @@ async fn homed_in_region(
       return homing.short(identity, (&homes, budget_ns));
     }
     // A home did not keep it: ranked again once this node installs a configuration (a death dropped, A-912), never on a
-    // timer, within what is left.
-    let left_ns = budget_ns.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
-    if left_ns == 0 || !install_after(installs, left_ns).await {
-      return homing.short(identity, (&homes, budget_ns));
+    // timer, within what is left of the live deadline.
+    if !install_within_live_deadline(installs, began, start_ns).await {
+      return homing.short(identity, (&homes, live_deadline_ns(start_ns)));
     }
   }
 }
+
+/// A homing's deadline from its start (A-914 (c), main 01a20182's ruling of 2026-11-27 17:57): the window it began with,
+/// `start_ns`, or this shard's homing window now where that is longer (`fleet::homing_window`, re-derived each period and
+/// fanned to every shard). A death's confirmation runs in periods a load stretches, so a window fixed from periods
+/// measured before it refused the push `retry` before the install it waited for (a914: 3.7 s against silences of 4.2 to
+/// 5.3 s, the estimate's confirmation reaching 6 to 9 s as the stretched periods were measured). Bounded: the window is
+/// held to its formula at the watchdog's window ceiling (`fleet::homing_window_ceiling`), so a window that keeps growing
+/// still ends.
+fn live_deadline_ns(start_ns: u64) -> u64 {
+  crate::state::with_state(|state| state.homing_window_ns)
+    .unwrap_or(0)
+    .max(start_ns)
+}
+
+/// Whether this node installs a configuration after `installs` within what is left of a homing's live deadline, begun at
+/// `began` with the window `start_ns` ([`live_deadline_ns`]): a wait that ends at what was left is waited again while the
+/// window grew meanwhile, and ends once nothing is left (A-914 (c)).
+async fn install_within_live_deadline(installs: u64, began: u64, start_ns: u64) -> bool {
+  loop {
+    let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
+    let left_ns = live_deadline_ns(start_ns).saturating_sub(elapsed);
+    if left_ns == 0 {
+      return false;
+    }
+    if install_after(installs, left_ns).await {
+      return true;
+    }
+  }
+}
+
+/// Counter: the longest a homing waited before it homed, nanoseconds (A-914 (c)): a push that waited past the window it
+/// began with and still homed shows it here. Format: a counter name in the daemon's status report.
+pub(crate) const HOMING_WAITED_MOST: &str = "vcs_store.homes.homing_waited_ns_most";
+
+/// Counter: the largest deadline a homing ran under as it homed, nanoseconds (A-914 (c), [`live_deadline_ns`]). Format:
+/// a counter name in the daemon's status report.
+pub(crate) const HOMING_DEADLINE_MOST: &str = "vcs_store.homes.homing_deadline_ns_most";
 
 /// One homing in the region as it goes ([`home_in_region`], A-912): the homes that kept the window so far, its bytes, the
 /// homes it was last ranked at, and whether a configuration installed meanwhile ranked them differently.

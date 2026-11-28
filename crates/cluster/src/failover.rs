@@ -369,12 +369,16 @@ impl Failover {
     ));
   }
 
-  /// A coordinator period began at `now_ns`: the time since the one before is a sample of the period's length. A clock
-  /// that read earlier than the last (none on one host's monotonic clock) is no sample.
-  pub fn period_began(&mut self, now_ns: u64) {
+  /// A coordinator period began at `now_ns`: the time since the one before is a sample of the period's length, at most
+  /// `ceiling_ns` (A-914 (c), main 01a20182's ruling of 2026-11-27 17:57): the caller's window ceiling, past which a
+  /// period is a wedge its watchdog ends and not a slow period, so every term counted in periods, and the windows
+  /// derived from them, have a maximum. A clock that read earlier than the last (none on one host's monotonic clock) is
+  /// no sample.
+  pub fn period_began(&mut self, now_ns: u64, ceiling_ns: u64) {
     if let Some(last) = self.last_period_began_ns
       && let Some(length) = now_ns.checked_sub(last)
     {
+      let length = length.min(ceiling_ns);
       self.periods.on_sample(length);
       self.recent_periods.on_sample(length);
     }
@@ -591,7 +595,7 @@ mod tests {
     let mut failover = Failover::new();
     let mut now = 0u64;
     for _ in 0..16 {
-      failover.period_began(now);
+      failover.period_began(now, u64::MAX);
       now = now.saturating_add(3 * HEARTBEAT);
     }
     let estimate = failover.refresh(None, &ElectionTiming::floor(), HEARTBEAT);
@@ -847,10 +851,31 @@ mod tests {
   #[test]
   fn a_period_clock_that_reads_earlier_is_no_sample() {
     let mut failover = Failover::new();
-    failover.period_began(5 * HEARTBEAT);
-    failover.period_began(4 * HEARTBEAT);
+    failover.period_began(5 * HEARTBEAT, u64::MAX);
+    failover.period_began(4 * HEARTBEAT, u64::MAX);
     assert_eq!(failover.periods().samples(), 0);
-    failover.period_began(5 * HEARTBEAT);
+    failover.period_began(5 * HEARTBEAT, u64::MAX);
     assert_eq!(failover.periods().samples(), 1);
+  }
+
+  /// A-914 (c), the ceiling (main 01a20182's ruling of 2026-11-27 17:57): a coordinator period past the caller's window
+  /// ceiling counts as the ceiling. Do: time one period at a heartbeat, then one a hundred heartbeats long under a ceiling
+  /// of ten. Expect the recent maximum at the ceiling, never past it, and the running tail below what the long one
+  /// would have made it.
+  #[test]
+  fn a_period_past_the_ceiling_counts_as_the_ceiling() {
+    let ceiling = 10 * HEARTBEAT;
+    let mut failover = Failover::new();
+    failover.set_recent_window(4);
+    failover.period_began(0, ceiling);
+    failover.period_began(HEARTBEAT, ceiling);
+    failover.period_began(101 * HEARTBEAT, ceiling);
+    assert_eq!(failover.periods().samples(), 2);
+    assert_eq!(failover.recent_period_max_ns(), Some(ceiling));
+    let mut unclamped = Failover::new();
+    unclamped.period_began(0, u64::MAX);
+    unclamped.period_began(HEARTBEAT, u64::MAX);
+    unclamped.period_began(101 * HEARTBEAT, u64::MAX);
+    assert!(failover.period_tail_ns() < unclamped.period_tail_ns());
   }
 }

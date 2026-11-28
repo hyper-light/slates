@@ -38239,11 +38239,10 @@ const CREATION_WATCH_PERIODS: u64 = 20;
 /// push's `unable to commit` is the typed answer (41aa47870 run 7: the green placed at 2 of 3, the newcomer behind,
 /// `merge.behind.heard` 9). A precondition that never holds fails here, before the second death, named.
 ///
-/// A push during the first death refused other than by its homing's `retry` fails the run at once, named (main
-/// 01a20182's rulings of 2026-11-27 17:05 and 17:12, its (d)): the design gives no such answer (2816da877's run 3: a's
-/// own HTTP port refusing the connection at 0 ms). A `retry` there is A-914 (c)'s prior, OPEN, a typed answer, and the
-/// run goes on: since A-935 the owner ships the green's newest version to the newcomer with no push, so the precondition
-/// proves the repair needs no traffic. Told by the words the server answers it in ([`slates_server::HOMED_SHORT`]).
+/// The push during the first death must land, and a refused one fails the run at once, named (main 01a20182's rulings
+/// of 2026-11-27 17:05, 17:12 and 17:58, its (r2)): since A-914 (c) its homing's deadline follows the window as the
+/// death's stretched periods are measured, so a `retry` there is no longer the typed prior it was; and since A-935 the
+/// repair window closes with no push either way, which the precondition proves.
 #[test]
 fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first() {
   let _serial = serialize_fleet_tests();
@@ -38257,11 +38256,9 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
   );
   let first = fleet.push(0, ("first.txt", b"main before any death\n"));
   let at_d = stretched_death(&mut fleet, 3, "after-d.txt");
-  if let Err(refused) = &at_d.1
-    && !refused.contains(slates_server::HOMED_SHORT)
-  {
+  if let Err(refused) = &at_d.1 {
     fleet.stop();
-    panic!("the first death's push refused, unexpected: {refused}");
+    panic!("the first death's push landed, before f = 1's repair window is waited for: {refused}");
   }
   let (repaired, holders) = repair_window_closed(&fleet);
   let during = [at_d, stretched_death(&mut fleet, 2, "after-c.txt")];
@@ -38309,6 +38306,110 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
     Ok(()),
     "the push during the second death landed"
   );
+}
+
+/// A-914 (c) (main 01a20182's rulings of 2026-11-27 17:57 and 17:58: the first death's homing, the window fixed from
+/// periods measured before the death). Do: on a four-node `f = 1` git fleet with a repository on a, push `main`;
+/// stretch every node's coordinator periods (as [`stretched_death`] does, a load spike arriving with the death) and stop
+/// d; then, from a, push on top again and again until one push's homing has ranked its homes again after the death's
+/// install and been kept (`vcs_store.homes.homing_reranked_kept`: it waited for the install, d among its homes), or a
+/// push is refused, or the death installs at a. The death's own window bounds the pushes, so no count is chosen: each
+/// push homes two identities, its names and its pack, so it misses d with probability 1/4, and a run where none waits
+/// has probability `4^-n` over the `n` that fit, printed. Expect every push to land and one to have waited, its
+/// deadline (`vcs_store.homes.homing_deadline_ns_most`) past the window the death began with. Red before A-914 (c): the
+/// homing's deadline was the window at its start, 3.7 s against silences of 4.2 to 5.3 s, so the first push homed on d
+/// was refused `retry` before the install it waited for (a914's first death, 5 of 16 at load).
+#[test]
+fn a914c_a_push_homed_on_a_member_dying_under_load_waits_for_its_install_and_lands() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), stores, lease) =
+    started_git_fleet_of("stretched-first-death", &["a", "b", "c", "d"]);
+  let mut fleet = founded_git_fleet(
+    "stretched-first-death",
+    (daemons, hosts),
+    stores,
+    (Some(lease), None),
+  );
+  let first = fleet.push(0, ("first.txt", b"main before the death\n"));
+  for daemon in &fleet.daemons {
+    daemon.inject_period_stretch(Some(STRETCH_NS)).unwrap();
+  }
+  let gone = fleet.hosts[3];
+  fleet.daemons.remove(3).stop();
+  let window = fleet.daemons[0].homing_window();
+  let pushes = push_until_a_homing_waits(&fleet, gone);
+  let counts = homing_counts(&fleet.daemons[0]);
+  for daemon in &fleet.daemons {
+    daemon.inject_period_stretch(None).unwrap();
+  }
+  fleet.stop();
+  eprintln!(
+    "stretched-first-death: first {first:?}; the window at the death {window:?}; {} pushes {pushes:?}; a's (reranked and \
+     kept, deadline most, waited most, silence longest) {counts:?}",
+    pushes.len()
+  );
+  assert_eq!(first, Ok(()), "the push before the death landed");
+  assert!(
+    pushes.iter().all(Result::is_ok),
+    "every push during the stretched first death landed: {pushes:?}"
+  );
+  let start = window
+    .as_ref()
+    .map_or(u64::MAX, |reading| reading.window_ns);
+  assert!(
+    counts
+      .as_ref()
+      .is_ok_and(|(kept, deadline, _, _)| *kept >= 1 && *deadline > start),
+    "a push's homing waited for the install, its deadline past the window it began with ({start} ns): {counts:?}"
+  );
+}
+
+/// Pushes on top at a, a new file each time, until a push is refused, one's homing was ranked again after an install and
+/// kept, or `gone`'s death installed at a (A-914 (c)'s test): each push's answer, in order. Bounded by the death's own
+/// window and, if it never installs, by [`RETIREMENT_DEADLINE`].
+fn push_until_a_homing_waits(fleet: &GitFleet, gone: HostId) -> Vec<Result<(), String>> {
+  let began = Instant::now();
+  let mut pushes = Vec::new();
+  while began.elapsed() < RETIREMENT_DEADLINE {
+    let file = format!("during-{}.txt", pushes.len());
+    let pushed = fleet.push_on_top(0, (&file, file.as_bytes()));
+    let refused = pushed.is_err();
+    pushes.push(pushed);
+    if refused
+      || homed_past_an_install(&fleet.daemons[0])
+      || installed_without(&fleet.daemons[0], gone)
+    {
+      break;
+    }
+  }
+  pushes
+}
+
+/// Whether one of `daemon`'s homings was ranked again after an install and kept (`vcs_store.homes.homing_reranked_kept`).
+fn homed_past_an_install(daemon: &Daemon) -> bool {
+  move_counter(daemon, "vcs_store.homes.homing_reranked_kept").is_ok_and(|kept| kept >= 1)
+}
+
+/// Whether `daemon`'s council no longer seats `gone`: its death installed there.
+fn installed_without(daemon: &Daemon, gone: HostId) -> bool {
+  daemon
+    .council_members()
+    .is_ok_and(|members| !members.contains(&gone))
+}
+
+/// What A-914 (c)'s test reads of a's homings: (reranked and kept, the largest deadline one homed under, the longest one
+/// waited, the longest death's silence to its install it measured), or why they could not be read.
+type HomingCounts = Result<(u64, u64, u64, u64), ObserveError>;
+
+/// [`HomingCounts`] of `daemon`.
+fn homing_counts(daemon: &Daemon) -> HomingCounts {
+  let read = |name: &str| move_counter(daemon, name);
+  Ok((
+    read("vcs_store.homes.homing_reranked_kept")?,
+    read("vcs_store.homes.homing_deadline_ns_most")?,
+    read("vcs_store.homes.homing_waited_ns_most")?,
+    read("failover.silence_longest_ns")?,
+  ))
 }
 
 /// A node's homing window as read from its status, or why it could not be ([`stretched_death`]'s readings).
