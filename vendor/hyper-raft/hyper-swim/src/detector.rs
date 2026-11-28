@@ -673,6 +673,9 @@ pub struct PeerReport {
     /// stated ([`Ack::relay_within_ns`]); `None` before one, while the peer is asked to relay
     /// nothing.
     pub relay_within: Option<Duration>,
+    /// slates: this member's probes of the peer that went unanswered while its owner held them
+    /// unjudged ([`Detector::hold_judging`]): counted, never accounted or missed.
+    pub unjudged: u64,
 }
 
 /// The relay stage as the member bounds it ([`Detector::relays`]).
@@ -837,6 +840,8 @@ struct Peer {
     /// The peer's liveness in the view, kept as each change is adopted ([`Detector::adopted`]), so a
     /// judgement reads it without a lookup.
     liveness: Option<Liveness>,
+    /// slates: whether its owner holds the peer's probes unjudged ([`Detector::hold_judging`]).
+    held: bool,
 }
 
 impl Peer {
@@ -858,6 +863,8 @@ impl Peer {
             reused: None,
             contribution: Contribution::default(),
             liveness: None,
+            // slates: judged until its owner holds it (`Detector::hold_judging`).
+            held: false,
         }
     }
 
@@ -1176,6 +1183,9 @@ pub struct Detector {
     extensions: BTreeMap<HostId, ExtensionTracker>,
     /// The suspects a condemnation visits, held across periods so it allocates nothing once grown.
     aging: Vec<(HostId, u64)>,
+    /// slates: the probes that went unanswered while their peer was held unjudged, every peer's
+    /// ([`Detector::unjudged`]).
+    unjudged: u64,
     /// The relays an indirect probe ranks, held for the same reason.
     relays: Vec<HostId>,
     /// The relays the period's probe asked that have not responded, an answer or a nack: its relay
@@ -1313,6 +1323,8 @@ impl Detector {
             period: 0,
             extensions: BTreeMap::new(),
             aging: Vec::new(),
+            // slates: none held yet (`Detector::hold_judging`).
+            unjudged: 0,
             relays: Vec::new(),
             awaiting: Vec::new(),
             deaths: VecDeque::new(),
@@ -1408,6 +1420,26 @@ impl Detector {
     /// a false suspicion: an owner that takes no action on a death.
     pub fn set_condemnation_cost(&mut self, cost: Duration) {
         self.condemnation_cost = cost;
+    }
+
+    /// slates: holds `peer`'s probes unjudged (`held`) or judges them again. While held, a probe of
+    /// it that goes unanswered is neither accounted nor missed: it neither suspects the peer nor
+    /// makes its condemnation pending, and a condemnation already pending is not taken while held.
+    /// Each is counted ([`PeerReport::unjudged`], [`Detector::unjudged`]). An answered probe is
+    /// handled as ever. Its owner holds a peer whose process it knows restarted until it can probe
+    /// the new one (slates' A-921 part 5: a re-key's window), and releases it once it can, or once
+    /// its detection has passed. Whether `peer` is in the view.
+    pub fn hold_judging(&mut self, peer: HostId, held: bool) -> bool {
+        self.peers
+            .get_mut(&peer)
+            .map(|known| known.held = held)
+            .is_some()
+    }
+
+    /// slates: the probes that went unanswered while their peer was held unjudged, every peer's
+    /// ([`Detector::hold_judging`]): an owner's evidence that a hold took effect.
+    pub fn unjudged(&self) -> u64 {
+        self.unjudged
     }
 
     /// The least a judged period of this member lasts, nanoseconds: the detection budget's share of
@@ -1780,6 +1812,12 @@ impl Detector {
         let Some(peer) = self.peers.get_mut(&probe.target) else {
             return;
         };
+        // slates: a held peer's unanswered probe is only counted (`Detector::hold_judging`).
+        if peer.held && !probe.answered {
+            peer.report.unjudged = peer.report.unjudged.saturating_add(1);
+            self.unjudged = self.unjudged.saturating_add(1);
+            return;
+        }
         Self::account(peer, probe.verdict);
         if probe.answered {
             peer.clear_pending();
@@ -1874,7 +1912,8 @@ impl Detector {
             let Some(pending) = peer.pending_since else {
                 continue;
             };
-            if host == answered {
+            // slates: a held peer's pending condemnation waits for its release.
+            if host == answered || peer.held {
                 continue;
             }
             let after = peer
@@ -3665,6 +3704,60 @@ mod tests {
         for peer in [B, C] {
             assert_eq!(liveness(&detector, peer), Liveness::Alive);
         }
+    }
+
+    /// slates: a held peer's unanswered probes are counted, neither accounted nor missed, so its
+    /// owner's hold keeps a silent peer alive; released, they are judged again and it is condemned.
+    #[test]
+    fn slates_a_held_peer_s_unanswered_probes_are_unjudged_until_it_is_released() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &peers);
+        let before = detector.report(A).unwrap();
+        assert!(detector.hold_judging(A, true), "A is in the view");
+        let mut state = 11;
+        for _ in 0..200 {
+            world.run(&mut detector, 1, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+        }
+        let held = detector.report(A).unwrap();
+        assert_eq!(
+            liveness(&detector, A),
+            Liveness::Alive,
+            "never suspected while held"
+        );
+        assert_eq!(
+            (
+                held.suspicions,
+                held.condemnations,
+                held.suspicion_allowance
+            ),
+            (
+                before.suspicions,
+                before.condemnations,
+                before.suspicion_allowance
+            ),
+            "no held probe accounted or missed"
+        );
+        assert!(held.unjudged > 0, "the held probes counted");
+        assert_eq!(detector.unjudged(), held.unjudged);
+        assert!(detector.hold_judging(A, false));
+        for _ in 0..200 {
+            world.run(&mut detector, 1, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+            if liveness(&detector, A) == Liveness::Dead {
+                break;
+            }
+        }
+        assert_eq!(
+            liveness(&detector, A),
+            Liveness::Dead,
+            "judged again once released"
+        );
+        assert_eq!(detector.report(A).unwrap().unjudged, held.unjudged);
     }
 
     /// Drives `detector` from `now` with any number of answers in flight: `answer` gives each probe's

@@ -226,6 +226,13 @@ pub(crate) struct PlaneState {
   /// Members whose announcement task ([`announce_epochs`]) has ended, for the member loop to join on its next turn.
   /// Bounded by the loop's tasks in flight, one a member.
   pub announce_done: std::collections::BTreeSet<HostId>,
+  /// Per member whose process this node learned restarted under its id, when it learned it on the control shard's
+  /// clock: its re-key's window, while the detector holds its probes unjudged (A-921 part 5, [`rekey_windows`]). Until
+  /// this node re-keys it, its probes reach it under its old process's keys and go unanswered, and it cannot refute a
+  /// suspicion it cannot hear. Bounded by the fleet's peer capacity, as `announced_from` is.
+  pub rekeying: BTreeMap<HostId, u64>,
+  /// The detector's count of probes held unjudged (`MemberPlane::hold_judging`) last folded into [`REKEY_UNJUDGED`].
+  pub unjudged_counted: u64,
 }
 
 impl std::fmt::Debug for PlaneState {
@@ -369,6 +376,7 @@ fn note_reconnected(state: &mut ShardState, anchor: HostId, member: HostId, proc
   if restarted {
     // The attempts its old process left are resolved (A-727 (d1a-3)).
     crate::vcs_store::homes::resolve_owed();
+    open_rekey_window(state, member);
   }
   if restarted && anchor > state.origin_anchor {
     state.record_sessions.remove(&member);
@@ -382,6 +390,106 @@ fn note_reconnected(state: &mut ShardState, anchor: HostId, member: HostId, proc
 /// Counter: a member that announced itself from a new process, whose session this node dialed as the pair's canonical
 /// dialer was dropped to be dialed afresh.
 const PEER_RECONNECTED: &str = "fleet.plane.peer_reconnected";
+
+/// Opens `member`'s re-key window (A-921 part 5, main's ruling of 2026-11-28 00:42): this node learned its process
+/// restarted, so until it re-keys the new one its probes of it are held unjudged ([`rekey_windows`] closes it). A
+/// member already in one keeps its opening; a new one past the fleet's peer capacity opens none.
+fn open_rekey_window(state: &mut ShardState, member: HostId) {
+  if state.plane.rekeying.contains_key(&member) {
+    return;
+  }
+  if state.plane.rekeying.len() >= state.config.fleet_peer_capacity {
+    return;
+  }
+  let held = state
+    .plane
+    .plane
+    .as_mut()
+    .is_some_and(|plane| plane.hold_judging(member, true));
+  if held {
+    let now = slates_machine::clock::monotonic_ns();
+    state.plane.rekeying.insert(member, now);
+    crate::fleet::count_refusal_in(state, REKEY_OPENED);
+  }
+}
+
+/// The member loop's turn of the re-key windows (A-921 part 5): each closes once its member's installed epoch names the
+/// process it announced last (`PlaneState::keyed_process`, the re-key's install) or one detection after it opened,
+/// whichever comes first, and its probes are judged again; and the probes the detector held unjudged since the last
+/// turn are counted ([`REKEY_UNJUDGED`]). A process that dies just after its restart is so condemned within one
+/// detection plus the detector's own bound, the window's price, paid only while it is open.
+fn rekey_windows(state: &mut ShardState, now_ns: u64) {
+  let detection = rekey_detection_ns(state);
+  let closing: Vec<(HostId, &'static str)> = state
+    .plane
+    .rekeying
+    .iter()
+    .filter_map(|(member, opened)| {
+      let keyed = state
+        .plane
+        .keyed_process
+        .get(member)
+        .is_some_and(|keyed| state.plane.announced_from.get(member) == Some(keyed));
+      let expired = now_ns.saturating_sub(*opened) >= detection;
+      match (keyed, expired) {
+        (true, _) => Some((*member, REKEY_CLOSED_KEYED)),
+        (false, true) => Some((*member, REKEY_CLOSED_EXPIRED)),
+        (false, false) => None,
+      }
+    })
+    .collect();
+  for (member, why) in closing {
+    close_rekey_window(state, member, why);
+  }
+  count_unjudged(state);
+}
+
+/// How long a re-key window stays open at most: this node's failover detection term, the daemon's liveness window
+/// before one is measured (the window the term is derived under).
+fn rekey_detection_ns(state: &ShardState) -> u64 {
+  state
+    .failover
+    .estimate()
+    .detection
+    .map_or(crate::daemon::LIVENESS_BUDGET_NS, |term| term.ns)
+}
+
+/// Closes `member`'s re-key window, counted by `why`: its probes are judged again.
+fn close_rekey_window(state: &mut ShardState, member: HostId, why: &'static str) {
+  state.plane.rekeying.remove(&member);
+  if let Some(plane) = state.plane.plane.as_mut() {
+    plane.hold_judging(member, false);
+  }
+  crate::fleet::count_refusal_in(state, why);
+}
+
+/// Folds the probes the detector held unjudged since the last fold into [`REKEY_UNJUDGED`]: the windows' non-vacuity.
+fn count_unjudged(state: &mut ShardState) {
+  let Some(total) = state
+    .plane
+    .plane
+    .as_ref()
+    .map(|plane| plane.detector().unjudged())
+  else {
+    return;
+  };
+  let since = total.saturating_sub(state.plane.unjudged_counted);
+  state.plane.unjudged_counted = total;
+  state.count(REKEY_UNJUDGED, since);
+}
+
+/// Counter: a re-key window opened (A-921 part 5): a member's process restarted under its id, its probes held unjudged.
+const REKEY_OPENED: &str = "fleet.plane.rekey_opened";
+
+/// Counter: a re-key window closed by the re-key's install, its member keyed under its new process.
+const REKEY_CLOSED_KEYED: &str = "fleet.plane.rekey_closed.keyed";
+
+/// Counter: a re-key window closed one detection after it opened, its member not yet keyed under its new process.
+const REKEY_CLOSED_EXPIRED: &str = "fleet.plane.rekey_closed.expired";
+
+/// Counter: a probe of a member in its re-key window that went unanswered and was held unjudged (the windows'
+/// non-vacuity: a window that held nothing counts none).
+pub(crate) const REKEY_UNJUDGED: &str = "fleet.plane.rekey_unjudged";
 
 /// Counter: an announcement from a member this node held dead, whose contact is kept so it can refute the death.
 const MEMBER_RETURNED: &str = "fleet.plane.member_returned";
@@ -1030,6 +1138,7 @@ pub(crate) async fn run(
     resolve_peers(resolver).await;
     join_addressable();
     let now = slates_machine::clock::monotonic_ns();
+    let _ = state::with_state(|state| rekey_windows(state, now));
     send(&socket, &drive(now, None));
     fold_membership(origin, &shards).await;
     let wake =
@@ -1075,6 +1184,116 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Shape: the process nonces a member announces itself with before and after its warm restart in the re-key window
+  /// tests: any two distinct values.
+  const OLD_PROCESS: u64 = 7;
+  /// Shape: the process nonce after the restart.
+  const NEW_PROCESS: u64 = 8;
+
+  /// A plane on `state` holding one peer, joined to its detector, with a fleet's room for its peers (a lone daemon's
+  /// configuration has none): the peer's member id.
+  fn plane_with_a_peer(state: &mut ShardState) -> HostId {
+    let local = state.fleet.host();
+    let peer = HostId(local.0 ^ 0x33);
+    let members = NonZeroUsize::new(4).unwrap();
+    state.config.fleet_peer_capacity = members.get();
+    let mut plane = MemberPlane::new(
+      local,
+      state.member_boot_nonce,
+      members,
+      std::time::Duration::from_nanos(slates_machine::clock::resolution_ns()),
+      lease_renewal(),
+      std::time::Duration::from_nanos(crate::lease::horizon_ns()),
+    )
+    .unwrap();
+    plane.join(peer, None);
+    state.plane.plane = Some(plane);
+    peer
+  }
+
+  /// What a re-key window test saw: whether the window was open after each look, and the counters.
+  type WindowSeen = (Vec<bool>, Vec<(&'static str, u64)>);
+
+  /// The counters a re-key window moves, as `state` holds them.
+  fn rekey_counts(state: &ShardState) -> Vec<(&'static str, u64)> {
+    [REKEY_OPENED, REKEY_CLOSED_KEYED, REKEY_CLOSED_EXPIRED]
+      .into_iter()
+      .map(|name| (name, state.refusals.get(name).copied().unwrap_or(0)))
+      .collect()
+  }
+
+  /// A-921 part 5's re-key window (main's ruling of 2026-11-28 00:42; windows-11-arm 5 and 7 runs in 16: a peer
+  /// condemned a warm-restarted member before it re-keyed it). Do: a plane holding a peer; the peer announces itself
+  /// from one process, then from another (its warm restart); the turn runs while this node is still keyed to the old
+  /// process, then once keyed to the new. Expect: no window at the first announcement, one opened at the second (counted),
+  /// open while keyed to the old process, closed at the re-key (counted keyed, never expired). Red before: no window
+  /// opened at a restart.
+  #[test]
+  fn a_restarted_members_rekey_window_opens_at_its_new_process_and_closes_at_its_rekey() {
+    let (open, counts): WindowSeen = crate::daemon::audit_on_shard(|state| {
+      let peer = plane_with_a_peer(state);
+      let mut open = Vec::new();
+      note_reconnected(state, HostId(0), peer, OLD_PROCESS);
+      open.push(state.plane.rekeying.contains_key(&peer));
+      note_reconnected(state, HostId(0), peer, NEW_PROCESS);
+      open.push(state.plane.rekeying.contains_key(&peer));
+      state.plane.keyed_process.insert(peer, OLD_PROCESS);
+      rekey_windows(state, slates_machine::clock::monotonic_ns());
+      open.push(state.plane.rekeying.contains_key(&peer));
+      state.plane.keyed_process.insert(peer, NEW_PROCESS);
+      rekey_windows(state, slates_machine::clock::monotonic_ns());
+      open.push(state.plane.rekeying.contains_key(&peer));
+      (open, rekey_counts(state))
+    });
+    assert_eq!(
+      open,
+      [false, true, true, false],
+      "opened at the new process, closed at its re-key"
+    );
+    assert_eq!(
+      counts,
+      [
+        (REKEY_OPENED, 1),
+        (REKEY_CLOSED_KEYED, 1),
+        (REKEY_CLOSED_EXPIRED, 0)
+      ]
+    );
+  }
+
+  /// A-921 part 5's re-key window, its other bound. Do: a plane holding a peer that announced itself from a new process,
+  /// never re-keyed; run the turn just before one detection from the window's opening, then at it. Expect: open just
+  /// before, closed at one detection (counted expired), so the peer's probes are judged again and a process that died
+  /// after its restart is condemned within a detection plus the detector's bound. Red before: no window opened.
+  #[test]
+  fn a_rekey_window_never_keyed_closes_one_detection_after_it_opened() {
+    let (open, counts): WindowSeen = crate::daemon::audit_on_shard(|state| {
+      let peer = plane_with_a_peer(state);
+      note_reconnected(state, HostId(0), peer, OLD_PROCESS);
+      note_reconnected(state, HostId(0), peer, NEW_PROCESS);
+      let opened = state.plane.rekeying.get(&peer).copied().unwrap_or(0);
+      let detection = rekey_detection_ns(state);
+      let mut open = vec![state.plane.rekeying.contains_key(&peer)];
+      rekey_windows(state, opened.saturating_add(detection).saturating_sub(1));
+      open.push(state.plane.rekeying.contains_key(&peer));
+      rekey_windows(state, opened.saturating_add(detection));
+      open.push(state.plane.rekeying.contains_key(&peer));
+      (open, rekey_counts(state))
+    });
+    assert_eq!(
+      open,
+      [true, true, false],
+      "open until one detection, closed at it"
+    );
+    assert_eq!(
+      counts,
+      [
+        (REKEY_OPENED, 1),
+        (REKEY_CLOSED_KEYED, 0),
+        (REKEY_CLOSED_EXPIRED, 1)
+      ]
+    );
+  }
 
   /// §4.8 "Leases and reads" across regions (found 2026-10-07 on two Docker networks: region 1's council at version 5,
   /// region 0's at 4, and region 0's owner refused its own volume `LeaseUnconfirmed` for good, counting

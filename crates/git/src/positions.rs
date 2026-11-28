@@ -479,6 +479,15 @@ impl Positions {
 
   /// The set kept as `runs`, or `None` unless each is non-empty and they ascend with a gap between each two: the one
   /// way a set is encoded, so a decoded set is equal to the set encoded and to no other.
+  /// The set of `runs`, kept as runs as they are, with no pass over them: for runs a reader made ascending and apart,
+  /// none empty, a unit at a time (`store::reach::SetReading`, the encoding's start; CLAUDE.md §3). Not settled into
+  /// its cheapest form, which is a pass over them: a set read for an encoding's turns, given back when it ends.
+  pub(crate) fn of_ascending_runs(runs: Vec<(u64, u64)>) -> Positions {
+    Positions {
+      form: Form::Runs(runs),
+    }
+  }
+
   pub(crate) fn from_runs(runs: Vec<(u64, u64)>) -> Option<Positions> {
     let each = runs.iter().all(|run| run.0 < run.1);
     let apart = runs

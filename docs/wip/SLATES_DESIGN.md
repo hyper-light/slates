@@ -61679,8 +61679,17 @@ Applied in the same change to:
 - **Tests.** `slates-git` `store::tests::encoding`: every unit of a version's and a base pack's encoding takes one
   placed entry at most (`one_unit`, red 152 and 454), and their fragments are the one-pass encoding's byte for byte;
   `slates-git --lib -- store::` 141 passed, 4 ignored.
-- **Owed.** The encoding's start: `Encoding::fragments` reads the version's D(k) whole (`Repository::unencoded`), its
-  own piece. Main's run: git/git v2.0.0's push encoded under load, the watchdog's spinning lines and
+- **The encoding's start, sliced the same way (2026-11-28, main's ruling of 00:50).** `Encoding::fragments` read the
+  version's D(k) whole from its value (`Repository::unencoded`, `Sets::read`, both of the value's sets), and a base
+  pack's start its head's reached set (`head_reach`): O(the set's runs) in one call, and a version that brings objects
+  other pushes indexed has a D(k) of as many runs as those objects lie apart. The encoding now begins at `Stage::Read`:
+  the set it sends read from its value's tree a node a unit (`reach::SetReading`: a leaf's runs, or an inner node's
+  children named), the D(k) alone for a version, then the stage it began with. The set is kept as the runs read, with
+  no pass to settle its form, since it is the encoding's own for its turns (`Positions::of_ascending_runs`). Counted
+  `EncodingCounters::most_runs_a_unit`. Test: `an_encodings_start_reads_its_versions_d_k_a_node_a_unit` (a D(k) of 113
+  runs, 150 blobs scattered among another green's 600, against a leaf's 64: 113 runs in one unit before, at most a
+  leaf's now; the fragments the one-pass encoding's, byte for byte). `slates-git --lib -- store::` 142 passed.
+- **Owed.** Main's run: git/git v2.0.0's push encoded under load, the watchdog's spinning lines and
   `vcs_store.git_encode.units_past_budget` by stage (run-requests.md, 2026-11-28).
 
 ### A-859 — A git object received in a pack is sent on as its entry lies there: git's pack reuse (bug, 2026-11-22, w-git for UI goal 93; main 01a20182's ruling of 03:38 PST; part B; §4.17.2 items 4 and "A fetch", A-639, A-718, A-722)
@@ -66491,6 +66500,29 @@ Applied in the same change to:
   saw it not yet re-keyed, so the test's own looks (one control-shard question a node in turn) add nothing, and its
   bound is the restarted node's detection plus both nodes' measured wake lateness (`detector_granularity_ns`), never a
   bare 1 s. Diag 10's Windows x86_64 lane met node 2 first seen at 1,010 ms: a timer tick of 15.625 ms on each look.
+- **Amended, the re-key window** (2026-11-28, w-shared; main 01a20182's ruling of 00:42; winfleet-5 and -6 on
+  windows-11-arm, 5 and 7 runs in 16 of the answers-peers test). The rule that a peer re-keys a restarted node within
+  one detection did not fit SWIM: until a peer re-keys it, its probes reach the node under its old process's keys,
+  unanswered, the node cannot refute a suspicion it cannot hear, and the detector condemns it two or three periods
+  later. That is not under any floor (`detection_bound` is an upper bound and the detector keeps none), but at 65 to
+  87 ms periods it is 327 to 669 ms, before the slower host's re-key (run 3: the new process listening at 502.914 s,
+  the condemnation pending at 503.140). Now a peer that learns a member's process restarted (`note_reconnected`: a
+  changed process nonce) opens the member's re-key window (`PlaneState::rekeying`), and its detector holds the
+  member's probes unjudged (`MemberPlane::hold_judging`, a local change to vendored hyper-swim, its README's item 4):
+  an unanswered one is counted (`fleet.plane.rekey_unjudged`), never suspecting the member or making its condemnation
+  pending. The window closes at the re-key's install (the installed epoch's process the one last announced,
+  `fleet.plane.rekey_closed.keyed`) or one detection after it opened (`fleet.plane.rekey_closed.expired`), checked
+  on the member loop's own turn, no timer of its own; bounded by the fleet's peer capacity. **Bound:** a process that
+  dies just after its restart is condemned within one detection plus `detection_bound`; that is the window's price,
+  paid only while it is open. The takeover's preconditions are unchanged: it reads condemnations as before, later by
+  at most the window. Red first: at the plane (`crates/cluster/tests/member_plane.rs`
+  `a_restarted_member_held_unjudged_through_its_rekey_is_condemned_only_once_released`), a silent member held by both
+  holders is condemned by neither while held, six of its probes held each (red with the hook a no-op: condemned while
+  held), and by both once released; at the window (`member_task` tests), it opens at a changed process and closes at
+  the re-key, or at one detection when never re-keyed (red with the opening a no-op). Applied to
+  `vendor/hyper-raft/hyper-swim/src/detector.rs` (`Detector::{hold_judging, unjudged}`, `PeerReport::unjudged`),
+  `crates/cluster/src/member_plane.rs`, `crates/server/src/member_task.rs`, the vendor README, GAPS,
+  `docs/bugs/2026-11-28-a-warm-restarted-node-was-condemned-before-its-peers-re-keyed-it.md`.
 
 ### A-932 — A merge record names its green's lineage, and a holder makes a green standing alone at once (2026-11-27, w-interop for main 01a20182, its ruling (a) of 2026-11-27 07:06 and its approval of 07:08; the fleet suite's red; amends A-908 and A-908 part 4; A-636 part 2b-2, A-145, A-255)
 

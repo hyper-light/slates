@@ -732,7 +732,8 @@ pub(crate) fn text_bytes_a_step(state: &ShardState) -> u64 {
 /// What one step of a fetch or a stream over the shard's view may move ([`slates_hg::render::StepCopy`]; main 01a20182's
 /// rulings of 2026-11-27 22:13 and 23:39): [`text_bytes_a_step`]; the machine's cache line a read of the content store
 /// is charged in (`slates_machine`'s facts, `DaemonConfig::cache_line`); a gathered row's cost the shard learned from its
-/// streams' own steps (`VcsStores::hg_row_cost`), at the measured copy rate the step's budget is derived from
+/// streams' own steps (`VcsStores::hg_row_cost`), the boot probe's before any (`DaemonConfig::hg_gather_row_ns`), at the
+/// measured copy rate the step's budget is derived from
 /// (`DaemonConfig::memcpy_bytes_per_second`); and the shard's clock, which those steps are timed by.
 pub(crate) fn step_copy(state: &ShardState) -> slates_hg::render::StepCopy {
   let (bytes, line) = (
@@ -742,10 +743,10 @@ pub(crate) fn step_copy(state: &ShardState) -> slates_hg::render::StepCopy {
   slates_hg::render::StepCopy {
     bytes,
     line,
-    row: state
-      .vcs_stores
-      .hg_row_cost
-      .row_bytes(line, (state.config.memcpy_bytes_per_second, bytes)),
+    row: state.vcs_stores.hg_row_cost.row_bytes(
+      state.config.hg_gather_row_ns,
+      (state.config.memcpy_bytes_per_second, bytes),
+    ),
     clock: Some(slates_rt::futures::now_ns),
   }
 }

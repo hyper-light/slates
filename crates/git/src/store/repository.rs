@@ -3228,32 +3228,50 @@ impl Repository {
     Ok(true)
   }
 
-  /// What `green`'s version `version` brought, still to encode as its fragments; `None` once they
-  /// are kept (A-653 continued (2)).
-  pub(super) fn unencoded(
+  /// The reading of `green`'s version `version`'s D(k) from its value, a node a unit (the encoding's start,
+  /// [`reach::SetReading`]); `None` once its fragments are kept. Refused while its sets are not derived.
+  pub(super) fn unencoded_reading(
     &self,
     store: &ContentStore,
     green: u64,
     version: usize,
-  ) -> Result<Option<Positions>, StoreRefused> {
-    let record = self.version_record(green, version)?;
-    if record.fragments.is_some() {
+  ) -> Result<Option<reach::SetReading>, StoreRefused> {
+    if self.version_record(green, version)?.fragments.is_some() {
       return Ok(None);
     }
-    Ok(Some(self.sets(store, green, version)?.brought))
+    self.set_reading(store, (green, version), false).map(Some)
   }
 
-  /// `green`'s head version and every object it reaches, read from the version's value (A-647 part 3): what its base
-  /// pack is made from.
-  pub(super) fn head_reach(
+  /// `green`'s head version and the reading of every object it reaches from the version's value, a node a unit (a base
+  /// pack's start, [`reach::SetReading`]).
+  pub(super) fn head_reach_reading(
     &self,
     store: &ContentStore,
     green: u64,
-  ) -> Result<(usize, Positions), StoreRefused> {
+  ) -> Result<(usize, reach::SetReading), StoreRefused> {
     let none = StoreRefused::NoVersion { green, version: 0 };
     let chain = self.chains.get(&green).ok_or(none)?;
     let version = chain.versions.len().checked_sub(1).ok_or(none)?;
-    Ok((version, self.sets(store, green, version)?.reached))
+    Ok((version, self.set_reading(store, (green, version), true)?))
+  }
+
+  /// The reading of `green`'s version `version`'s reached set, else its D(k), from its value or the memo's.
+  fn set_reading(
+    &self,
+    store: &ContentStore,
+    (green, version): (u64, usize),
+    reached: bool,
+  ) -> Result<reach::SetReading, StoreRefused> {
+    let value = self
+      .value_of(green, version)?
+      .ok_or(StoreRefused::Deferred {
+        green,
+        version: to_u64(version),
+      })?;
+    reach::SetReading::of(store, &value, reached).ok_or(StoreRefused::SetsUnreadable {
+      green,
+      version: to_u64(version),
+    })
   }
 
   /// The encoder's learned rules, this repository's own, with the owner's exchange (its measured rates among it).
