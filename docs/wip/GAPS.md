@@ -435,6 +435,11 @@
 >   v1 retargeted to the newcomer meanwhile: not yet A-935's, one red against none in 16). Unproven guess for the stall:
 >   an object of an earlier landed record whose homes were the two dead (d and c), the healer not yet re-homing it before
 >   c died.
+> - **Not done, by ruling (main 01a20182's of 2026-11-27 22:35): a tighter reship rate for a holder answering `Behind`.**
+>   A record reships a target once a pass until it acknowledges (`merge_service::PendingGreen::next`, the stated bound:
+>   3 and 9 `Behind` a run in the stall red). Reshipping an unchanged `Behind` only after its chain read ends would need
+>   the read's end reported to the owner, a protocol step with no measured cost behind it; not once per install either,
+>   which would leave a quiet stretch's newcomer behind (the gap A-935 closed).
 > - **FIXED (w-shared, 2026-11-27; main 01a20182's reading of 22:09, winfleet-3's a935 arm64 red): a read past tolerance
 >   was never read again.** A newcomer's one chain read went past tolerance while its candidacy was owed ("answered by
 >   [c, the newcomer, a], nothing held"), and `ledger_read`'s mark refused every later read of the register for good: 52

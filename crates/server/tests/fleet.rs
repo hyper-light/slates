@@ -15141,12 +15141,13 @@ fn a_candidates_claim_keeps_the_room_its_successor_makes_the_volume_in() {
 /// §4.2 (A-401's second part): `live-ship` turns a volume's live shipping on only once every candidate has made the
 /// claim's admission, and refuses `BudgetExceeded` when one cannot. Do: three nodes at `f = 1`, the pressure hold held at
 /// nothing; fill one candidate's shard with everything it admits; on a, create a bounded volume and ask to live-ship it;
-/// then destroy the fill and ask again. Expect the first refused `BudgetExceeded` with the volume not live-shipped, and
-/// the second answered live-shipped. Before, the flag was recorded at once whatever the candidates could hold.
+/// wait until a's installed placement of the volume names the filled one; then destroy the fill and ask again. Expect
+/// the first refused `BudgetExceeded` with the volume not live-shipped, and the second answered live-shipped. Before,
+/// the flag was recorded at once whatever the candidates could hold.
 #[test]
 fn a_live_ship_a_candidate_cannot_admit_is_refused_and_ships_once_it_can() {
   let _serial = serialize_fleet_tests();
-  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   for daemon in &daemons {
     daemon.inject_available_memory(u64::MAX / 2).unwrap();
   }
@@ -15156,6 +15157,19 @@ fn a_live_ship_a_candidate_cannot_admit_is_refused_and_ships_once_it_can() {
     panic!("the volume was created");
   };
   share_with_fleet(&mut client, id, &daemons);
+  // The live-ship asks the candidates a's installed configuration places the volume on (`verbs::live_ship`), so b, the
+  // filled one, must be among them first. Diag 12's windows-11-arm red was set in 2 ms, too fast for an admission round:
+  // most likely a's configuration had not yet placed the volume with b on that slow lane, so no full candidate was
+  // asked (inferred from the 2 ms; the reading below names it if it recurs).
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let placed_with_b = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    Ok(
+      daemons[0]
+        .placement_candidates(ObjectId(id.bytes))?
+        .contains(&hosts[1]),
+    )
+  });
+  drop(observed);
   let refused = client.call(&RequestBody::LiveShip {
     volume: id,
     live_shipped: true,
@@ -15177,10 +15191,14 @@ fn a_live_ship_a_candidate_cannot_admit_is_refused_and_ships_once_it_can() {
     daemon.stop();
   }
   eprintln!(
-    "asked: fill {fill:?}; first {refused:?} (live {shipped_while_full}); fill destroyed {destroyed:?}; second \
-     {shipped:?} (live {shipped_after})"
+    "asked: fill {fill:?}; placed with b {placed_with_b}; first {refused:?} (live {shipped_while_full}); fill destroyed \
+     {destroyed:?}; second {shipped:?} (live {shipped_after})"
   );
   assert!(fill.is_ok(), "a candidate's shard was filled: {fill:?}");
+  assert!(
+    placed_with_b,
+    "a's placement named b, the filled candidate, before it asked"
+  );
   assert!(
     matches!(
       refused,
