@@ -2176,7 +2176,15 @@ const RECORD_REFUSED_UNTRACKED: &str = "fleet.record.refused.untracked";
 /// whose commit never places shows on the holder why: before these, a holder restarted warm refused a successor's
 /// adoption `ForeignGeneration` every period without a trace. Format: refusal names in the daemon's status report.
 pub(crate) fn count_record_refusal(state: &mut ShardState, record: &Record, error: &RegisterError) {
-  let kind = match error {
+  let kind = record_refusal_kind(error);
+  state.count(kind, 1);
+  note_unacknowledged(state, kind, record, Some(*error));
+}
+
+/// The counter a holder's register refusal `error` of a record is counted under ([`count_record_refusal`]). Format: a
+/// counter name in the daemon's status report.
+pub(crate) fn record_refusal_kind(error: &RegisterError) -> &'static str {
+  match error {
     RegisterError::StaleEpoch { .. } => "fleet.record.refused.stale_epoch",
     RegisterError::ConfigurationStale { .. } => "fleet.record.refused.configuration_stale",
     RegisterError::Unsupported { .. } => "fleet.record.refused.unsupported",
@@ -2185,9 +2193,7 @@ pub(crate) fn count_record_refusal(state: &mut ShardState, record: &Record, erro
     RegisterError::ForeignGeneration { .. } => "fleet.record.refused.foreign_generation",
     RegisterError::ConflictingPosition => "fleet.record.refused.conflicting_position",
     RegisterError::Behind { .. } => "fleet.record.refused.behind",
-  };
-  state.count(kind, 1);
-  note_unacknowledged(state, kind, record, Some(*error));
+  }
 }
 
 /// What a holder last answered with no acknowledgement of a record, by why (A-921's second mode; main 01a20182's order

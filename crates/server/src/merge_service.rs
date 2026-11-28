@@ -166,6 +166,10 @@ pub struct MergeShardState {
   pub(crate) checkpoints_changed: BTreeSet<ObjectId>,
   /// The greens this holder refused for good after a recomputation mismatch (fatal-and-loud).
   pub refused: BTreeSet<ObjectId>,
+  /// Each green whose latest merge record this holder did not accept, with its version and the reason's counter
+  /// (`note_unaccepted`): what is logged once a reason. Bounded by the greens with a record not accepted here; one goes
+  /// once its record is accepted.
+  pub(crate) unaccepted: BTreeMap<ObjectId, (u64, &'static str)>,
   /// On a holder: each green's membership of its repository's lineage, as the names-log parts this node holds record it
   /// (A-908; `LoggedChange::Joined`, removed at `Left`): how a holder makes a member's replica as the owner makes the
   /// member, a root founding its lineage, a branch branched from its source. One entry a member of a names log held here.
@@ -5528,30 +5532,47 @@ pub(crate) fn accept_merge_record(
   peer_host: HostId,
   record: &Record,
 ) -> Vec<u8> {
+  let (reply, unaccepted) = judge_merge_record(state, local, peer_host, record);
+  note_unaccepted(state, (record, peer_host), unaccepted);
+  reply
+}
+
+/// [`accept_merge_record`]'s judgement: its reply, and why the record was not accepted, the counter its reason counts
+/// (`None` where it was accepted, or answered by a version 0's seeding).
+fn judge_merge_record(
+  state: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  record: &Record,
+) -> (Vec<u8>, Option<&'static str>) {
   if let Err(error) = crate::fleet::check_held_record(state, local, peer_host, record) {
     crate::fleet::count_record_refusal(state, record, &error);
-    return slates_db::register::encode_refusal(&error);
+    return (
+      slates_db::register::encode_refusal(&error),
+      Some(crate::fleet::record_refusal_kind(&error)),
+    );
   }
   let object = record.object;
   if state.merge.refused.contains(&object) {
     state.count(RECORD_GREEN_REFUSED, 1);
-    return Vec::new();
+    return (Vec::new(), Some(RECORD_GREEN_REFUSED));
   }
   if state.merge.fault.refuse_records {
     // Test support: the acknowledgement is withheld, so the owner's version cannot commit here.
     state.count(RECORD_WITHHELD, 1);
-    return Vec::new();
+    return (Vec::new(), Some(RECORD_WITHHELD));
   }
   let value = match MergeRecordValue::decode_record(&record.value) {
     Ok(value) => value,
     Err(refused) => {
-      state.count(refused.counter().unwrap_or(INPUTS_UNDECODABLE), 1);
-      return Vec::new();
+      let reason = refused.counter().unwrap_or(INPUTS_UNDECODABLE);
+      state.count(reason, 1);
+      return (Vec::new(), Some(reason));
     }
   };
   if record.sequence != value.version {
     state.count(OUT_OF_ORDER, 1);
-    return Vec::new();
+    return (Vec::new(), Some(OUT_OF_ORDER));
   }
   // A different value at a position this holder holds one is held first, which rewinds a replica built over the value
   // it replaces; the record is then served as the replica's next version (A-373).
@@ -5559,29 +5580,36 @@ pub(crate) fn accept_merge_record(
   match record_standing(state, object, value.version, peer_host) {
     None => {
       state.count(RECORD_NO_STANDING, 1);
-      return Vec::new();
+      return (Vec::new(), Some(RECORD_NO_STANDING));
     }
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
     Some(RecordStanding::Applied) => {
-      return crate::fleet::accept_held_record(state, local, peer_host, record);
+      return (
+        crate::fleet::accept_held_record(state, local, peer_host, record),
+        None,
+      );
     }
     Some(RecordStanding::Next) => {}
     Some(RecordStanding::Behind { reached }) => {
       state.count(BEHIND_ANSWERED, 1);
-      return slates_cluster::content::ContentMessage::Behind {
-        object,
-        sequence: value.version,
-        reached,
-      }
-      .encode();
+      return (
+        slates_cluster::content::ContentMessage::Behind {
+          object,
+          sequence: value.version,
+          reached,
+        }
+        .encode(),
+        Some(BEHIND_ANSWERED),
+      );
     }
   }
   // Version 0 of a green over a base: its replica is seeded from the origin a share at a time (A-286).
   if value.version == 0
     && let Some(manifest) = value.inputs
   {
-    return crate::merge_origin::seed_version_zero(
-      state, local, peer_host, record, &value, manifest,
+    return (
+      crate::merge_origin::seed_version_zero(state, local, peer_host, record, &value, manifest),
+      None,
     );
   }
   let inputs = match value.inputs {
@@ -5590,7 +5618,7 @@ pub(crate) fn accept_merge_record(
       Ok(held) => Some(held),
       Err(reason) => {
         state.count(reason, 1);
-        return Vec::new();
+        return (Vec::new(), Some(reason));
       }
     },
   };
@@ -5604,7 +5632,10 @@ pub(crate) fn accept_merge_record(
     state.store.budget.release(held.charge);
   }
   match recomputed {
-    Ok(()) => crate::fleet::accept_held_record(state, local, peer_host, record),
+    Ok(()) => (
+      crate::fleet::accept_held_record(state, local, peer_host, record),
+      None,
+    ),
     Err(reason) => {
       state.count(reason, 1);
       if reason == RECOMPUTE_MISMATCH {
@@ -5620,9 +5651,36 @@ pub(crate) fn accept_merge_record(
           peer_host
         );
       }
-      Vec::new()
+      (Vec::new(), Some(reason))
     }
   }
+}
+
+/// Logs a merge record this holder did not accept (main 01a20182's ruling of 2026-11-27 18:33: a914's first-death
+/// barrier red, a candidate holding the version before that never acknowledged the push's version): its green, version,
+/// sender and `unaccepted`, the reason's counter, once per green, version and reason, so a record shipped every period
+/// logs once. Accepted, the green's note goes. Bounded by the greens with a record not accepted here.
+fn note_unaccepted(
+  state: &mut ShardState,
+  (record, sender): (&Record, HostId),
+  unaccepted: Option<&'static str>,
+) {
+  let Some(why) = unaccepted else {
+    state.merge.unaccepted.remove(&record.object);
+    return;
+  };
+  let noted = (record.sequence, why);
+  if state.merge.unaccepted.insert(record.object, noted) == Some(noted) {
+    return;
+  }
+  slates_machine::log_line!(
+    "slates-server: partition {}: holder {:?} did not accept green {} version {} from {sender:?}: {why} at {} ns",
+    state.partition,
+    state.fleet.host(),
+    hex(&record.object.0),
+    record.sequence,
+    slates_rt::futures::now_ns()
+  );
 }
 
 /// A version's inputs gathered from this holder's hold, and the charge they hold against the shard's budget until the
