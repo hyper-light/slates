@@ -6,9 +6,10 @@
 # - git (`git_scale.sh`): stock `git daemon` (git://, receive-pack on, `uploadpack.allowFilter`), stock
 #   `git http-backend` under Apache httpd (smart HTTP, `stock-http`), and slates' HTTP edge;
 # - Mercurial (`hg_scale.sh`): stock `hg serve` (HTTP, `web.push_ssl=False`, `web.allow-push=*`) and slates' HTTP edge;
-# - Subversion (`svn_scale.sh`): stock `svnserve -d` (svn://) and slates' svn:// listener. `mod_dav_svn` under Apache is
-#   measured where the host has it (`HTTPD_MODULES/mod_dav_svn.so`) by no harness yet: its presence is recorded, and
-#   where absent the record says so.
+# - Subversion (`svn_scale.sh`): stock `svnserve -d` (svn://) and slates' svn:// listener; stock `mod_dav_svn` under
+#   Apache (`stock-http`) and slates' WebDAV site on its HTTP edge (`slates-http`), `mod_dav_svn` measured where the
+#   host has it (`HTTPD_MODULES/mod_dav_svn.so`) and skipped, said so, where it does not (main 01a20182's ruling of
+#   2026-11-27 14:31).
 #
 # Recorded first: the date (UTC), the machine (model, cores, memory, OS), slates' version and commit, every client's and
 # server's version, which competitors the host has. While the harnesses run, a sampler records every SAMPLE seconds the
@@ -50,9 +51,9 @@ else
   say "httpd: absent ($HTTPD): git-http-backend not measured"
 fi
 if [ -f "$HTTPD_MODULES/mod_dav_svn.so" ]; then
-  say "mod_dav_svn: present ($HTTPD_MODULES/mod_dav_svn.so), measured by no harness yet"
+  say "mod_dav_svn: present ($HTTPD_MODULES/mod_dav_svn.so), measured as svn_scale's stock-http"
 else
-  say "mod_dav_svn: absent from $HTTPD_MODULES: not measured"
+  say "mod_dav_svn: absent from $HTTPD_MODULES: svn_scale's stock-http skipped"
 fi
 say "runs: $RUNS of each server, interleaved, stock first; bound $BOUND s a step; load at the start: $(load)"
 
@@ -103,7 +104,7 @@ run() {
 }
 run git env SERVERS="stock stock-http slates" bash "$HERE/git_scale.sh" "$SLATES" "$GIT_SOURCE" "$WORK/git" "$RUNS" "$BOUND"
 run hg env SERVERS="stock slates" SLATES="$SLATES" bash "$HERE/hg_scale.sh" "$HG" "$HG_SOURCE" "$WORK/hg" "$RUNS" "$BOUND"
-run svn env SERVERS="stock slates" SLATES="$SLATES" bash "$HERE/svn_scale.sh" "$SVN_DUMP" "$SVN_SOURCE" "$SVN_REF" "$WORK/svn" "$RUNS" "$BOUND"
+run svn env SERVERS="stock slates stock-http slates-http" SLATES="$SLATES" bash "$HERE/svn_scale.sh" "$SVN_DUMP" "$SVN_SOURCE" "$SVN_REF" "$WORK/svn" "$RUNS" "$BOUND"
 
 kill "$SAMPLER" 2> /dev/null
 say "== each server kind's peak resident memory (MiB) and most CPU time seen (s), over every sample"

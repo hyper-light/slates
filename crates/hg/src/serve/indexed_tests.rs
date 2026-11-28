@@ -1568,6 +1568,55 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
   assert!(walked > 0, "no view was walked by its links");
 }
 
+/// Goal 93, hg's whole-history gap (main 01a20182's ruling of 2026-11-27 16:23): a stream's steps and the content
+/// store's reads, counted by stage (`render::StageTally`). Do: with each of `fixtures/state`'s repositories imported and
+/// its secret roots dropped, stream it a step at a time to its end in one room, then take the tally. Expect every step
+/// counted once in some stage; the count walk and the index rows a step a revision each, so as many count steps as index
+/// steps, both some; and every content store read made inside a step counted in its stage (`ContentStore::reads`, which
+/// counts contents and windows, not an index's rows; here the chunks come from the test's texts, so none). What the
+/// tally is for: the per-revision cost of each walk, which the cuts after it bound.
+#[test]
+fn a_streams_steps_and_reads_are_counted_by_stage() {
+  for name in ["amended-root", "divergent", "states"] {
+    let (imported, store) = imported(name);
+    let mut streaming = crate::render::Streaming::default();
+    let mut source = whole_texts(&imported.index, &store);
+    let mut out = Vec::new();
+    let (mut steps, mut read) = (0u64, 0u64);
+    loop {
+      crate::render::answer_want(&mut streaming, &mut source).unwrap();
+      steps += 1;
+      let before = store.reads();
+      let more = streaming
+        .step(&imported.index, &store, &mut room(), &mut out)
+        .unwrap();
+      read += store.reads() - before;
+      if !more {
+        break;
+      }
+    }
+    let tally = streaming.take_tally();
+    let counted = tally.count.steps + tally.index.steps + tally.data.steps + tally.other.steps;
+    eprintln!("{name}: {steps} steps; {tally:?}");
+    assert_eq!(counted, steps, "{name}: every step counted once");
+    assert!(tally.count.steps > 0, "{name}: the count walk counted");
+    assert_eq!(
+      tally.count.steps, tally.index.steps,
+      "{name}: a count step and an index step a revision"
+    );
+    assert_eq!(
+      tally.count.reads + tally.index.reads + tally.data.reads + tally.other.reads,
+      read,
+      "{name}: every read inside a step counted in its stage"
+    );
+    assert_eq!(
+      streaming.take_tally(),
+      crate::render::StageTally::default(),
+      "{name}: taken whole"
+    );
+  }
+}
+
 /// A-745 (stream clones in slices). Do: with each of `fixtures/state`'s repositories imported and its secret roots
 /// dropped, ask `stream_out` whole within one room and a step at a time (`render::Streaming`), each step given a room of
 /// its own; find the least room each way. Expect each step to need less room than the whole answer, and the steps'

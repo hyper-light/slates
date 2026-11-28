@@ -41,7 +41,7 @@ use std::collections::BTreeMap;
 
 use slates_cluster::{CommitBudget, broadcast};
 use slates_db::register::{Acceptor, Authority, HostId, LedgerPromise, LedgerRead, ObjectId};
-use slates_db::takeover::{LedgerAnswered, ledger_positions_chained, read_ledger};
+use slates_db::takeover::{LedgerAnswered, WitnessOutcome, ledger_positions_chained, read_ledger};
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
 
@@ -68,6 +68,17 @@ pub(crate) const REFUSED: &str = "fleet.ledger_read.refused";
 pub(crate) const UNTRACKED: &str = "fleet.ledger_read.untracked";
 /// Counter: an adopted position that did not continue this node's copy, held no further. Format: a counter name.
 pub(crate) const DISCONTINUOUS: &str = "fleet.ledger_read.discontinuous";
+/// Counter: a ledger read of a state log this node answered with its committed floor (A-919 (C)). Format: a counter name.
+pub(crate) const FLOOR_SERVED: &str = "fleet.ledger_read.floor_served";
+/// Counter: a read whose single holder's prefix the owner's floor witnessed, adopted past tolerance (A-919 (C)).
+/// Format: a counter name.
+pub(crate) const WITNESS_VERIFIED: &str = "fleet.ledger_read.witness_verified";
+/// Counter: a read whose holders' reports did not reach the owner's floor, refused as past tolerance, typed, never a
+/// fault (A-919 (C)). Format: a counter name.
+pub(crate) const WITNESS_UNCOVERED: &str = "fleet.ledger_read.witness_uncovered";
+/// Counter: a read whose adopted prefix's digest at the owner's floor differed from the owner's, every position dropped
+/// (A-919 (C)): a stale or wrong report, or a wrong floor. Format: a counter name.
+pub(crate) const WITNESS_MISMATCH: &str = "fleet.ledger_read.witness_mismatch";
 /// Counter: a successor's adoption of a family green whose join it did not hold, reading its names log's lacking
 /// positions from the log's cohort (A-927 part 2, [`join_read`]). Format: a counter name.
 pub(crate) const JOIN_WANTED: &str = "fleet.ledger_read.join_wanted";
@@ -226,18 +237,71 @@ fn chained_end(state: &ShardState, register: ObjectId, through: u64) -> Option<u
   last
 }
 
-/// A candidate's answer to `peer_host`'s ledger read (A-919): admitted only from a current candidate of the register
-/// under the generation this node has installed, and answered from what it holds of it, its holding's start beside
-/// (`read_ledger`); as the register's owner, from its own hold. Moves nothing. A refused read is nothing, counted.
-pub(crate) fn serve_ledger_read(
+/// A candidate's answer to `peer_host`'s ledger read (A-919), run on its own task from the control shard `origin`:
+/// admitted only from a current candidate of the register under the generation this node has installed, and answered
+/// from what it holds of it, its holding's start beside (`read_ledger`); as the register's owner, from its own hold.
+/// Moves nothing. A refused read is nothing, counted. Where the read is of a state log this node keeps a committed floor
+/// of (A-919 (C), main 01a20182's ruling of 2026-11-27 10:57), the answer carries it, read from whichever of this node's
+/// shards keeps it (the log's owner shard), each asked within a heartbeat, and its holding start is at least the
+/// position past it: below it this node let the log go, so its silence there names nothing (main's ruling of 11:24, the
+/// start enforced, not left to the order the owner re-commits its parts in).
+pub(crate) async fn serve_ledger_read_witnessed(
+  (origin, local): (u16, HostId),
+  peer_host: HostId,
+  request: Vec<u8>,
+) -> Vec<u8> {
+  let Some(mut answer) =
+    state::with_state(|s| ledger_read_answer(s, local, peer_host, &request)).flatten()
+  else {
+    return Vec::new();
+  };
+  if matches!(
+    answer.object.class(),
+    slates_db::register::RegisterClass::State(_)
+  ) && let Some(floor) = floor_of(origin, answer.object).await
+  {
+    answer.committed_through = Some(floor);
+    let past = floor.position.saturating_add(1);
+    answer.held_from = answer.held_from.map(|start| start.max(past));
+    let _ = state::with_state(|s| s.count(FLOOR_SERVED, 1));
+  }
+  answer.encode()
+}
+
+/// The committed floor of state log `register` one of this node's shards keeps as its owner, asked from `origin` (A-919
+/// (C)): each shard in turn, its own read in place, within a heartbeat each; the first kept.
+async fn floor_of(origin: u16, register: ObjectId) -> Option<slates_db::register::CommittedFloor> {
+  let shards = state::with_state(|s| s.shards.clone()).unwrap_or_default();
+  for shard in shards {
+    let floor = if shard == origin {
+      state::with_state(|s| s.state_logs.floor(register)).flatten()
+    } else {
+      crate::xshard::call_within(
+        origin,
+        shard,
+        move |s| s.state_logs.floor(register),
+        crate::daemon::HEARTBEAT_NS,
+      )
+      .await
+      .flatten()
+    };
+    if floor.is_some() {
+      return floor;
+    }
+  }
+  None
+}
+
+/// The answer to `peer_host`'s ledger read ([`serve_ledger_read_witnessed`]), `None` where the read is refused (counted).
+fn ledger_read_answer(
   state: &mut ShardState,
   local: HostId,
   peer_host: HostId,
   request: &[u8],
-) -> Vec<u8> {
+) -> Option<LedgerPromise> {
   let Ok(read) = LedgerRead::decode(request) else {
     state.count(REFUSED, 1);
-    return Vec::new();
+    return None;
   };
   let configuration = state.fleet.configuration();
   if read.asker != peer_host
@@ -248,7 +312,7 @@ pub(crate) fn serve_ledger_read(
       .contains(&peer_host)
   {
     state.count(REFUSED, 1);
-    return Vec::new();
+    return None;
   }
   let acceptor = state.holder_records.get(&read.object).or_else(|| {
     state
@@ -258,7 +322,7 @@ pub(crate) fn serve_ledger_read(
   });
   let mut answer = read_ledger(local, acceptor, &read, crate::takeover::page_budget());
   answer.held_from = acceptor.and_then(|acceptor| knowledge_start(read.object, acceptor));
-  answer.encode()
+  Some(answer)
 }
 
 /// Whether `next` continues the chain of `register` the read adopted (`last`, or before it what this node holds:
@@ -332,7 +396,7 @@ async fn read_once(
   local: HostId,
   budget: CommitBudget,
 ) -> Option<Dispatch> {
-  let (read, candidates, members, quorum, own) = state::with_state(|s| {
+  let (read, candidates, members, quorum, own, prior) = state::with_state(|s| {
     let configuration = s.fleet.configuration();
     let candidates = configuration.place(register).candidates;
     let read = LedgerRead {
@@ -351,6 +415,7 @@ async fn read_once(
       s.council.configuration().members.clone(),
       configuration.quorum,
       own,
+      prior_digest(s, register, wanted.from),
     )
   })?;
   let mut answers = BTreeMap::from([(local, answered(own, wanted.to))]);
@@ -369,15 +434,26 @@ async fn read_once(
   let (replied, stragglers) =
     broadcast(outgoing, LEDGER_READ_STREAM, Priority::Control, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
+  // The owner's committed floor, where its answer carries one (A-919 (C)).
+  let mut floor: Option<slates_db::register::CommittedFloor> = None;
   for (host, reply, endpoint) in replied {
     if let Ok(answer) = LedgerPromise::decode(&reply.bytes)
       && answer.holder == host
       && read.answers(&answer)
     {
+      if let Some(answered_floor) = answer.committed_through
+        && floor.is_none_or(|kept| answered_floor.position > kept.position)
+      {
+        floor = Some(answered_floor);
+      }
       answers.insert(host, answered(answer, wanted.to));
     }
     recovered.push((host, endpoint));
   }
+  // A witness where the owner kept a floor and this node holds the log's prefix before the range as one chain.
+  let witness = floor
+    .zip(prior)
+    .map(|(floor, prior)| slates_db::takeover::Witness { floor, prior });
   let dispatch = Dispatch::new(sent, &recovered, stragglers, LateReplies::Discard);
   return_sessions(recovered);
   let adoption = ledger_positions_chained(
@@ -386,20 +462,25 @@ async fn read_once(
     quorum,
     (wanted.from, wanted.to),
     &answers,
+    witness,
     |last, next| continues(register, wanted.from, last, next),
   );
   let _ = state::with_state(|s| {
+    count_witness(s, register, adoption.witness);
     s.count(ASKED, 1);
     s.count(
       ANSWERED,
       u64::try_from(answers.len().saturating_sub(1)).unwrap_or(u64::MAX),
     );
     if adoption.past_tolerance {
-      // The open edge: what committed is the owner's applied state, not the newest surviving older value.
+      // The open edge: what committed is the owner's applied state, not the newest surviving older value. The line names
+      // the reader and who answered it, its own answer among them (main 01a20182's ask of 2026-11-27 15:51: 41aa47870
+      // run 7's names-log read did not say whose it was).
       s.count(PAST_TOLERANCE, 1);
+      let answered: Vec<HostId> = answers.keys().copied().collect();
       slates_machine::log_line!(
-        "slates-server: a read of {register:?} from {} was past tolerance: nothing held, the register's candidacy \
-         owed",
+        "slates-server: a read of {register:?} from {} by {local:?} was past tolerance: answered by {answered:?}, \
+         nothing held, the register's candidacy owed",
         wanted.from
       );
       s.ledger_reads.wanted.remove(&register);
@@ -417,6 +498,50 @@ async fn read_once(
     }
   });
   Some(dispatch)
+}
+
+/// Counts what the owner's floor made of a read of `register` (A-919 (C)); a mismatch is logged, as a fault.
+fn count_witness(state: &mut ShardState, register: ObjectId, outcome: WitnessOutcome) {
+  match outcome {
+    WitnessOutcome::Unused => {}
+    WitnessOutcome::Verified => state.count(WITNESS_VERIFIED, 1),
+    WitnessOutcome::Uncovered => state.count(WITNESS_UNCOVERED, 1),
+    WitnessOutcome::Mismatch => {
+      state.count(WITNESS_MISMATCH, 1);
+      slates_machine::log_line!(
+        "slates-server: a read of {register:?}: the prefix its holders reported does not match its owner's committed \
+         floor's digest; nothing held"
+      );
+    }
+  }
+}
+
+/// The chain's digest over the parts of state log `register` this node holds below `from`, each continuing the last
+/// from the log's start (A-919 (C)): where a read's fold continues the chain from. `None` for any other register, and
+/// where what it holds there is not one chain from the start.
+fn prior_digest(
+  state: &ShardState,
+  register: ObjectId,
+  from: u64,
+) -> Option<[u8; slates_db::register::DIGEST_BYTES]> {
+  if !matches!(
+    register.class(),
+    slates_db::register::RegisterClass::State(_)
+  ) {
+    return None;
+  }
+  let mut digest = slates_db::register::CHAIN_BASE;
+  let mut at = 0;
+  if let Some(acceptor) = state.holder_records.get(&register) {
+    for accepted in acceptor.positions_between(register, first_position(register), from) {
+      if crate::state_log::record_of(&accepted.value).map(|part| part.from) != Some(at) {
+        return None;
+      }
+      digest = slates_db::register::chain_digest(&digest, &accepted.value);
+      at = accepted.sequence;
+    }
+  }
+  Some(digest)
 }
 
 /// A read's answer as the fold counts it: its positions, the range it covered, its holding's start.

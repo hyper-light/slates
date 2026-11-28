@@ -1208,6 +1208,10 @@ pub struct ShardState {
   /// its hedge delay first and folds the acknowledgement as a straggler's. A missing set or a refusal goes at once.
   /// `None` in production (`Daemon::inject_content_ack_delay`).
   pub injected_content_ack_delay_ns: Option<u64>,
+  /// Test support (never reachable from the wire): whether this node leaves every member's credential message
+  /// unanswered, as a member whose credential plane is not yet up does to the enrolling node, which counts it as not
+  /// holding the credential (`credentials::serve_remote`). `false` in production (`Daemon::inject_credential_deafness`).
+  pub injected_credential_deafness: bool,
   /// Test support (never reachable from the wire): a volume whose forwarded verbs this node leaves unanswered while
   /// set, the session carrying its other replies as before, as an owner alive but never answering one exchange is to
   /// its asker (`Daemon::inject_forward_silence`). `None` in production.

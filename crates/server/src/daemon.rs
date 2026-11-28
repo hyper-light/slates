@@ -264,6 +264,17 @@ pub struct RecordDialReport {
 /// held for.
 pub type RegionHold = ([u8; 32], Vec<slates_cluster::homes::HomeOwner>);
 
+/// What a green's owner counts held of it (A-914's repair-window precondition, `Daemon::repair_window_holders`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepairWindowHolders {
+  /// The newest placed version of the green's merge chain beside the holders that acknowledged it
+  /// (`MergeShardState::placed_holders`); `None` before a version placed.
+  pub green: Option<(u64, Vec<slates_db::HostId>)>,
+  /// The position of the names log of the repository the green is a member of; `None` where this node holds no such
+  /// repository.
+  pub names_head: Option<u64>,
+}
+
 /// A node's homing window as its control shard last derived it, with its terms (A-914, `Daemon::homing_window`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HomingWindowReading {
@@ -1876,6 +1887,48 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| {
       s.period_stretch_ns = stretch_ns.unwrap_or(0);
     })
+  }
+
+  /// Test support (A-914's repair-window precondition, main 01a20182's ruling of 2026-11-27 15:51): what this node, as
+  /// `green`'s owner, counts held of it ([`RepairWindowHolders`]): its merge chain's newest placed version with the holders
+  /// that acknowledged it, and its names log's position (its repository's register, `Repositories::log_position`). An
+  /// owner keeps no placed head of a state log and forgets a log's acknowledgements once it let every part go, so a test
+  /// reads who holds the names log's head from the holders (`Daemon::names_log_positions`). Across the shards; the typed
+  /// refusal when one could not be observed.
+  pub fn repair_window_holders(
+    &self,
+    green: [u8; 16],
+  ) -> Result<RepairWindowHolders, ObserveError> {
+    let object = slates_db::register::ObjectId(green);
+    let mut held = RepairWindowHolders::default();
+    for shard in self.shards.clone() {
+      let (placed, names) = self.observe(Some(shard), move |s| {
+        let placed = s.merge.placed_holders.get(&object).cloned();
+        let repositories = s.db.partition().repositories();
+        let names = repositories
+          .member(slates_db::catalog::VolumeId { bytes: green })
+          .and_then(|member| {
+            repositories.log_position(member.repository, slates_db::catalog::StateLog::Names)
+          });
+        (placed, names)
+      })?;
+      held.green = held.green.or(placed);
+      held.names_head = held.names_head.max(names);
+    }
+    Ok(held)
+  }
+
+  /// Test support (A-934): the state logs' parts this node's shards hold as an owner that are not their log's newest
+  /// (`state_log::StateLogs::parts_past_newest`): each log keeps its newest part once every candidate holds it, so this
+  /// falls back to zero, where `state_log_parts_bytes` keeps one part a log, once each candidate has caught up. Summed
+  /// over the shards; the typed refusal when one could not be observed.
+  pub fn state_log_parts_past_newest(&self) -> Result<usize, ObserveError> {
+    let mut parts = 0usize;
+    for shard in self.shards.clone() {
+      parts =
+        parts.saturating_add(self.observe(Some(shard), |s| s.state_logs.parts_past_newest())?);
+    }
+    Ok(parts)
   }
 
   /// Test support (A-919): the bytes of the state logs' parts this node's shards still hold as an owner, owed to some
@@ -4477,6 +4530,31 @@ impl Daemon {
     })
   }
 
+  /// Test support: while `deaf`, this node answers no member's credential message (A-764's stream), as a member whose
+  /// credential plane is not yet up does, so an enrolling node counts it as not holding the credential; `false`
+  /// restores its answers. Set on every shard, since a message is served on whichever shard its session lands.
+  /// `Ok` once installed, else the typed refusal.
+  pub fn inject_credential_deafness(&self, deaf: bool) -> Result<(), ObserveError> {
+    for shard in &self.shards {
+      self.observe(Some(*shard), move |s| {
+        s.injected_credential_deafness = deaf;
+      })?;
+    }
+    Ok(())
+  }
+
+  /// Test support: whether any of this node's partitions holds the credential `id` (A-764: on the partition its id
+  /// routes to), read on every shard; the typed refusal where a shard does not answer.
+  pub fn credential_held(&self, id: [u8; 32]) -> Result<bool, ObserveError> {
+    let mut held = false;
+    for shard in &self.shards {
+      held |= self.observe(Some(*shard), move |s| {
+        s.db.partition().credentials().get(&id).is_some()
+      })?;
+    }
+    Ok(held)
+  }
+
   /// Test support: while `Some(ns)`, this node publishes `ns` as its failover delay in place of its estimate, on every
   /// shard at once (A-363, A-414): the bound of every wait that bounds a failover (a forward, the location round, a held
   /// reply, a takeover's attempts) and the term of the leases that read it (the write lease, a landing's target lease,
@@ -5969,6 +6047,7 @@ async fn init_shard(
     injected_serve_delay_ns: None,
     injected_forward_answer_delay_ns: None,
     injected_content_ack_delay_ns: None,
+    injected_credential_deafness: false,
     injected_forward_silence: None,
     injected_takeover_silence: std::collections::BTreeSet::new(),
     injected_holder_silence: std::collections::BTreeSet::new(),
@@ -11837,13 +11916,20 @@ mod tests {
   fn owe_next_part(state: &mut crate::state::ShardState, which: u8, at: usize) {
     let name = oracle_names_log(which);
     let register = name.register();
-    let from = state
+    // The log's next position, as its repository's own positions rise: past every part owed and past its committed
+    // floor (A-919 (C), main 01a20182's ruling of 2026-11-27 13:42), so a position let go is never made again.
+    let held_end = state
       .state_logs
       .parts()
       .filter(|(owed, ..)| *owed == register)
       .map(|(_, position, _)| position)
       .max()
       .unwrap_or(0);
+    let floor = state
+      .state_logs
+      .floor(register)
+      .map_or(0, |floor| floor.position);
+    let from = held_end.max(floor);
     let slates_db::catalog::LogName::State { repository, log } = name else {
       return;
     };
@@ -11949,12 +12035,16 @@ mod tests {
         _ if which == 0 => HeldStep::Checkpoint,
         _ => HeldStep::Delta,
       });
-      let mut runner = proptest::test_runner::TestRunner::new(slates_test_seeds::unseeded(
-        proptest::test_runner::Config {
-          cases: slates_test_seeds::cases(64),
-          ..proptest::test_runner::Config::default()
-        },
-      ));
+      let mut runner = proptest::test_runner::TestRunner::new(
+        slates_test_seeds::seeded(
+          proptest::test_runner::Config {
+            cases: slates_test_seeds::cases(64),
+            ..proptest::test_runner::Config::default()
+          },
+          include_str!("daemon.proptest-regressions"),
+        )
+        .unwrap(),
+      );
       // The runner's case is an `Fn`, so each case borrows the one shard's state through a cell.
       let cell = std::cell::RefCell::new(state);
       let outcome = runner.run(&proptest::collection::vec(step, 1..60), |steps| {

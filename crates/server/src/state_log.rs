@@ -56,7 +56,7 @@
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{StateLog, StateLogRecord};
-use slates_db::register::{HostId, ObjectId, Record, RegisterError};
+use slates_db::register::{HostId, ObjectId, Record, RegisterClass, RegisterError};
 use slates_ipc::protocol::Refusal;
 use slates_wire::Wire;
 
@@ -66,7 +66,8 @@ use crate::state::ShardState;
 /// The state logs' parts an owner shard still owes some candidate (one field on [`ShardState`]).
 #[derive(Debug, Default)]
 pub(crate) struct StateLogs {
-  /// Each state log's register with parts owed, by register.
+  /// Each state log's register with parts owed, by register, and each log of a repository this partition holds whose
+  /// remote candidates hold every part, kept for its newest part (A-934, [`StateLogs::let_go_held`]).
   logs: BTreeMap<ObjectId, OwedLog>,
   /// The bytes of every part held: what [`admit`] holds to [`bound`].
   bytes: usize,
@@ -80,17 +81,30 @@ pub(crate) struct StateLogs {
   /// second mode): what the next delta of its recovery image carries of them (`content_holder::held_changes`). Bounded
   /// by the parts held and let go between two publications.
   changed: std::collections::BTreeSet<(ObjectId, u64)>,
+  /// Each log's committed floor (A-919 (C), main 01a20182's ruling of 2026-11-27 10:57): the highest position this owner
+  /// let go, every part through it held by every candidate when it went, with the chain's digest through it
+  /// (`slates_db::register::chain_digest` over each part's register value from the log's first). A ledger read's answer
+  /// from this owner carries it, so a candidate a death brought in adopts the prefix a single holder reports where its
+  /// digest matches. Kept where this owner let go a chain from the log's start: one that never held it from there (a
+  /// takeover's successor) keeps none. Rides the recovery image (`content_holder`'s floor piece), so a warm restart keeps
+  /// it; one a register this shard owns or owned, 40 bytes each.
+  floors: BTreeMap<ObjectId, slates_db::register::CommittedFloor>,
+  /// The logs whose floor rose since the last committed publication: what its next delta puts of them.
+  floors_changed: std::collections::BTreeSet<ObjectId>,
   /// The record-plane passes in a row whose parts waited because the shard's publication carrying them was refused, and
   /// that publication's refusal (A-921's second mode, main 01a20182's ruling of 2026-11-26: a held-back part never
   /// stalls in silence). Past [`held_back_bound`] passes, [`admit`] refuses the repository's next change with it.
   held_back: (u32, Option<Refusal>),
+  /// The log this owner's neighbourhood change last waited for to settle (A-934, [`placed_on_current`]), so the wait is
+  /// logged once as it begins, naming the log; `None` while none waits.
+  settle_waits_on: Option<ObjectId>,
 }
 
 /// One state log's parts and what its candidates acknowledged.
 #[derive(Debug, Default)]
 struct OwedLog {
-  /// The parts not yet held by every candidate, by the position each leaves the log at (its sequence): each the
-  /// register value its record ships as.
+  /// The parts not yet held by every candidate, and the log's newest part while it has remote candidates (A-934), by the
+  /// position each leaves the log at (its sequence): each the register value its record ships as.
   parts: BTreeMap<u64, Vec<u8>>,
   /// Each candidate's highest position acknowledged: a holder holds a prefix of the log ([`check_held`]), so its
   /// highest acknowledgement says every part at or below it is held there.
@@ -98,16 +112,27 @@ struct OwedLog {
 }
 
 impl StateLogs {
-  /// Keeps `record` as a part of its log's register, owed to the log's candidates.
-  pub(crate) fn hold(&mut self, record: &StateLogRecord) {
+  /// Keeps `record` as a part of its log's register, owed to the log's candidates; whether it did. A part at or below the
+  /// log's committed floor is refused (A-919 (C), main 01a20182's ruling of 2026-11-27 12:52): a log's positions come
+  /// from its repository's own positions, durable and rising, so a new part never reuses a position let go, and one
+  /// that did would be held under a floor that already witnesses another value there.
+  pub(crate) fn hold(&mut self, record: &StateLogRecord) -> bool {
+    let register = record.log_name().register();
+    if self
+      .floors
+      .get(&register)
+      .is_some_and(|floor| record.to <= floor.position)
+    {
+      return false;
+    }
     let value = value_of(record);
     self.bytes = self.bytes.saturating_add(value.len());
-    let register = record.log_name().register();
     let log = self.logs.entry(register).or_default();
     if let Some(replaced) = log.parts.insert(record.to, value) {
       self.bytes = self.bytes.saturating_sub(replaced.len());
     }
     self.changed.insert((register, record.to));
+    true
   }
 
   /// Puts back a part a recovered image carried (A-921's second mode, main 01a20182's ruling of 2026-11-26): owed again
@@ -175,6 +200,41 @@ impl StateLogs {
   /// Forgets the changes a committed publication carried.
   pub(crate) fn clear_changed(&mut self) {
     self.changed.clear();
+    self.floors_changed.clear();
+  }
+
+  /// `register`'s committed floor, where this owner keeps one (A-919 (C)).
+  pub(crate) fn floor(&self, register: ObjectId) -> Option<slates_db::register::CommittedFloor> {
+    self.floors.get(&register).copied()
+  }
+
+  /// Every log's committed floor: what a checkpoint of the shard's recovery image carries of them (A-919 (C)).
+  pub(crate) fn floors(
+    &self,
+  ) -> impl Iterator<Item = (ObjectId, slates_db::register::CommittedFloor)> + '_ {
+    self
+      .floors
+      .iter()
+      .map(|(register, floor)| (*register, *floor))
+  }
+
+  /// The logs whose floor rose since the last committed publication, each with its floor now.
+  pub(crate) fn floors_changed(
+    &self,
+  ) -> impl Iterator<Item = (ObjectId, slates_db::register::CommittedFloor)> + '_ {
+    self
+      .floors_changed
+      .iter()
+      .filter_map(|register| Some((*register, self.floor(*register)?)))
+  }
+
+  /// Puts back a floor a recovered image carried (A-919 (C)); the image carries it, so it is owed to no publication.
+  pub(crate) fn restore_floor(
+    &mut self,
+    register: ObjectId,
+    floor: slates_db::register::CommittedFloor,
+  ) {
+    self.floors.insert(register, floor);
   }
 
   /// Notes the greens `record`'s operation moved, each owed to its newest version the operation took it to.
@@ -221,9 +281,16 @@ impl StateLogs {
     }
   }
 
-  /// Lets go of `register`'s parts every one of `remote`, the log's remote candidates, holds; all of them when there is
-  /// none (a laptop). A log with no part left is forgotten with its acknowledgements: a later part ships to every
-  /// candidate, each holding the parts before it.
+  /// Lets go of `register`'s parts every one of `remote`, the log's remote candidates, holds, but its newest part; all of
+  /// them when there is no remote candidate (a laptop), and the log is forgotten with its acknowledgements then.
+  ///
+  /// The newest part stays (A-934, main 01a20182's ruling of 2026-11-27 16:20): owed in the shard's image with its
+  /// candidates' acknowledgements, it ships again to any candidate a neighbourhood change brings in (`fleet`'s owed
+  /// parts go to every candidate not acknowledged at them), which reads the prefix before it (A-919, witnessed by the
+  /// floor), and a settle counts who holds it (§4.8, [`placed_on_current`]). Before, a log whose parts were all let go
+  /// was forgotten, and nothing shipped a newcomer what it lacked. Bounded: one part a state log of a repository this
+  /// partition holds ([`forget_unheld`]), each one operation's changes of its log, held under [`bound`] with the parts
+  /// owed ([`admit`]).
   pub(crate) fn let_go_held(&mut self, register: ObjectId, remote: &[HostId]) {
     let Some(log) = self.logs.get_mut(&register) else {
       return;
@@ -233,23 +300,89 @@ impl StateLogs {
       .map(|host| log.acked.get(host).copied().unwrap_or(0))
       .min()
       .unwrap_or(u64::MAX);
-    let kept = log.parts.split_off(&held_everywhere.saturating_add(1));
+    let mut through = held_everywhere.saturating_add(1);
+    if !remote.is_empty()
+      && let Some(newest) = log.parts.keys().next_back().copied()
+    {
+      through = through.min(newest);
+    }
+    let kept = log.parts.split_off(&through);
     let released: usize = log.parts.values().map(Vec::len).sum();
-    // A part let go while it is still marked changed was held after the last committed publication, so none carried it:
-    // its mark goes, and the next delta neither puts nor removes it. One a publication carried (or an image restored) is
-    // marked, so the next delta removes its piece. At f = 0 every part is held and let go in one take, so nothing is ever
-    // marked (main 01a20182's ruling of 2026-11-27: before, each kept a key until a publication committed).
-    for position in log.parts.keys() {
+    // The floor rises over the parts let go, in order, each continuing the chain from the floor (the first from the
+    // log's start); it rides the same publication as their removal, so a restored image has either the parts or the
+    // floor over them, never neither (main's guard-then-apply).
+    let floor = floor_over(self.floors.get(&register).copied(), &log.parts);
+    if floor != self.floors.get(&register).copied()
+      && let Some(floor) = floor
+    {
+      self.floors.insert(register, floor);
+      self.floors_changed.insert(register);
+    }
+    let gone: Vec<u64> = log.parts.keys().copied().collect();
+    log.parts = kept;
+    let emptied = log.parts.is_empty();
+    self.mark_let_go(register, &gone);
+    self.bytes = self.bytes.saturating_sub(released);
+    if emptied {
+      self.logs.remove(&register);
+    }
+  }
+
+  /// Marks `positions` of `register`, let go, for the next delta of the shard's image.
+  ///
+  /// A part let go while it is still marked changed was held after the last committed publication, so none carried it:
+  /// its mark goes, and the next delta neither puts nor removes it. One a publication carried (or an image restored) is
+  /// marked, so the next delta removes its piece. At f = 0 every part is held and let go in one take, so nothing is ever
+  /// marked (main 01a20182's ruling of 2026-11-27: before, each kept a key until a publication committed).
+  fn mark_let_go(&mut self, register: ObjectId, positions: &[u64]) {
+    for position in positions {
       let key = (register, *position);
       if !self.changed.remove(&key) {
         self.changed.insert(key);
       }
     }
-    log.parts = kept;
+  }
+
+  /// Notes that a settle waits for `register` ([`placed_on_current`]), or for none; whether that changed what it waits
+  /// for, so the caller logs a wait as it begins.
+  pub(crate) fn note_settle_wait(&mut self, register: Option<ObjectId>) -> bool {
+    std::mem::replace(&mut self.settle_waits_on, register) != register
+  }
+
+  /// `register`'s newest part's position and each candidate's acknowledgement, for a settle's wait to name.
+  pub(crate) fn kept_reading(&self, register: ObjectId) -> (Option<u64>, Vec<(u64, u64)>) {
+    self.logs.get(&register).map_or((None, Vec::new()), |log| {
+      (
+        log.parts.keys().next_back().copied(),
+        log.acked.iter().map(|(host, at)| (host.0, *at)).collect(),
+      )
+    })
+  }
+
+  /// Forgets `register`'s log whole, its parts marked let go (A-934, [`forget_unheld`]).
+  fn forget(&mut self, register: ObjectId) {
+    let Some(log) = self.logs.remove(&register) else {
+      return;
+    };
+    let released: usize = log.parts.values().map(Vec::len).sum();
+    let gone: Vec<u64> = log.parts.keys().copied().collect();
+    self.mark_let_go(register, &gone);
     self.bytes = self.bytes.saturating_sub(released);
-    if log.parts.is_empty() {
-      self.logs.remove(&register);
-    }
+  }
+
+  /// The logs whose every part each of their remote candidates holds (`remote` gives a log's): each kept for its newest
+  /// part alone ([`StateLogs::let_go_held`]).
+  fn held_everywhere<'a>(
+    &'a self,
+    remote: impl Fn(ObjectId) -> Vec<HostId> + 'a,
+  ) -> impl Iterator<Item = ObjectId> + 'a {
+    self.logs.iter().filter_map(move |(register, log)| {
+      let newest = log.parts.keys().next_back().copied()?;
+      remote(*register)
+        .iter()
+        .all(|host| log.acked.get(host).is_some_and(|at| *at >= newest))
+        .then_some(*register)
+    })
   }
 
   /// Every register with parts owed, each with its parts in position order and the highest position each candidate
@@ -263,6 +396,16 @@ impl StateLogs {
       .map(|(register, log)| (*register, &log.parts, &log.acked))
   }
 
+  /// The parts held that are not their log's newest (A-934): what is still owed to some candidate once each log keeps
+  /// its newest part alone ([`StateLogs::let_go_held`]); `Daemon::state_log_parts_past_newest` reads it.
+  pub(crate) fn parts_past_newest(&self) -> usize {
+    self
+      .logs
+      .values()
+      .map(|log| log.parts.len().saturating_sub(1))
+      .fold(0usize, usize::saturating_add)
+  }
+
   /// The bytes of every part held: the unit tests and `Daemon::state_log_parts_bytes` (A-919) read it.
   pub(crate) fn bytes(&self) -> usize {
     self.bytes
@@ -273,6 +416,34 @@ impl StateLogs {
     self.bytes < bound
   }
 }
+
+/// The floor `floor` rises to over `released`, a log's parts let go in position order (A-919 (C)): each part that
+/// continues the chain from the floor (its `from` the floor's position; the first from the log's start, 0, where there
+/// is none yet) advances it to its position, the digest one link on over its register value. It stops at the first that
+/// does not, so an owner that never held the chain from the log's start keeps no floor.
+pub(crate) fn floor_over(
+  floor: Option<slates_db::register::CommittedFloor>,
+  released: &BTreeMap<u64, Vec<u8>>,
+) -> Option<slates_db::register::CommittedFloor> {
+  let mut floor = floor;
+  for (position, value) in released {
+    let (at, digest) = floor.map_or((0, slates_db::register::CHAIN_BASE), |floor| {
+      (floor.position, floor.digest)
+    });
+    if record_of(value).map(|part| part.from) != Some(at) {
+      break;
+    }
+    floor = Some(slates_db::register::CommittedFloor {
+      position: *position,
+      digest: slates_db::register::chain_digest(&digest, value),
+    });
+  }
+  floor
+}
+
+/// Counter: a part the partition made at or below its log's committed floor, refused (A-919 (C), [`StateLogs::hold`]): a
+/// position let go made again, never reached by a log's rising positions. Format: a counter name.
+const PART_BELOW_FLOOR: &str = "repository.state_log.part_below_floor";
 
 /// A state log's record as its register holds it: behind [`STATE_LOG_CLASS`].
 pub(crate) fn value_of(record: &StateLogRecord) -> Vec<u8> {
@@ -314,6 +485,7 @@ pub(crate) fn kept_for_test(state: &mut ShardState) -> Vec<StateLogRecord> {
 /// Takes the records the partition handed on since the last take into the parts this owner shard owes, and lets go at
 /// once of those no remote candidate needs (a laptop's, every one).
 pub(crate) fn take_made(state: &mut ShardState) {
+  forget_unheld(state);
   let records = state.db.take_state_log_records();
   if records.is_empty() {
     return;
@@ -327,7 +499,15 @@ pub(crate) fn take_made(state: &mut ShardState) {
   let local = state.fleet.host();
   let config = state.fleet.configuration().clone();
   for record in &records {
-    state.state_logs.hold(record);
+    if !state.state_logs.hold(record) {
+      state.count(PART_BELOW_FLOOR, 1);
+      slates_machine::log_line!(
+        "slates-server: partition {}: a state-log part to {} is at or below its log's committed floor, refused: a position \
+         let go made again",
+        state.partition,
+        record.to
+      );
+    }
     state.state_logs.note_greens(record);
   }
   for record in &records {
@@ -335,6 +515,59 @@ pub(crate) fn take_made(state: &mut ShardState) {
     let remote = remote_candidates(&config, register, local);
     state.state_logs.let_go_held(register, &remote);
   }
+}
+
+/// Forgets each log kept for its newest part alone ([`StateLogs::let_go_held`]) whose repository this partition no
+/// longer holds (A-934: destroyed, or moved to another owner), so what is kept stays one part a log of a repository held
+/// here. A log with a part some candidate still lacks stays until it is held, so a repository's last change reaches its
+/// holders first. Each record-plane pass, before its take ([`take_made`]); bounded by the logs kept.
+fn forget_unheld(state: &mut ShardState) {
+  let local = state.fleet.host();
+  let config = state.fleet.configuration();
+  let repositories = state.db.partition().repositories();
+  let unheld: Vec<ObjectId> = state
+    .state_logs
+    .held_everywhere(|register| remote_candidates(config, register, local))
+    .filter(|register| {
+      let RegisterClass::State(log) = register.class() else {
+        return true;
+      };
+      let repository = slates_db::catalog::RepositoryId {
+        bytes: register.placement_key().0,
+      };
+      repositories.log_position(repository, log).is_none()
+    })
+    .collect();
+  for register in unheld {
+    state.state_logs.forget(register);
+  }
+}
+
+/// Whether each state log this shard owns has its newest part held by `f + 1` of its cohort in the current
+/// neighbourhood, this owner among them (§4.8 "the newest committed record is held by f+1 of the new candidates";
+/// A-934): by the candidates acknowledged at or past it ([`StateLogs::let_go_held`] keeps it, so a log stays counted
+/// after its other parts go). `Err` naming the first log that is not, which a settle waits for. A log with no part
+/// kept is a laptop's (no remote candidate) and holds.
+pub(crate) fn placed_on_current(state: &ShardState) -> Result<(), ObjectId> {
+  let local = state.fleet.host();
+  let config = state.fleet.configuration();
+  for (register, parts, acked) in state.state_logs.owed() {
+    let Some(newest) = parts.keys().next_back().copied() else {
+      continue;
+    };
+    let holders: Vec<HostId> = std::iter::once(local)
+      .chain(
+        acked
+          .iter()
+          .filter(|(_, at)| **at >= newest)
+          .map(|(host, _)| *host),
+      )
+      .collect();
+    if !config.placed_on_current(register, &holders) {
+      return Err(register);
+    }
+  }
+  Ok(())
 }
 
 /// Whether every part `repository`'s operations moved is held at `f + 1` (§4.8's commit rule; A-724 piece 8c, the

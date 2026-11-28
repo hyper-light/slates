@@ -900,6 +900,24 @@ impl Drop for WriteWaiting {
   }
 }
 
+/// The edge's listener while [`serve`] holds it: its port, logged with the process's monotonic time as the listener goes,
+/// however `serve` ends, by its own refusal or its task dropped (main 01a20182's ask of 2026-11-27 17:05: a914's run 3 was
+/// refused a connect at 0 ms on a live node's own port, and no "stopped" line said why).
+struct Listening {
+  /// The port the listener was bound at.
+  port: u16,
+}
+
+impl Drop for Listening {
+  fn drop(&mut self) {
+    slates_machine::log_line!(
+      "slates-server: the version-control HTTP edge's listener on port {} closed at {} ns",
+      self.port,
+      slates_machine::clock::monotonic_ns()
+    );
+  }
+}
+
 /// Serves the edge `state` keeps on `listener` until the listener fails or its task ends (the module doc): each
 /// connection a child task deciding its requests with a site `site` makes for it, here or on the shard it moves to.
 /// Refused at once for a cleartext edge off loopback, and when `state` is not on this shard.
@@ -913,6 +931,9 @@ where
   M: Fn() -> S + Clone + Send + 'static,
 {
   let address = listener.local_addr().map_err(EdgeRefused::Listener)?;
+  let _listening = Listening {
+    port: address.port(),
+  };
   let secure = state
     .with(|state| state.identity.is_some())
     .ok_or(EdgeRefused::StateGone)?;

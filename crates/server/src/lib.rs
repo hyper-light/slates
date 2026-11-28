@@ -279,6 +279,8 @@ mod vcs_ssh;
 // it for receive-pack (A-654 part 3), and the SSH site for its git-receive-pack (A-683).
 #[cfg_attr(not(test), allow(dead_code))]
 mod git_push;
+// The words of a push its homing answered `retry`, which a fleet test tells from a push that never reached the edge.
+pub use git_push::words::HOMED_SHORT;
 // The version-control servers' stores on their owner shard (A-662): one content store and one entry a repository, its
 // tool's store with its derived values, made with its record, charged to the shard's budget and replayed by a recovery
 // from its entries' objects; its git stores lent to upload-pack by the HTTP edge's site (A-682). Its push steps are
@@ -335,7 +337,7 @@ pub mod xshard;
 pub use config::{BootFault, BootFaultKind, DaemonConfig, DurabilityBound, FleetMembership};
 pub use daemon::{
   Daemon, DrainReport, HeldRecordView, HomingWindowReading, LeadershipHandoff, LinkAfter,
-  SegmentSource, SessionHold,
+  RepairWindowHolders, SegmentSource, SessionHold,
 };
 pub use deploy::{DeployError, FleetManifest, FleetNodeEntry, FleetPlan, NodeAddress};
 pub use dns::Resolver;

@@ -163,11 +163,15 @@ fn a_public_key_line_is_read_as_ssh_keygen_writes_it() {
 }
 
 /// A-625 part 3 (§4.13: a human enrolls, an agent never). Do, through the daemon's dispatch on a real shard: enroll the
-/// key `ssh-keygen` wrote with the launcher's proof; again; then from an agent's channel with a proof that verifies,
-/// and from the human's with a proof made for another expiry; revoke it from the agent's channel, then the human's,
-/// then again. Expect: `CredentialEnrolled` naming the key's fingerprint, its record proving the principal asked for as
-/// an `ssh-rsa` key; `AlreadyExists`; `Forbidden` and `GrantIssuerUnverified`, each counted, with the record as it was;
-/// `Forbidden` again; `CredentialRevoked` with the record gone; then `NotFound`.
+/// key `ssh-keygen` wrote with the launcher's proof; the same request again (A-764: asked again after
+/// `CredentialUnreplicated`, so the region's members it missed are reached); the same key with another expiry, proven;
+/// then from an agent's channel with a proof that verifies, and from the human's with a proof made for another expiry;
+/// revoke it from the agent's channel, then the human's, then again; then the first request once more. Expect:
+/// `CredentialEnrolled` naming the key's fingerprint, its record proving the principal asked for as an `ssh-rsa` key;
+/// `CredentialEnrolled` again, counted `credential.enroll.repeated`, the record as it was; `AlreadyExists` for the other
+/// expiry (a different record under a held id); `Forbidden` and `GrantIssuerUnverified`, each counted, with the record
+/// as it was; `Forbidden` again; `CredentialRevoked` with the record gone; `NotFound`; then `AlreadyExists` (revoked
+/// here, it never comes back).
 #[test]
 fn a_human_enrolls_and_revokes_a_key_and_an_agent_cannot() {
   crate::daemon::audit_on_shard(|state| {
@@ -189,28 +193,56 @@ fn a_human_enrolls_and_revokes_a_key_and_an_agent_cannot() {
       expires_ns: None,
     };
     assert_eq!(held(state, &id), Some(record.clone()));
+    enrolled_again_only_as_it_was(state, (key.clone(), asked.clone()), &record);
+    refused_to_others(state, key, asked.clone());
+    assert_eq!(held(state, &id), Some(record));
+    revoked_by_a_human_only(state, id);
     assert!(matches!(
-      refusal(dispatched(state, &human(), asked.clone())),
+      refusal(dispatched(state, &human(), asked)),
       Some(Refusal::AlreadyExists { .. })
     ));
-    refused_to_others(state, key, asked);
-    assert_eq!(held(state, &id), Some(record));
-    assert_eq!(
-      refusal(dispatched(state, &agent(), revocation(state, id))),
-      Some(Refusal::Forbidden {
-        verb: "revoke_credential".to_owned()
-      })
-    );
-    assert_eq!(
-      dispatched(state, &human(), revocation(state, id)),
-      ReplyBody::CredentialRevoked
-    );
-    assert_eq!(held(state, &id), None);
-    assert_eq!(
-      refusal(dispatched(state, &human(), revocation(state, id))),
-      Some(Refusal::NotFound)
-    );
   });
+}
+
+/// The enrollment `asked` of `key`, whose record `record` is held, asked again (A-764: after `CredentialUnreplicated`):
+/// `CredentialEnrolled`, counted `credential.enroll.repeated`; then `key` with another expiry, a different record under
+/// the held id: `AlreadyExists`; the record as it was.
+fn enrolled_again_only_as_it_was(
+  state: &mut ShardState,
+  (key, asked): (CredentialMaterial, RequestBody),
+  record: &CredentialRecord,
+) {
+  assert_eq!(
+    dispatched(state, &human(), asked),
+    ReplyBody::CredentialEnrolled { id: record.id }
+  );
+  assert_eq!(counted(state, "credential.enroll.repeated"), 1);
+  let other_expiry = enrollment(state, key, Some(1));
+  assert!(matches!(
+    refusal(dispatched(state, &human(), other_expiry)),
+    Some(Refusal::AlreadyExists { .. })
+  ));
+  assert_eq!(held(state, &record.id).as_ref(), Some(record));
+}
+
+/// `id`'s revocation from an agent's channel (`Forbidden`), then a human's (`CredentialRevoked`, the record gone), then
+/// a human's again (`NotFound`).
+fn revoked_by_a_human_only(state: &mut ShardState, id: [u8; 32]) {
+  assert_eq!(
+    refusal(dispatched(state, &agent(), revocation(state, id))),
+    Some(Refusal::Forbidden {
+      verb: "revoke_credential".to_owned()
+    })
+  );
+  assert_eq!(
+    dispatched(state, &human(), revocation(state, id)),
+    ReplyBody::CredentialRevoked
+  );
+  assert_eq!(held(state, &id), None);
+  assert_eq!(
+    refusal(dispatched(state, &human(), revocation(state, id))),
+    Some(Refusal::NotFound)
+  );
 }
 
 /// The two refusals of an enrollment of `key` an agent's channel and a proof for another expiry meet, each counted.

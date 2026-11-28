@@ -9925,7 +9925,9 @@ server, not inferred from command names.
 > lookup, and a client's token proves its principal on a successor after the issuing node is lost. An enrollment is
 > acknowledged once `f + 1` members hold it, a revocation only once every member has let it go (a member that kept it
 > would go on proving a revoked credential); short of that each is refused `CredentialUnreplicated` and asked again
-> reaches the rest. At each configuration change every member offers what it holds, so one that joined holds what the
+> reaches the rest. An enrollment asked again finds its very record held on the enrolling partition (same id, principal,
+> kind and expiry), answers enrolled there and goes on to the region; a different record under a held id, or a revoked
+> id, is refused `AlreadyExists` (2026-11-27, `credential.enroll.repeated`). At each configuration change every member offers what it holds, so one that joined holds what the
 > region holds. A revocation leaves a tombstone on every member that applies it (`CredentialTombstoned`, appended), which
 > the healer offers too, so a revoked credential is never enrolled again: not by a member that missed its revocation
 > and rejoins with the record (it lets the record go), and not by that member's offer of it (refused where the
@@ -63964,7 +63966,7 @@ Applied in the same change to: the A-412 note in `merge_service::catch_up`'s doc
   - **The ledger question is split into a read and a promise.** The read is `slates_db::takeover::read_ledger` and
     `LedgerRead`: `positions_between`, paged by `page_budget`, with where the answerer's holding begins. It is
     answered only to a current candidate of the register under the installed generation (stream 32,
-    `ledger_read::serve_ledger_read`), and it moves nothing. A takeover's `answer_ledger` is the read after its
+    `ledger_read::serve_ledger_read_witnessed` since A-919 (C)), and it moves nothing. A takeover's `answer_ledger` is the read after its
     promise. One read serves a successor's takeover, a state log's newcomer, and A-918 B's green chains under a live
     owner.
   - **The owner answers too** (main's ruling (a)), from its own hold. §4.8 counts it among `f + 1` (":308", ":24277
@@ -64056,6 +64058,19 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
   join it lacks (`ledger_read::join_read`). It reads the names log's positions below its adopted position. A read past
   tolerance is kept per register, bounded by the registers held, so that adoption refuses on it. A read's held
   names-log parts are noted as a shipped part's are.
+- **Amended: the forget's mark** (2026-11-27, main 01a20182's TLC of 11:17). `FencedLedger_forget.cfg` failed: with
+  ReadSafety removed, Continuity broke in 17 states with the rule on. A holder forgot, accepted a late proposal at
+  position 1 again, took its start back to 1, and promised nothing at position 2, which it had held: epoch 2 adopted
+  nothing there, losing epoch 1's committed value. ReadSafety as written failed too, at state 10, a forgotten holder's
+  silence counted in a majority. The model now keeps a mark per holder, the highest position it held when it forgot
+  (`lost`), and an accept at or below the mark never moves its start (`ForgetMark`): it counts below the mark only once
+  it holds that prefix again. ReadSafety is start-aware: it judges a majority only at positions every one of its
+  holdings reaches. `FencedLedger_forget_nomark.cfg`, the rule without the mark, must fail Continuity. The product has
+  no such path: the owner's hold, the one acceptor that forgets (rebuilt at a warm restart), refills only through its
+  commits (`fleet::owner_hold`). Those come in each log's position order from its oldest owed part
+  (`fleet::owed_state_log_parts`), and what it lost is exactly the let-go prefix below that part (`let_go_held` splits
+  at the point every remote candidate holds). Every other holder's acceptor persists across restarts, and a candidate a
+  death brings in held nothing before. A-919 (C)'s committed floor is that prefix's mark, made explicit on the owner.
 
 ### A-921 part 2 — A repository a takeover moved from a node is answered there with where it went, found by the one owner lookup (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; amends AUD-08's lookup status)
 
@@ -66451,3 +66466,150 @@ Applied in the same change to:
   up first. The other callers that wait a dead home out are in GAPS, reported. Tests: fleet
   `a_region_read_whose_first_home_died_unseen_is_answered_by_the_next_within_the_budget` and
   `a_region_read_whose_first_home_is_slow_past_its_share_reads_the_next_and_returns_the_session`.
+
+### A-919 (C) — An owner's committed floor witnesses the prefix a single holder reports, so a candidate a death brings in reads a log its restarted owner let go (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 10:57, 10:59, 11:09 and 11:24; closes A-919's open edge)
+
+- **Why.** A-919's open edge: a state-log part the owner let go was held by every remote candidate when it went, `2f`
+  copies. Once the owner restarted warm, its hold kept only its owed parts (A-921 part 3). Once one remote candidate
+  died, a candidate a death brought in read the log, and at a let-go position the fold counted the owner below its
+  start (gone) and the departed (gone): two of three at `f = 1`, past tolerance. The newcomer adopted nothing and
+  refused every later part, and the owner kept every part from then on. Red: a919's owner-restart scene, the read past
+  tolerance and the newcomer holding no names-log position.
+- **The fact the owner already knows.** Every position at or below the highest one it let go was committed with one
+  value: it let a part go only once every candidate held it. The owner keeps that floor, the position and the chain's
+  digest through it (`slates_db::register::CommittedFloor`, `chain_digest` from `CHAIN_BASE` over each part's register
+  value from the log's first), per log (`state_log::StateLogs::floor`). It rises in `let_go_held` over the parts
+  released, in order, each continuing the chain from the floor (`state_log::floor_over`). An owner that never held the
+  chain from the log's start (a takeover's successor) keeps none.
+- **Durable before the let-go acts** (main's guard-then-apply). The floor rides the shard's recovery image as its own
+  piece (kind 23, `content_holder::floor_piece`), in the same delta as the parts' removal. A crash before that
+  publication restores the parts held under the old floor; one after, the parts gone under the new floor; never the
+  parts gone without the floor. A restored floor is refused typed (`HeldRefused::Floor`) where it lies at or above a part
+  still owed, or the lowest part owed does not continue it (`content_holder::floors_agree`), and where its bytes are not
+  a floor's. Image version 37, delta version 15.
+- **Verified, not trusted.** A ledger read is served on its own task (`ledger_read::serve_ledger_read_witnessed`); a
+  state log's answer carries the owner's floor, read from whichever of its shards keeps it, and its holding start is at
+  least the position past the floor (main's ruling of 11:24: the owner hold's start enforced, not left to the order it
+  re-commits its parts in). `LedgerPromise::committed_through` is a trailing optional field; an answer ending at its
+  positions, an older build's, carries none. The asker passes a `Witness` (the floor, and the digest of what it holds
+  before the read's range) to the fold (`takeover::ledger_positions_chained`):
+  - a position at or below the floor past tolerance is adopted on one report tentatively;
+  - at the floor, the adopted chain must end there with the floor's digest: verified (`fleet.ledger_read.witness_verified`);
+  - a different digest drops every position adopted and refuses the read (`witness_mismatch`, a fault, logged);
+  - a chain that stops before the floor (a holder whose log starts later, a floor past the log's end) is past
+    tolerance as before (`witness_uncovered`, counted, never a fault);
+  - a single report above the floor is refused as before.
+- **The invariant it rests on.** No holder trims a state log's positions: `fleet::after_held_record` returns before any
+  compaction for a state log, and `Acceptor::compact_below` serves single-value registers alone. So every acceptor fed by
+  its owner's shipments holds the log from its first part, and its reports cover the floor or the read is uncovered.
+- **Who reads.** Every ledger read runs on a holder's own acceptor (`holder_records`): a holder refused a part past its
+  copy (`state_log`), a successor's missing join (`ledger_read::join_read`), A-918 B's chain read (`merge_service`). It
+  persists across restarts, and its only production removal is a tombstone's retirement. The owner's hold, the one
+  acceptor that forgets, is written only by its own commits and never reads.
+- **A guard** (main's ruling of 12:52): a part at or below its log's committed floor is refused, counted
+  `repository.state_log.part_below_floor` and logged (`StateLogs::hold`). A log's positions are its repository's own,
+  durable and rising, so none is made again below the floor; the guard makes that a rule.
+- **The model.** `FencedLedger.tla` (sha256 61b68654ea2e1e31) adds the floor (`LetGo`, gated by `FloorRead`, its values
+  the digest, durable across `Forget`) and a candidate a death brings in reading the log (`ReadAdopt`, only for a holder
+  that held none of it, its forget's mark 0: within tolerance the highest report, past it a single report only at or
+  below the floor and matching it). `ReadNoLoss` (what a read adopted past tolerance on one report is the committed
+  value) and `ReadIsPrefix` join the invariants. main's TLC of 12:52 on the text before found a reader that had acked and
+  forgotten adopt a stale report while its own ack's value committed (ReadSafety at depth 16): no product reader can,
+  so `ReadAdopt` is restricted to match. TLC (main's, 2026-11-27, 8 workers, on that text): `_floor_bounded` (MaxForgets
+  1, symmetric) holds, 50,040,406 states, complete, BOUNDED; `_forget` holds (75,901,986) and the base config holds
+  (7,024,669); `_floor_nocheck` fails ReadNoLoss, `_forget_nomark` and `_forget_norule` fail Continuity and
+  `_register` fails Continuity, each as required; the full `_floor` (MaxForgets 2) was running with no violation at
+  49.7M states, its verdict owed to the record; `_3` is partial as always (no violation in 54,970,940 states).
+- **Tests.**
+  - Fleet `a919_a_newcomer_holds_a_restarted_owners_let_go_prefix_on_its_committed_floor` (red first, a919's
+    owner-restart scene turned around): red on main, the read past tolerance and the newcomer's names-log positions
+    `[]`; after, never past tolerance, the newcomer holding `[2, 3, 4]` from the log's first part as the old holder does,
+    below a's restarted hold start 3, and a's parts let go again.
+  - Units: the fold's witness (`takeover::tests::a_holders_prefix_the_owners_floor_witnesses_is_adopted_past_tolerance`,
+    `a_floor_the_reports_do_not_match_or_reach_adopts_nothing_past_tolerance`), the wire field and its hostile cuts
+    (`register::tests::a_hostile_ledger_question_or_answer_is_refused`), the floor's rise and base
+    (`state_log::tests::an_owners_committed_floor_rises_over_the_parts_it_lets_go_with_the_chains_digest`,
+    `a_floor_rises_only_over_parts_that_continue_its_chain_from_the_logs_start`), the image's hostile floors
+    (`content_holder::floor_tests::an_images_floor_that_disagrees_with_its_logs_owed_parts_is_refused`) and the crash on
+    either side of a let-go's publication (`a_crash_on_either_side_of_a_let_gos_publication_keeps_the_part_or_the_floor_over_it`)
+    and the guard (`state_log::tests::a_part_at_or_below_its_logs_floor_is_refused`).
+- **Applied in the same change to:** `crates/db/src/{register,takeover}.rs`,
+  `crates/server/src/{state_log,content_holder,ledger_read,fleet}.rs`, `crates/server/src/state_log/tests.rs`,
+  `crates/vfs/src/{recover,checkpoint_log}.rs`, `crates/server/tests/fleet.rs`, `docs/wip/models/FencedLedger.tla` and
+  its configurations, A-919's entry, GAPS.
+
+
+### A-934 — An owner keeps each state log's newest part until its cohort changes no more, and a settle waits for it on f + 1 of the new cohort (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 15:51 (item 2) and 16:20; §4.8 "Neighbourhood changes"; amends A-919 (C) and A-636 part 2b)
+
+- **Why.** §4.8 retires the old set "only after ... the newest committed record is held by f+1 of the new candidates".
+  The settle (`fleet::records_placed_on_current_neighbourhood`) asked that of each volume's head and catalog and each
+  green's newest merge record, but of no state log. The owner kept no placed head of a state log, and forgot a log with
+  its acknowledgements once it let every part go, so it could neither count a log's holders on a new cohort nor ship
+  a candidate the change brought in what it lacked. The old set could retire with a log's newest part held by the owner
+  alone of the cohort a takeover of it recovers through. a914's lagging candidate got its missing names-log part only
+  by an accident: a let-go part's stale piece in the image, re-shipped at a warm restart, which 43a8563a2's fold fix
+  removed (main's bisect of 16:02; its finding of 16:06).
+- **The rule.**
+  - `StateLogs::let_go_held` lets go of a log's parts every remote candidate holds **but its newest**, while the log has
+    a remote candidate. The newest stays owed, in the shard's image, with each candidate's acknowledgement. A laptop (no
+    remote candidate) still lets everything go, and its log is forgotten.
+  - Re-ship is the owed-part ship as it was: `fleet::owed_state_log_parts` ships a part to every current candidate not
+    acknowledged at it, so a candidate a neighbourhood change brings in is shipped the newest part. It finds it past its
+    empty copy and reads the prefix before it (A-919 (iii)), witnessed by the owner's floor ((C)), holds it and
+    acknowledges. A holder already at that position accepts the very record it holds, and acknowledges again.
+  - The settle also asks, of each state log the shard owns, that its newest part be held by `f + 1` of its cohort in
+    the current neighbourhood, the owner among them (`state_log::placed_on_current`, by the candidates acknowledged at
+    or past it; `fleet::state_logs_placed_on_current_neighbourhood`). A settle that waits names the log: counted
+    `fleet.settle.waits_on_state_log` each period, and logged as the wait begins with the log's register, its newest
+    position and its acknowledgements.
+  - A log kept for its newest part alone is forgotten once its repository is no longer held by the partition
+    (destroyed, or moved to another owner), and only once every remote candidate holds that part, so a repository's
+    last change still reaches its holders (`state_log::forget_unheld`, each record-plane pass before its take).
+- **The bound.** One part per state log of a repository the partition holds, each one operation's changes of its log,
+  held under `state_log::bound` with the parts owed (`state_log::admit`). The acknowledgements kept with it are one per
+  candidate.
+- **The floor.** (C)'s floor rises over the parts let go, so it now stops below each log's newest part; the newest is
+  held by the owner and shipped, never read under the floor. The guard (a part at or below the floor refused) is
+  unchanged. The model's `LetGo` releases a subset of what it released, so `FencedLedger`'s results hold as they were
+  (main's ruling of 16:20: no rerun owed).
+- **Tests.**
+  - Fleet `a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_cohort` (red first). Four nodes
+    at `f = 1`; a's parts held off y and a push made, so a and x hold the names log's newest part; then held off every
+    member, and x stopped. The change must not settle while the hold stands, and must settle once it is lifted. Red: it
+    settled while held, a's names log at 4, y holding positions 2 and 3 and the newcomer none.
+  - Fleet a919's two tests now expect a's parts to fall back to each log's newest (`Daemon::state_log_parts_past_newest`
+    back to zero), not to no part at all; a914 waits for f = 1's repair window (A-914, 9feb04958).
+  - Units: `state_log::tests::an_owner_keeps_each_part_until_every_candidate_holds_it_and_counts_its_bytes` (the phases
+    log's newest part kept), `an_owners_committed_floor_rises_over_the_parts_it_lets_go_with_the_chains_digest` (the
+    floor below the newest part until a later one comes), and
+    `a_log_kept_for_its_newest_part_is_forgettable_only_once_every_candidate_holds_it`.
+- **Applied in the same change to:** `crates/server/src/{state_log,fleet,daemon}.rs`,
+  `crates/server/src/state_log/tests.rs`, `crates/server/tests/fleet.rs`, GAPS.
+
+### A-935 — An owner keeps each green's newest version pending once every candidate holds it, so a candidate a death brings in is shipped it with no push (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 17:12 and 17:29; the green sibling of A-934; corrects GAP-A9-7's record half, A-918 B)
+
+- **Why.** A newcomer reads a green's chain on `Behind` (A-918 B), and it answers `Behind` only to a record shipped to
+  it. An owner released a version's pending record once every candidate held it (`record_merge_acks`), and nothing
+  ships a placed version again (A-412). So a candidate a death brought in was shipped the green only by the next push's
+  version, and in a quiet stretch the first death's repair window never closed: a second death then lost a green
+  `f = 1` keeps. 2816da877's a914 run 3: its first death's push never reached a, and the newcomer stayed outside the
+  green's holders for 400 s while it held the names log (A-934).
+- **The rule.** `PendingGreen::release_held` releases each version every candidate holds **but the newest**. The
+  newest stays pending, its placements kept; a neighbourhood change retargets it (`PendingGreen::retarget`, every pass
+  of `next_merge_work`), so it is owed to the candidate the change brought in and ships to it. The newcomer, holding
+  none of the chain, answers `Behind` and reads the chain before it from its cohort, with the versions' inputs, and
+  rebuilds (A-918 B). An older version kept is released once a later one is held everywhere. Version 0's inputs go
+  when version 0 is released.
+- **Not changed.** The settle counts each green's newest version on `f + 1` of the current cohort, the owner among
+  them (`greens_placed_on_current_cohort`), the design's settle rule (main's ruling of 17:29). What this adds is that
+  the repair window closes with no traffic, which a914's precondition tests.
+- **The bound.** One version a green this node owns beyond those still owed: its value and its two placements, dropped
+  with the green at its destroy, as the pending map always was.
+- **Tests.** Fleet `a935_a_candidate_a_death_brings_in_holds_each_greens_newest_version_with_no_push` (red first): four
+  nodes at `f = 1`, one push, both candidates holding the green, one of them stopped and taken over, nothing pushed.
+  The newcomer must hold the green's newest placed version within the repair path's bound, derived in the test
+  (the retarget's ship, the `Behind` heard and the read asked, the read's answers, the inputs fetched and the rebuild:
+  5 passes of up to 10 periods each). Red: the newcomer's replica at `None` after its 50 periods.
+  - a914 goes back to main's (d): its first death's push refused `retry` (A-914 (c)'s prior, OPEN) goes on to the
+    repair-window precondition, which then proves the repair needs no traffic; any other refusal fails at once.
+- **Applied in the same change to:** `crates/server/src/merge_service.rs`, `crates/server/tests/fleet.rs`, GAPS.

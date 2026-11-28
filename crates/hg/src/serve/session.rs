@@ -284,6 +284,16 @@ pub enum Producing {
 }
 
 impl Producing {
+  /// A stream clone's steps and reads by stage since the last take, `stream_out`'s or a `stream2` part's
+  /// ([`crate::render::Streaming::take_tally`]); none for an answer that streams no files.
+  pub fn take_stream_tally(&mut self) -> Option<crate::render::StageTally> {
+    match self {
+      Producing::Bundle(answering) => answering.take_stream_tally(),
+      Producing::Revlogs(streaming) => Some(streaming.take_tally()),
+      Producing::Lookup(_) => None,
+    }
+  }
+
   /// Appends the answer's next slice to `out`, what it makes charged to `room`: whether more follow. A refused step
   /// leaves the answer where it was.
   pub fn step(

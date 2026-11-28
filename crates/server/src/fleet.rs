@@ -1731,6 +1731,24 @@ fn dispatched_request(
       });
       PeerRequestServed::Spawned(stream_id, served)
     }
+    // A current candidate reads a register's ledger it lacks (A-919), on its own task: a state log's read carries its
+    // owner's committed floor, asked of the shard that keeps it (A-919 (C)).
+    crate::forward_lane::Next::Request {
+      stream_id,
+      kind,
+      request,
+    } if kind == crate::ledger_read::LEDGER_READ_STREAM && enrolled => {
+      let peer_host = state::with_state(|s| {
+        s.learned_members
+          .get(&peer_anchor)
+          .map_or(seed, |learned| learned.host)
+      })
+      .unwrap_or(seed);
+      let served = forwards.spawn(stream_id, async move {
+        crate::ledger_read::serve_ledger_read_witnessed((control, local), peer_host, request).await
+      });
+      PeerRequestServed::Spawned(stream_id, served)
+    }
     // A work route's question (A-288) is answered on the green's shard, so it too runs on its own task.
     crate::forward_lane::Next::Request {
       stream_id,
@@ -1932,15 +1950,6 @@ async fn serve_peer_records(
             state::with_state(|s| crate::edges::serve_edges(s, peer_anchor, &request))
               .unwrap_or_default()
           }
-          // A current candidate reads a register's ledger it lacks (A-919).
-          crate::ledger_read::LEDGER_READ_STREAM => state::with_state(|s| {
-            let peer_host = s
-              .learned_members
-              .get(&peer_anchor)
-              .map_or(seed, |learned| learned.host);
-            crate::ledger_read::serve_ledger_read(s, local, peer_host, &request)
-          })
-          .unwrap_or_default(),
           // A moved volume's new owner asks its cohort by name (A-291).
           crate::moves::MOVE_STREAM => state::with_state(|s| {
             let peer_host = s
@@ -8990,6 +8999,33 @@ fn records_placed_on_current_neighbourhood(state: &ShardState) -> bool {
   heads && crate::merge_service::greens_placed_on_current_cohort(state)
 }
 
+/// Whether every state log this shard owns has its newest part held by `f + 1` of its cohort in the current
+/// neighbourhood (A-934, main 01a20182's ruling of 2026-11-27 16:20; [`crate::state_log::placed_on_current`]), as its
+/// heads and greens must ([`records_placed_on_current_neighbourhood`]). Before, no state log was asked, so an owner
+/// settled with a log's newest part on itself alone of the new cohort. A settle that waits counts
+/// [`SETTLE_WAITS_ON_STATE_LOG`] each period and logs the log it waits for as the wait begins.
+fn state_logs_placed_on_current_neighbourhood(state: &mut ShardState) -> bool {
+  let waited = crate::state_log::placed_on_current(state).err();
+  let begun = state.state_logs.note_settle_wait(waited);
+  let Some(register) = waited else {
+    return true;
+  };
+  state.count(SETTLE_WAITS_ON_STATE_LOG, 1);
+  if begun {
+    let (newest, acked) = state.state_logs.kept_reading(register);
+    slates_machine::log_line!(
+      "slates-server: partition {}: a neighbourhood change waits to settle for state log {register:?}: its newest part \
+       at {newest:?} acknowledged {acked:?}, short of f + 1 of the current cohort",
+      state.partition
+    );
+  }
+  false
+}
+
+/// Counter: a period whose neighbourhood settle waited for a state log's newest part on the current cohort (A-934,
+/// [`state_logs_placed_on_current_neighbourhood`]). Format: a counter name in the daemon's status report.
+const SETTLE_WAITS_ON_STATE_LOG: &str = "fleet.settle.waits_on_state_log";
+
 /// Whether every volume this shard owns is served from within this node's current neighbourhood (A-546): its head
 /// snapshot's placement names only this node and hosts of that neighbourhood, so the settle that names it certifies that
 /// no head this node serves names a holder outside its neighbourhoods, and such a holder lets its content go (A-508's
@@ -9048,6 +9084,7 @@ async fn report_settlement(
       move |s| {
         s.fleet.configuration().version == version
           && records_placed_on_current_neighbourhood(s)
+          && state_logs_placed_on_current_neighbourhood(s)
           && content_placed_on_current_neighbourhood(s)
       },
       HEARTBEAT_NS,

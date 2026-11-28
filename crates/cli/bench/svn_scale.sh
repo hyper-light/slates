@@ -14,7 +14,14 @@
 #   repository's records are kept on the node's changeset store, which it needs since C2), a Subversion repository made by `slates
 #   repository create --tool svn` and filled by `slates repository import` of the dump (timed as "import", every run),
 #   and a token from `slates credential token` (run with the anchor's issuer surface), its id and the token the user and
-#   password svn signs in with (CRAM-MD5).
+#   password svn signs in with (CRAM-MD5);
+# - stock-http: Apache httpd (HTTPD, default /usr/sbin/httpd; its modules in HTTPD_MODULES, default /usr/libexec/apache2)
+#   serving a copy of the loaded repository through `mod_dav_svn` (`DAV svn`, `SVNPath`, anonymous write), Subversion's
+#   own HTTP server (main 01a20182's ruling of 2026-11-27 14:31). Where HTTPD_MODULES holds no `mod_dav_svn.so` the
+#   server is skipped, said so on every run, and its absence is no failure;
+# - slates-http: slates as above with its HTTP edge (`--vcs-http 127.0.0.1:0`) in place of its svn:// listener, the
+#   repository at `http://127.0.0.1:PORT/project`, the token given as Basic's password: slates' WebDAV site, the
+#   counterpart of `mod_dav_svn`.
 #
 # The steps, each timed on the wall clock and bounded (`alarm`), a failure recorded and the run going on:
 # 1. load: `svnadmin load` of the whole dump into a fresh repository (Subversion's own import of a history), timed
@@ -24,13 +31,21 @@
 #    checkout, since git's own checkout rewrites `eol=crlf` files);
 # 3. log: `svn log -q` of the whole history, which must name every revision;
 # 4. incremental: one new file committed from a copy of the working copy (`commit`), then the working copy updated to
-#    it (`update`), which must then hold it;
-# 5. update-1000: the working copy taken back 1,000 revisions (untimed), then updated to the youngest.
+#    it (`update`), which must then hold it. The commit is then read back: the new file's content as the server serves
+#    it (`svn cat`), and the revision's changed paths (`svn log -v`, without its author and date), recorded as one
+#    digest a run and compared across the servers at the end (main's ruling of 14:31), the file's text the same on every
+#    server;
+# 5. update-1000: the working copy taken back 1,000 revisions (untimed), then updated to the youngest;
+# 6. concurrent clients (`concurrent.sh`, main 01a20182's ruling of 2026-11-27 15:02), before update-1000: N checkouts
+#    of trunk at once, each one's tree the single client's at the youngest revision (`concurrent-checkout`); N copies of
+#    the working copy updating at once to one more revision committed before them, each then holding it
+#    (`concurrent-update`). N derived from the machine, the wall time, each client's median and most and the server's
+#    peak resident memory recorded.
 #
 # svn runs with its own empty configuration directory, never prompts, and speaks C. Everything is written under WORK,
 # which is made empty and removed at the end; DUMP and SOURCE are only read.
 #
-# Usage: [SERVERS="stock slates"] [SLATES=slates] svn_scale.sh DUMP SOURCE REF WORK [RUNS] [BOUND]
+# Usage: [SERVERS="stock slates stock-http slates-http"] [SLATES=slates] svn_scale.sh DUMP SOURCE REF WORK [RUNS] [BOUND]
 #   SERVERS    the servers measured, in the order each run starts them (default "stock")
 #   SLATES     the release `slates` binary (`cargo build --release --locked -p slates-cli`), for the slates server
 #   DUMP       the dataset's dump (`git_to_svn_dump.py SOURCE REF 5000 > DUMP`)
@@ -48,6 +63,8 @@ RUNS=${5:-3}
 BOUND=${6:-3600}
 SERVERS=${SERVERS:-stock}
 SLATES=${SLATES:-slates}
+HTTPD=${HTTPD:-/usr/sbin/httpd}
+HTTPD_MODULES=${HTTPD_MODULES:-/usr/libexec/apache2}
 UPDATE_SPAN=1000
 
 rm -rf "$WORK"
@@ -85,6 +102,8 @@ timed() {
 git -C "$SOURCE" ls-tree -r --format='%(objectmode) %(objectname) %(path)' "$REF" | sed -n 's/^100[0-7]* //p' \
   | LC_ALL=C sort > "$WORK/source.files"
 echo "dataset: $DUMP, $(du -h "$DUMP" | cut -f1); $SOURCE at $(git -C "$SOURCE" rev-parse "$REF"), $(wc -l < "$WORK/source.files" | tr -d ' ') regular files"
+# shellcheck source=concurrent.sh
+. "$(dirname "$0")/concurrent.sh"
 echo "svn: $(svn --version --quiet); slates: $("$SLATES" version 2> /dev/null || echo none); svnserve: $(svnserve --version --quiet)"
 echo "machine: $(sysctl -n machdep.cpu.brand_string 2> /dev/null), $(sysctl -n hw.ncpu 2> /dev/null) cores; load: $(uptime | sed 's/.*load averages*: //')"
 
@@ -126,12 +145,16 @@ rss_of() { ps -o rss= -p "$1" 2> /dev/null | awk '{ printf "%.0f", $1 / 1024 }' 
 # The value of the first line of FILE matching the sed expression, or nothing.
 first() { sed -n "$2" "$1" | head -1; }
 
-# Starts a fresh slates anchor for run $1, makes the repository, imports the dump (timed) and mints a token: sets URL,
-# AUTH, ANCHOR, DAEMON.
+# Starts a fresh slates anchor for run $1 serving over route $2 (`svn`, its svn:// listener; `http`, its HTTP edge's
+# WebDAV site), makes the repository, imports the dump (timed, as server $3) and mints a token: sets URL, AUTH, ANCHOR,
+# DAEMON.
 start_slates() {
-  local instance="w-perf-svn-$$-$1" log="$WORK/anchor-$1.log" exports minted streak=0 port
-  mkdir -p "$WORK/store-$1"
-  "$SLATES" --instance "$instance" anchor --vcs-svn 127.0.0.1:0 --vcs-store "$WORK/store-$1" > /dev/null 2> "$log" &
+  local route=${2:-svn} server=${3:-slates}
+  local instance="w-perf-svn-$$-$1-$route" log="$WORK/anchor-$1-$route.log" exports minted streak=0 port listen
+  if [ "$route" = http ]; then listen=--vcs-http; else listen=--vcs-svn; fi
+  mkdir -p "$WORK/store-$1-$route"
+  "$SLATES" --instance "$instance" anchor "$listen" 127.0.0.1:0 --vcs-store "$WORK/store-$1-$route" > /dev/null \
+    2> "$log" &
   ANCHOR=$!
   for _ in $(seq 1 1200); do
     if grep -q "^slates daemon: instance $instance serving on" "$log" \
@@ -140,9 +163,13 @@ start_slates() {
     sleep 0.1
   done
   DAEMON=$(first "$log" 's/^slates anchor: instance .* up; daemon pid \([0-9]*\);.*/\1/p')
-  port=$(first "$log" 's|^slates daemon: the svn:// listener serves on 127\.0\.0\.1:\([0-9]*\).*|\1|p')
+  if [ "$route" = http ]; then
+    port=$(first "$log" 's|^slates daemon: the version-control HTTP edge serves cleartext on 127\.0\.0\.1:\([0-9]*\).*|\1|p')
+  else
+    port=$(first "$log" 's|^slates daemon: the svn:// listener serves on 127\.0\.0\.1:\([0-9]*\).*|\1|p')
+  fi
   exports=$(first "$log" 's/^slates anchor: issuer surface: export //p')
-  echo "slates run $1: $(first "$log" 's/^\(slates daemon: instance .* serving on .*\)/\1/p'), svn:// on $port"
+  echo "$server run $1: $(first "$log" 's/^\(slates daemon: instance .* serving on .*\)/\1/p'), $route on $port"
   for _ in $(seq 1 1200); do
     if "$SLATES" --instance "$instance" volume list > /dev/null 2>&1; then streak=$((streak + 1)); else streak=0; fi
     [ "$streak" -ge 10 ] && break
@@ -150,13 +177,56 @@ start_slates() {
   done
   "$SLATES" --instance "$instance" bootstrap root > /dev/null
   "$SLATES" --instance "$instance" repository create project --tool svn > /dev/null \
-    || { echo "slates run $1: repository create refused" | tee -a "$RESULTS"; return 1; }
-  timed "slates import $1" "$SLATES" --instance "$instance" repository import project "$DUMP"
-  echo "slates daemon rss after import: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
+    || { echo "$server run $1: repository create refused" | tee -a "$RESULTS"; return 1; }
+  timed "$server import $1" "$SLATES" --instance "$instance" repository import project "$DUMP"
+  echo "$server daemon rss after import: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
   # shellcheck disable=SC2086 # the surface's NAME=VALUE pairs are words
   minted=$(env $exports "$SLATES" --instance "$instance" credential token)
-  URL="svn://127.0.0.1:$port/project"
+  if [ "$route" = http ]; then URL="http://127.0.0.1:$port/project"; else URL="svn://127.0.0.1:$port/project"; fi
   AUTH=(--username "$(echo "$minted" | sed -n 's/^id: //p')" --password "$(echo "$minted" | sed -n 's/^token: //p')")
+}
+
+# Whether this host can run stock-http: HTTPD_MODULES holds `mod_dav_svn.so` and `mod_dav.so`.
+has_dav_svn() {
+  [ -f "$HTTPD_MODULES/mod_dav_svn.so" ] && [ -f "$HTTPD_MODULES/mod_dav.so" ]
+}
+
+# Starts Apache httpd serving a copy of the loaded repository through `mod_dav_svn` for run $1 (the header's
+# stock-http): sets URL and STOCK. Prefork, as git_scale.sh's stock-http; the server runs as this user in the foreground,
+# its configuration, pid and logs in its own directory under WORK, in a session of its own.
+start_stock_http() {
+  local root="$WORK/stock-http-$1" port
+  mkdir -p "$root/logs"
+  if [ ! -d "$WORK/loaded" ]; then
+    "${A[@]}" create "$WORK/loaded"
+    timed "stock-http load $1" "${A[@]}" load -q --bypass-prop-validation --file "$DUMP" "$WORK/loaded"
+  fi
+  cp -R "$WORK/loaded" "$root/project"
+  port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  cat > "$root/httpd.conf" <<CONF
+ServerRoot "$root"
+ServerName 127.0.0.1
+Listen 127.0.0.1:$port
+PidFile "$root/logs/httpd.pid"
+ErrorLog "$root/logs/error.log"
+LoadModule mpm_prefork_module $HTTPD_MODULES/mod_mpm_prefork.so
+LoadModule authz_core_module $HTTPD_MODULES/mod_authz_core.so
+LoadModule unixd_module $HTTPD_MODULES/mod_unixd.so
+LoadModule dav_module $HTTPD_MODULES/mod_dav.so
+LoadModule dav_svn_module $HTTPD_MODULES/mod_dav_svn.so
+<Location /svn/project>
+  DAV svn
+  SVNPath "$root/project"
+  Require all granted
+</Location>
+CONF
+  perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!\n"' "$HTTPD" -f "$root/httpd.conf" -DFOREGROUND \
+    > /dev/null 2> "$WORK/stock-http-$1.log" &
+  STOCK=$!
+  URL="http://127.0.0.1:$port/svn/project"
+  AUTH=()
+  for _ in $(seq 1 100); do s info "$URL" > /dev/null 2>&1 && break; sleep 0.1; done
+  echo "stock-http run $1: httpd $("$HTTPD" -v | sed -n 's/^Server version: //p') with mod_dav_svn on 127.0.0.1:$port"
 }
 
 # Checks working copy $1 of server $2 against SOURCE's tree at REF: each regular file's blob id and path.
@@ -178,6 +248,78 @@ check() {
   fi
 }
 
+# Reads server $1's run $2 commit back, the revision after $3: the new file's content as served (`svn cat`) and the
+# revision's changed paths (`svn log -v`, its author and date left out); each checked, and recorded as one digest for the
+# comparison across servers.
+committed() {
+  local server=$1 run=$2 before=$3 head served
+  head=$(s info --show-item revision "$URL")
+  if [ "$head" != "$((before + 1))" ]; then
+    echo "$server incremental check revision DIFFER: $head after $before" | tee -a "$RESULTS"
+  fi
+  served=$(s cat "$URL/trunk/a-699-scale.txt" 2> /dev/null)
+  if [ "$served" = "one more revision, run $run" ]; then
+    echo "$server incremental check content identical" | tee -a "$RESULTS"
+  else
+    echo "$server incremental check content DIFFER: $served" | tee -a "$RESULTS"
+  fi
+  s log -v -q -r "$head" "$URL" | grep -E '^   [ADMR] ' | LC_ALL=C sort > "$WORK/$server-changed-$run"
+  echo "$server incremental digest $run $({ echo "$head $served"; cat "$WORK/$server-changed-$run"; } \
+    | shasum -a 256 | cut -d' ' -f1)" | tee -a "$RESULTS"
+}
+
+# The listing of working copy $1's regular files, each its git blob id and path, into $2 (as `check` lists one).
+listing() {
+  (cd "$1" && find . -name .svn -prune -o -type f -print | sed 's|^\./||' | LC_ALL=C sort > "$2.paths" \
+    && git hash-object --no-filters --stdin-paths < "$2.paths" | paste -d' ' - "$2.paths" | LC_ALL=C sort > "$2")
+}
+
+# The concurrent clients of server $1's run $2 (header, step 6): working copy $3 at the youngest revision, and copy $4
+# the single client committed from.
+concurrent_steps() {
+  local server=$1 run=$2
+  C_SERVER=$server C_RUN=$run C_COPY=$3 C_OTHER=$4
+  case $server in slates | slates-http) SERVER_PIDS="$ANCHOR $DAEMON" ;; *) SERVER_PIDS=$STOCK ;; esac
+  CLIENT_VARS="S AUTH URL C_RUN"
+  concurrent "$server" checkout "$run" svn_checkout_client svn_checkout_check svn_checkout_prepare
+  concurrent "$server" update "$run" svn_update_client svn_update_check svn_update_prepare
+}
+
+# The single client's tree at the youngest revision: what each checkout must hold.
+svn_checkout_prepare() { s update -q "$C_COPY" && listing "$C_COPY" "$C_DIR/expected.files"; }
+svn_checkout_client() { "${S[@]}" ${AUTH[@]+"${AUTH[@]}"} checkout -q "$URL/trunk" "$C_DIR/co-$1"; }
+svn_checkout_check() {
+  listing "$C_DIR/co-$1" "$C_DIR/co-$1.files" 2> /dev/null
+  if [ -s "$C_DIR/co-$1.files" ] && cmp -s "$C_DIR/expected.files" "$C_DIR/co-$1.files"; then
+    echo "$C_SERVER check concurrent-checkout client $1 tree identical" >> "$RESULTS"
+  else
+    echo "$C_SERVER check concurrent-checkout client $1 tree DIFFER" | tee -a "$RESULTS"
+  fi
+  rm -rf "$C_DIR/co-$1"
+}
+
+# A copy of the working copy for each of $1 clients (the probe's when 0), then one more revision committed for them to
+# update to, the same text on every server.
+svn_update_prepare() {
+  local k
+  for k in $(seq "$([ "$1" = 0 ] && echo 0 || echo 1)" "$1"); do cp -R "$C_COPY" "$C_DIR/up-$k"; done
+  s update -q "$C_OTHER"
+  C_UPDATED="an updated revision, run $C_RUN, for $1 clients"
+  echo "$C_UPDATED" > "$C_OTHER/a-699-updated-$1.txt"
+  s add -q "$C_OTHER/a-699-updated-$1.txt"
+  s commit -q -m "updated" "$C_OTHER"
+  C_UPDATED_FILE="a-699-updated-$1.txt"
+}
+svn_update_client() { "${S[@]}" ${AUTH[@]+"${AUTH[@]}"} update -q "$C_DIR/up-$1"; }
+svn_update_check() {
+  if [ "$(cat "$C_DIR/up-$1/$C_UPDATED_FILE" 2> /dev/null)" = "$C_UPDATED" ]; then
+    echo "$C_SERVER check concurrent-update client $1 updated" >> "$RESULTS"
+  else
+    echo "$C_SERVER check concurrent-update client $1 MISSED" | tee -a "$RESULTS"
+  fi
+  rm -rf "$C_DIR/up-$1"
+}
+
 # Runs the steps against the server started for run $2 ($1 its name).
 steps() {
   local server=$1 run=$2 copy="$WORK/$1-wc-$2" other="$WORK/$1-other-$2" youngest named
@@ -192,12 +334,15 @@ steps() {
     echo "$server check log MISSED: $named named of $youngest" | tee -a "$RESULTS"
   fi
   cp -R "$copy" "$other"
-  echo "one more revision, $server run $run" > "$other/a-699-scale.txt"
+  # The same text on every server, so each run's commit reads back alike across them.
+  echo "one more revision, run $run" > "$other/a-699-scale.txt"
   s add -q "$other/a-699-scale.txt"
   timed "$server commit $run" "${S[@]}" ${AUTH[@]+"${AUTH[@]}"} commit -q -m "one more revision" "$other"
   timed "$server update $run" "${S[@]}" ${AUTH[@]+"${AUTH[@]}"} update -q "$copy"
   if [ -f "$copy/a-699-scale.txt" ]; then
     echo "$server incremental check updated" | tee -a "$RESULTS"
+    committed "$server" "$run" "$youngest"
+    concurrent_steps "$server" "$run" "$copy" "$other"
   else
     echo "$server incremental check MISSED" | tee -a "$RESULTS"
   fi
@@ -220,6 +365,24 @@ for run in $(seq 1 "$RUNS"); do
         if start_slates "$run"; then steps slates "$run"; else echo "slates run $run: the anchor did not start" | tee -a "$RESULTS"; fi
         stop_servers
         ;;
+      stock-http)
+        if ! has_dav_svn; then
+          echo "stock-http skipped run $run: no mod_dav_svn.so and mod_dav.so in $HTTPD_MODULES" | tee -a "$RESULTS"
+          continue
+        fi
+        start_stock_http "$run"
+        steps stock-http "$run"
+        stop_servers
+        rm -rf "$WORK/stock-http-$run"
+        ;;
+      slates-http)
+        if start_slates "$run" http slates-http; then
+          steps slates-http "$run"
+        else
+          echo "slates-http run $run: the anchor did not start" | tee -a "$RESULTS"
+        fi
+        stop_servers
+        ;;
       *) echo "unknown server $server" >&2; exit 1 ;;
     esac
   done
@@ -227,7 +390,7 @@ done
 
 echo "== results (seconds; every run shown)"
 FAILED_ROWS=""
-for step in load import checkout log commit update "update-$UPDATE_SPAN"; do
+for step in load import checkout log commit update "update-$UPDATE_SPAN" concurrent-checkout concurrent-update; do
   grep -qE "^[^ ]+ $step " "$RESULTS" || continue
   for server in $SERVERS; do
   # A step only another server runs (svn's load is stock's, its import slates') is no line for this one.
@@ -239,16 +402,26 @@ for step in load import checkout log commit update "update-$UPDATE_SPAN"; do
   if ! grep "^$server $step " "$RESULTS" | grep -q " ok$"; then FAILED_ROWS="$FAILED_ROWS $server:$step"; fi
   done
 done
+concurrent_table
 echo "load at the end: $(uptime | sed 's/.*load averages*: //')"
 # A step a server ran in no run is no row; a step whose every run failed is FAILED, and fails the harness: a leg that
 # could not run must never print as a best of "-" (main's r592, every slates git and svn step failed and the round
 # exited 0). A server that timed no step at all (its setup refused) fails it too, though it left no row to mark.
 for server in $SERVERS; do
+  # A server this host cannot run (stock-http without mod_dav_svn) said so on every run, and is no failure.
+  grep -q "^$server skipped run " "$RESULTS" && continue
   grep -qE "^$server [^ ]+ [0-9]+ [0-9.]+ " "$RESULTS" || FAILED_ROWS="$FAILED_ROWS $server:every-step"
 done
 # A check that found the served data unlike the source (refs, objects, changesets, tree or log DIFFER; an incremental
 # change MISSED) fails the harness too: a check that only prints could let a dropped ref pass (main 01a20182, after
 # r655 narrowed git's object check to what the push sends).
+# Each run's commit read back alike on every server that took it: one digest a run (main's ruling of 14:31).
+for run in $(seq 1 "$RUNS"); do
+  digests=$(awk -v run="$run" '$2 == "incremental" && $3 == "digest" && $4 == run { print $1 " " $5 }' "$RESULTS")
+  if [ "$(echo "$digests" | awk 'NF { print $2 }' | sort -u | wc -l | tr -d ' ')" -gt 1 ]; then
+    echo "servers incremental check across servers DIFFER run $run: $(echo "$digests" | tr '\n' ' ')" | tee -a "$RESULTS"
+  fi
+done
 CHECKS_FAILED=$(grep -E '^[^ ]+ (incremental )?check .*(DIFFER|MISSED)' "$RESULTS" | sort -u | tr '\n' ';')
 if [ -n "$FAILED_ROWS" ] || [ -n "$CHECKS_FAILED" ]; then
   [ -n "$FAILED_ROWS" ] && echo "FAILED: every run failed for$FAILED_ROWS"
