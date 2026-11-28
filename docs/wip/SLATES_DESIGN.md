@@ -15243,8 +15243,18 @@ Status (2026-11-27, the stream's index rows a run a step): the gathering reads e
 link, node, flags, length) in one range walk of the index, which opens only the sealed tables whose first and last
 keys can meet the log's range, and spends at most a step's bytes touched (half the step quantum at the measured copy
 rate) or the room, whichever first. The index stage then writes as many rows a step as one step's copy holds, from
-those numbers, with no lookup a row, and the next log is the count pass's next sized one. Measured on a 1,200-revision
-stock history over 48 sealed runs: 0.37 index reads a revision, from 4.47.
+those numbers, with no lookup a row, and the next log is the one the gathering found after it. Measured on a
+1,200-revision stock history over 48 sealed runs: 0.37 index reads a revision, from 4.47.
+Status (2026-11-27, A-937, the kept rendered length): a stream walks nothing before its head. Each revision's chunk
+length as the stream sends it is kept where the revision lands, in the index that takes its place (a sized row a
+revision, a number row a log, the head's files and bytes a field of the index its fork copies): a push's fork at its
+landing, after any re-base, a made changeset's and an import's index likewise. The head is named from them, the
+entries and data are written from the sized rows the gathering reads beside the numbers, and a kept length that is not
+the chunk's is refused typed, never sent past the head. A rebuilt index is unsized (no record names a length) and
+serves no stream (`1\n`, the client clones) until a sliced recount, the count walk once, ends.
+Status (2026-11-27, the data stage a run a step): a split log's data file is written a run of chunks a step, within the
+step's copy budget or the room, whichever first, its first chunk whatever: on a 1,200-revision stock history one step
+for 300 chunks, where each chunk took a step.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
@@ -64222,6 +64232,20 @@ daemon}.rs`, `crates/server/src/vcs_http/{git,hg,svn,daemon_edge}.rs`, `crates/s
   limit: a forward's first try may go to a readmitted creator, costing a redirect, never a wrong answer. Keeping a fact
   past A-309's removal to close it is a design change of its own.
 
+- **Readmission keeps what the skip reads (2026-11-27, w-shared for main 01a20182, its ruling of 20:48; diag 12's
+  x86_64 red).** The creator skip (`owner_location`'s `known_owner`: a first owner the configuration keeps a retirement or
+  a completed takeover of is not offered) read nothing once the host was admitted again: `admit` drops the completion
+  record (A-309, rightly: kept, a later takeover of the id that never completed would settle its lines), and the
+  retirement had gone at the completion. A stranger with no route of its own offered the readmitted creator. Now `admit`
+  moves the fact to `RegionalConfiguration::superseded` (host to the admitting version), read by routing alone, so
+  A-309's lineage concern and the routing concern stay apart. An ObjectId carries no incarnation, so the skip cannot tell
+  the host's objects from before and after; one it made after takes the location round, which finds it, while the entry
+  is kept. Bound: at most `completed_bound`, the earliest admitted let go first; a let-go entry costs a stranger one
+  forward refused as not the owner's, never a wrong owner. Regional layout 8 carries it; layout 7 is read with none.
+  Tests: fleet `a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it` asks the stranger's
+  direct route of an unrouted object of a's (red first: it named a); units `a_member_admitted_again_after_its_completed_takeover_stays_superseded`,
+  `superseded_members_are_bounded_the_earliest_let_go_first`, `raft_wire::tests::a_superseded_member_round_trips_and_layout_seven_reads_none`.
+
 ### A-925 — A node announces its own version-control edges to its peers, as a client reaches them (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; A-921 part 2's prerequisite)
 
 - **Why.** A-921's product half answers a request at a node that is not a repository's owner with where to go. A node
@@ -66761,3 +66785,61 @@ Applied in the same change to:
     kind in `every_message`'s round trip and the unknown-kind refusal moved past it.
 - **Applied in the same change to:** `crates/cluster/src/content.rs`, `crates/server/src/{fleet,merge_service,
   state_log,replica_build}.rs`, `crates/server/tests/fleet.rs`, GAPS.
+- **The replay half (main 01a20182's ruling of 2026-11-27 20:19, its (i)).** A replica build that waits on its
+  repository's store's replay (`replica_build::laid_out`) made no turn, so it answered `ReplicaBuilding` at 0 through
+  the replay, and the barrier gave up while the replay moved (a914 at 69fbc8de0 run 2: two region reads, each spending
+  its whole share on d, just dead and not yet suspected, 2 s at 0 turns). Now the work done a build reports is its turns
+  and the most of its store's replay it saw (`VcsStores::rebuild_steps`: the records replayed and the names fetched from
+  the region, `rebuild_fetched`, reset at each rebuild's start and bounded by the partition's repositories), which only
+  rises (`replica_build::replayed_seen`). The barrier's rule is unchanged: movement counts once per target, version and
+  work done, which only rises. The barrier is right whatever a read costs; a read's cost itself is A-936's next item,
+  the hedged region read. Units: `state_log::tests::a_barrier_is_not_given_up_while_its_mark_rises_and_is_once_it_stands_still`,
+  `replica_build::tests::a_waiting_builds_replay_seen_rises_with_its_steps_and_never_falls`,
+  `vcs_store::tests::a_rebuilds_steps_are_its_records_replayed_and_names_fetched`; main's ×16's run 2 is the field
+  evidence.
+
+### A-937 — A Mercurial revision's chunk length is kept where it lands, so a stream clone walks nothing before its head (2026-11-27, w-interop for main 01a20182, its order of 2026-11-27 16:23 (cut 2) and its rulings of 18:56, 18:58 and 20:19; goal 93's hg whole-history gap; §4.17.3 "Stream clones: the revlog view")
+
+- **Why.** A stream names its files' count and bytes first, so it walked every log's rows and sized every revision's
+  chunk before its first byte: at 343703bd7 on hg-src that count stage was 464,254 of a stream's 842,218 steps, 541,331
+  content store reads and about 3.8 s of a 15.4 s stream (main's hg_scale round, BENCHMARKS).
+- **What is kept.** In the hg index, RAM only, rebuilt with it (no disk format changes, main's ruling of 18:56):
+  - a sized row a revision, `S` and its log's number and its own (big-endian): its chunk's length (`u32`) and its offset
+    among the log's chunks (`u64`), its index entry's two numbers. 21 bytes of key and body (`SIZED_ROW_BYTES`), about
+    21 MB a million revisions; the log's number in place of its path halves it (main's ruling of 18:58);
+  - a number row a log, `X` and the log's key: its number, given in the order logs are first sized;
+  - the head's totals (files, bytes), the revisions appended and sized, and whether one cannot be streamed as kept: a
+    field of the index, copied by its fork, so a generation's totals are its rows'. A stream is served only while every
+    revision appended is sized and each can be streamed (`HgIndex::rendered`).
+  The index never replaces a row (insert-only, `RowDiffers`), which is why the length is a row of its own rather than a
+  field of the revision's row: a recount must be able to add it after the row exists.
+- **Where it is kept.** Where each revision's length is had: a segment's chunk by its length as the segment made it, any
+  other delta compressed once by the stream's own compressor (`index::chunk_len_of`), at the landing rather than at
+  every stream. A push sizes its fork just before its landing, after any re-base (`vcs_store::hg_sized::size_fork`), a
+  made changeset its fork, an import its index before it is placed (`slates_hg::push::sized`). A changelog delta against
+  another revision than the one before it is kept unstreamable, the stream's own rule.
+- **Recovery** (main's ruling (C) of 18:56 and of 20:19). A replay appends what each record names, a push's or an
+  import's (`import::record::replay`), and no record names a chunk length, so a rebuilt index is unsized and serves no
+  stream until its recount ends: `render::Recount`, the count walk once, sliced on a task of its own at a replay's end
+  (`hg_sized::rebuilt`), its asks answered by the node's store as a stream's are, begun again where a fork is swapped in
+  meanwhile, a row sized already kept as it is. Sizing inline in the replay would lengthen the recovery every client
+  waits on; an unsized repository only answers stream clones `1\n` for one walk's time, and they fall back to a clone.
+- **A stale length** is refused typed (`render::Refused::StaleLength`): a log with fewer sized rows than revisions, or a
+  chunk not its kept length. Before the head (the totals not the rows'), no stream (`1\n`); after it, the stream is cut
+  short there, never a byte past what the head named.
+- **Counted.** `vcs_store.hg_sized.{revisions,unsized_logs,refused}` and `vcs_store.hg_recount.{runs,slices,restarts,done,
+  short}`; the stream's count stage's steps (`vcs_store.hg_stream_steps.count`) at zero.
+- **Tests.** The oracle, `slates_hg::serve::indexed::tests::rendered`: generated landing histories (raw and chunk places,
+  logs crossing 7.2's inline bound) landed three ways, sized where they land, recounted after each landing, and replayed
+  from a generated landing on with nothing sized before it and then recounted; the three keep the same values after
+  every landing, and the landed history's stream is served with every text read back through its entries. Its reach
+  (a split log, both place forms), the stale refusals, and the stream tests' count stage at zero. The server:
+  `vcs_store::hg_import::tests::t_cut2_an_import_is_sized_where_it_lands_and_recounted_after_its_rebuild` (sized at
+  landing; a rebuild's recount begun, sliced and ended; the same head and stream after) and the edge's
+  `a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes` (a push sized where it landed, the stream's
+  count stage no step).
+- **Applied in the same change to:** `crates/hg/src/{index,render}.rs`, `crates/hg/src/push/{mod,sized}.rs`,
+  `crates/hg/src/serve/{indexed_tests,rendered_tests}.rs`, `crates/server/src/vcs_store.rs`,
+  `crates/server/src/vcs_store/{hg_sized,hg_import,hg_made}.rs`, `crates/server/src/vcs_store/hg_import/tests.rs`,
+  `crates/server/src/repository/hg_push.rs`, `crates/server/src/repository/hg_push/rebase.rs`,
+  `crates/server/src/vcs_http/tests/daemon_edge.rs`, this section's status, GAPS, BENCHMARKS.

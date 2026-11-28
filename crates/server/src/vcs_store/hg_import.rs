@@ -109,6 +109,9 @@ pub(crate) struct Importing {
   named: u64,
   /// The import's name, derived as its segments land from their payloads' identities ([`NAME_CONTEXT`]).
   name: blake3::Hasher,
+  /// Each revision of its segments made so far, its chunk's length as the segment made it: what its index is sized by
+  /// before it is placed ([`super::hg_sized::keep_in`]; goal 93, cut 2).
+  sized: Vec<slates_hg::push::sized::Landed>,
 }
 
 /// Where an import stands.
@@ -290,6 +293,7 @@ pub(crate) fn begin(
         run: None,
         named,
         name: blake3::Hasher::new_derive_key(NAME_CONTEXT),
+        sized: Vec::new(),
       };
       state.vcs_stores.imports.insert(id, importing);
       state.count(STARTED, 1);
@@ -444,6 +448,15 @@ fn segment_parts(
 ) -> Option<SegmentLanding> {
   if places.len() != segment.texts.len() {
     return None;
+  }
+  // Each revision's chunk length as the segment made it, for the index's sizing before it is placed (goal 93, cut 2).
+  match slates_hg::push::sized::chunked(&segment.texts, &places) {
+    Ok(lengths) => {
+      if let Some(importing) = state.vcs_stores.imports.get_mut(&id) {
+        importing.sized.extend(lengths);
+      }
+    }
+    Err(_) => state.count(super::hg_sized::SIZED_REFUSED, 1),
   }
   let sequence = state.vcs_stores.next_changeset(id)?;
   let payload_identity = *blake3::hash(&chunks).as_bytes();
@@ -719,6 +732,7 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
     run,
     named,
     name,
+    sized,
   } = importing;
   let import = match stage {
     Stage::Running { import, .. } => *import,
@@ -734,6 +748,7 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
           run,
           named,
           name,
+          sized,
         },
       );
       return Err(ImportFailed::Busy);
@@ -762,6 +777,7 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
       run,
       named,
       name,
+      sized,
     },
   );
   state.count(DONE, 1);
@@ -889,7 +905,7 @@ pub(crate) fn land(
   state: &mut ShardState,
   id: RepositoryId,
 ) -> Result<Vec<slates_hg::filerev::FileContents>, ImportFailed> {
-  let (mut imported, room, mut works, (run, named, name), landed_contents) =
+  let (mut imported, room, mut works, (run, named, name), (landed_contents, sized)) =
     match state.vcs_stores.imports.remove(&id) {
       Some(Importing {
         stage: Stage::Done {
@@ -902,8 +918,15 @@ pub(crate) fn land(
         named,
         name,
         landed_contents,
+        sized,
         ..
-      }) if segments.is_empty() => (imported, room, works, (run, named, name), landed_contents),
+      }) if segments.is_empty() => (
+        imported,
+        room,
+        works,
+        (run, named, name),
+        (landed_contents, sized),
+      ),
       Some(running) => {
         state.vcs_stores.imports.insert(id, running);
         return Err(ImportFailed::Busy);
@@ -917,6 +940,10 @@ pub(crate) fn land(
     landing_entry(state, id, (&*imported, &mut works), (record, name))
   });
   let mut index = Some(core::mem::take(&mut imported.index));
+  // Its revisions sized where they land, before it takes the store's place (goal 93, cut 2).
+  if let Some(index) = index.as_mut() {
+    super::hg_sized::keep_in(state, index, &sized);
+  }
   let appended = entry.and_then(|(owner, changes, parts, record)| {
     crate::repository::push::push_imported(
       state,

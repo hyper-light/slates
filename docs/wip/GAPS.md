@@ -417,8 +417,9 @@
 >   replica build stalls at the second death.** Reproduced on purpose (a refused first-death push, then the second
 >   death): the logs put it on the holder's configuration lag, not the build or the region (the build's replay 5 ms):
 >   each reship refused `foreign_generation`. Now the holder answers `CatchingUp` and the barrier counts it (design
->   A-936). Still open: one focused run after it showed the holder's build for v2 at no turn, before the build's begin
->   and end were logged; they are now. Not seen in a914 since A-914 (c) (16 of 16 at 02548a267): every stalled red followed a refused first
+>   A-936). The no-turn build (main's ×16 at 69fbc8de0, a914 run 2): the build waited on its store's replay, whose two
+>   region reads each spent a whole share on d, dead and not yet suspected; now the replay's steps count as the build's
+>   work done, so the barrier sees it move (A-936's replay half). OPEN, next: the hedged region read, the read's cost. Not seen in a914 since A-914 (c) (16 of 16 at 02548a267): every stalled red followed a refused first
 >   push, so its red must make the condition on purpose, or the logs show a refused push is its only door (main's ruling
 >   of 19:02). a914 at 604aa12a0 run 10 and at d08595c7e runs 1, 3, 5, 7 and 9 (each after a refused first-death
 >   push): the second death's v2 placed at the owner alone, its other live candidate answering `ReplicaBuilding` at 0
@@ -434,6 +435,12 @@
 >   v1 retargeted to the newcomer meanwhile: not yet A-935's, one red against none in 16). Unproven guess for the stall:
 >   an object of an earlier landed record whose homes were the two dead (d and c), the healer not yet re-homing it before
 >   c died.
+> - **Not recurred since A-936 (main 01a20182's ruling of 2026-11-27 21:08): a superseded owner's write answered
+>   `FsDone` on Windows** (`a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost`, diag 12 at a0d39a8c1,
+>   both lanes). Suspected: a holder whose install walk had not reached the volume's copy still named the old owner and
+>   took its live entry. At 3b0015fa6 (A-936 in, its copy installed ahead of the walk) 8 of 8 on both lanes, and the
+>   log that would show it, `fleet.live.admitted_under_lagging_copy`, fired 0 times. No fix written; the log stays, and
+>   if it ever fires that run is the red.
 > - **OPEN, being logged (w-shared; main 01a20182's ruling of 2026-11-27 17:05): a live node's own HTTP edge refused a
 >   connect at 0 ms.** 2816da877's a914 run 3: the first death's push failed "Failed to connect to 127.0.0.1 port 55009
 >   after 0 ms: Couldn't connect to server" on a's own `vcs_http_port` while a was alive, and no "the HTTP edge
@@ -568,7 +575,13 @@
 >     from version 0). Both are reached now. Red first: a successor holding none of the green's records gave it up after
 >     37 attempts; it adopts it in 7 now, and takes a push. A-918 B's newcomer half is closed below. **Owed (main):**
 >     gate 24.
->   - **KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
+>   - **FIXED (w-shared, 2026-11-27; main 01a20182's ruling of 20:48; diag 12's x86_64 red): readmission no longer
+>     clears what the creator skip reads.** `RegionalConfiguration::admit` still drops a readmitted host's completion
+>     record (A-309) and now keeps the fact for routing alone (`superseded`, regional layout 8; at most `completed_bound`,
+>     the earliest let go first, a let-go costing one refused forward), which `owner_location`'s skip reads. Red first on
+>     the Mac: a921's forwarded test asks the stranger's direct route of an object of a's it has no route for; it named a,
+>     and the volume's own route named it too in that run; now none. The entry below stays as the record.
+>   - **Was a KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
 >     A readmission drops the host's completed takeover (`RegionalConfiguration::admit`, A-309) and its retirement is
 >     gone once that completes, so A-921 part 2's creator skip has nothing to read for it: a node that has not yet
 >     learned an object's adopter offers the readmitted creator first. It costs a redirect, never a wrong answer. The
@@ -1206,6 +1219,18 @@
 > below the root removing "ax" beside "ab" took "ab"'s value; `Ptrie::remove` asks `get` first, so no caller met it.
 > Now matched as `get` matches it; the sweep found every other descent (`get`, `insert_at`, `graft_at`, `cut_at`,
 > `under_any`) already matching its labels whole. The oracle asserts an absent key's removal copies no node.
+
+> **Open, measured red on main (A-920, w-svn, 2026-11-27; main's ruling of 20:31): one free returns about 40 MB of pages
+> to the system inside a landing's step.** Release probe 18 read copy's prepare at 2.0 ms of wall on 47 µs of CPU.
+> Debug logs, a footprint read before and after each landing step (`staging::returned`): the slowest step spent 1.7 ms
+> off its CPU while the process footprint fell 40.1 MB, the steps pages were returned in held all of a run's off-CPU
+> time (1.7-2.5 ms), and a run with no return during a landing step spent at most 18 µs off its CPU although 1,218 steps
+> met the reaper dropping. So it is the page return, not the reaper's drops, and neither slicing the reaper's drops
+> (measured: 804-2,442 µs, no better) nor dropping on the shard can split one return. The wide copy test holds
+> `LANDING_OFF_CPU_MOST_NS` to 84a's 1 ms bar and fails where a return stalls a step (2 of 4 debug runs; another run's
+> 8 return steps, 71 MB, stalled none, at most 22 µs off its CPU, so the stall is intermittent): the red the arena piece turns
+> green (the landing's structures in the shard's arena, so a free never hands pages back mid-step). Unexplained, logged,
+> not attributed: one run's 5,025 µs in a step whose footprint did not fall.
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
@@ -5152,6 +5177,29 @@
 > search. Held by `a_streams_index_rows_are_written_a_run_a_step` (1,200 revisions of a stock-hg history imported, 48
 > sealed runs): index reads 5,369 (4.47 a revision) before, 449 (0.37) after; index steps 1,249 before, 57 after. Count
 > stage on the same history: 1,215 steps, 1,298 reads. Cut 2, the kept rendered length, is next.
+> Cut 2, the kept rendered length, BUILT (2026-11-27, w-interop; A-937, main's rulings of 18:56, 18:58 and 20:19). Each
+> revision's chunk length as a stream sends it is kept where it lands, in the index that takes the revisions' place: a
+> sized row a revision (`S`, the log's number and the revision's, its length and offset; 21 bytes of key and body), a
+> number row a log (`X`), and the head's totals as a field of the index its fork copies. A push sizes its fork at its
+> landing, after any re-base, its segments' chunk lengths noted as each landed and the rest compressed once; a made
+> changeset and an import size theirs the same way. A stream names its head from them, no walk before its first byte,
+> and a length that is stale is refused typed (`render::Refused::StaleLength`; before the head, no stream, `1\n`). A
+> rebuild names no length (a replay appends what its records name), so a sliced recount follows it
+> (`vcs_store::hg_sized`, the count walk once, `render::Recount`), and the stream answers `1\n` until it ends: the
+> recovery is not lengthened, and a stream clone meanwhile falls back to a clone. Held by the hg crate's three-way
+> oracle (`serve::indexed::tests::rendered`, landed, recounted and replayed histories), the stale refusal, and the
+> server's `t_cut2_an_import_is_sized_where_it_lands_and_recounted_after_its_rebuild` and the edge's push-then-stream
+> test: no count step. Owed (main): the hg leg's rerun at the tip (the round at 343703bd7 is in BENCHMARKS: count stage
+> 464,254 of 842,218 steps). Next: the data stage a run a step; the index stage's reads on hg-src; the incremental
+> push's 8.4×.
+> The data stage a run a step, BUILT (2026-11-27, w-interop; main's reading of 19:39 and order of 20:30: hg-src's
+> data stage moved 529 bytes a step, 139,403 steps for 73.8 MB, about 30 µs a step). A split log's data file is
+> written a run of chunks a step, ending at the log's last chunk, at a chunk the store must be asked for, or before one
+> that would pass the step's copy budget (the one the gathering and a push's chunking are held to) or the room. Held by
+> `a_streams_data_chunks_are_written_a_run_a_step` (the 1,200-revision stock history): 1 data step for 300 chunks, from
+> 301. On the same history the index stage reads 971 times since cut 2 (449 before it: the sized rows' walk beside the
+> numbers, and a search for each next log now the count's list is gone), still under one read a revision; with
+> hg-src's 524,131 index reads, owed an explanation next.
 > **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
 > command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
 > session failed correct but slow steps (80-100 s of single-shard CPU, git's own index-pack among it). Now each waits

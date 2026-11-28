@@ -715,7 +715,10 @@ pub async fn request_raft(
 /// earlier, unversioned layout wrote begins with its configuration version, whose low word is the magic only at version
 /// 1,195,787,090, which no fleet's council reaches.
 const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
-/// Format: the regional configuration's layout version: 7 since A-546, which added the members whose settled
+/// Format: the regional configuration's layout version: 8 since A-921 part 2's skip (main 01a20182's ruling of
+/// 2026-11-27 20:48), which added the members admitted again while a completed takeover of them was kept
+/// (`superseded`: a count, then each host and the version that admitted it, after the moved-object exceptions). Layout
+/// 7 (A-546) added the members whose settled
 /// neighbourhood certifies their content (a host set, after the settled neighbourhoods). Layout 6 (A-538) gave each
 /// retirement and each completion record a byte saying whether its confirmations certify their content (after its
 /// version). Layout 5 (A-484) gave each
@@ -733,7 +736,10 @@ const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
 /// (GAPS, live-durability 2026-11-09). A-309's change keeps the length when nothing was dropped and no retirement is
 /// kept, and A-291's when no object is moved, which only the version tells apart.
 /// Format: the regional layout's version, raised with each change of its fields' meaning (4 since A-291).
-const REGIONAL_LAYOUT: u32 = 7;
+const REGIONAL_LAYOUT: u32 = 8;
+/// Format: the older regional layout a decoder still reads that carries no superseded members, 7 (A-546's): read with
+/// none, so a stranger's route offers a readmitted creator its old objects until the next configuration, as before.
+const REGIONAL_LAYOUT_UNSUPERSEDED: u32 = 7;
 /// Format: the older regional layout a decoder still reads whose takeovers carry their certification byte but whose
 /// settles carry none, 6 (A-538's): its settles are read as uncertified (A-546), so a holder keeps the content of a live
 /// owner's copy judged on them.
@@ -763,20 +769,25 @@ fn take_layout(bytes: &[u8], (magic, layout): (u32, u32)) -> Result<&[u8], RaftW
   Ok(rest)
 }
 
+/// What a regional layout carries beyond the oldest one read: its takeovers' certification byte (A-538), its settles'
+/// certified members (A-546) and its superseded members (A-921 part 2's skip), in that order.
+type LayoutMarks = (bool, bool, bool);
+
 /// Reads a regional configuration's magic and layout version, with whether its takeovers carry their certification byte
 /// (A-538) and whether it lists its certified settles (A-546): both in the current layout, the first alone in layout 6,
 /// neither in layout 5, whose marks are read as uncertified. Any other layout is refused by name, as [`take_layout`]
 /// refuses it.
-fn take_regional_layout(bytes: &[u8]) -> Result<((bool, bool), &[u8]), RaftWireError> {
+fn take_regional_layout(bytes: &[u8]) -> Result<(LayoutMarks, &[u8]), RaftWireError> {
   let (arrived, rest) = take_u32(bytes)?;
   if arrived != REGIONAL_MAGIC {
     return Err(RaftWireError::ForeignLayout { magic: arrived });
   }
   let (layout, rest) = take_u32(rest)?;
   match layout {
-    REGIONAL_LAYOUT => Ok(((true, true), rest)),
-    REGIONAL_LAYOUT_SETTLES_UNCERTIFIED => Ok(((true, false), rest)),
-    REGIONAL_LAYOUT_UNCERTIFIED => Ok(((false, false), rest)),
+    REGIONAL_LAYOUT => Ok(((true, true, true), rest)),
+    REGIONAL_LAYOUT_UNSUPERSEDED => Ok(((true, true, false), rest)),
+    REGIONAL_LAYOUT_SETTLES_UNCERTIFIED => Ok(((true, false, false), rest)),
+    REGIONAL_LAYOUT_UNCERTIFIED => Ok(((false, false, false), rest)),
     other => Err(RaftWireError::LayoutVersion { layout: other }),
   }
 }
@@ -805,7 +816,8 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
 /// certification marks.
 fn encode_regional_at(config: &RegionalConfiguration, layout: u32) -> Vec<u8> {
   let certifies = layout != REGIONAL_LAYOUT_UNCERTIFIED;
-  let settles_certified = layout == REGIONAL_LAYOUT;
+  let settles_certified = layout == REGIONAL_LAYOUT || layout == REGIONAL_LAYOUT_UNSUPERSEDED;
+  let supersedes = layout == REGIONAL_LAYOUT;
   let mut out = Vec::new();
   put_u32(&mut out, REGIONAL_MAGIC);
   put_u32(&mut out, layout);
@@ -876,6 +888,17 @@ fn encode_regional_at(config: &RegionalConfiguration, layout: u32) -> Vec<u8> {
     if let Some(from) = moved.from {
       put_u64(&mut out, from.0);
       encode_hosts(&mut out, &moved.cohort);
+    }
+  }
+  // The members admitted again while a completed takeover of them was kept (A-921 part 2's skip), in layout 8.
+  if supersedes {
+    put_u32(
+      &mut out,
+      u32::try_from(config.superseded.len()).unwrap_or(u32::MAX),
+    );
+    for (host, version) in &config.superseded {
+      put_u64(&mut out, host.0);
+      put_u64(&mut out, *version);
     }
   }
   encode_hosts(&mut out, &config.voters);
@@ -1125,7 +1148,7 @@ fn decode_retired(
 /// bytes of another layout are refused by name before any field is read ([`RaftWireError::ForeignLayout`],
 /// [`RaftWireError::LayoutVersion`]).
 pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfiguration, RaftWireError> {
-  let ((certifies, settles_certified), rest) = take_regional_layout(bytes)?;
+  let ((certifies, settles_certified, supersedes), rest) = take_regional_layout(bytes)?;
   let (version, rest) = take_u64(rest)?;
   let (f, rest) = take_u32(rest)?;
   let (has_mirror, rest) = take_bool(rest)?;
@@ -1144,6 +1167,20 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
   let (adoptions, rest) = decode_adoptions(rest)?;
   let (completed, rest) = decode_completed(rest, certifies)?;
   let (moved, rest) = decode_moved(rest)?;
+  // A count, then each host and the version that admitted it again: the shape the epochs map is decoded in.
+  let (superseded, rest) = if supersedes {
+    decode_epochs(rest).map(|(hosts, rest)| {
+      (
+        hosts
+          .into_iter()
+          .map(|(host, version)| (host, version.0))
+          .collect(),
+        rest,
+      )
+    })?
+  } else {
+    (std::collections::BTreeMap::new(), rest)
+  };
   let (voters, rest) = decode_hosts(rest)?;
   expect_end(rest)?;
   Ok(RegionalConfiguration {
@@ -1158,6 +1195,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
     retired,
     adoptions,
     completed,
+    superseded,
     moved,
     voters,
     settle_certified,
@@ -2129,9 +2167,9 @@ mod tests {
       .unwrap();
     assert!(config.moved.is_empty());
     let bytes = encode_regional_configuration(&config);
-    // The record is the last one: its confirmed ids (a count, then each) are followed only by the moved objects' count
-    // and the recorded voters' count (none of either here, A-380).
-    let tail = confirmed * size_of::<u64>() + 2 * size_of::<u32>();
+    // The record is the last one: its confirmed ids (a count, then each) are followed only by the moved objects', the
+    // superseded members' and the recorded voters' counts (none of any here; A-380, A-921 part 2's skip).
+    let tail = confirmed * size_of::<u64>() + 3 * size_of::<u32>();
     let count_at = bytes.len() - tail - size_of::<u32>();
     let mut lying = bytes.clone();
     lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -2180,11 +2218,11 @@ mod tests {
       "round-trip is identity with a record's recovery and held hosts",
     );
     let bytes = encode_regional_configuration(&config);
-    // From the end: the recorded voters' and moved objects' counts, then the record's confirmed and held hosts (each a
-    // count then its ids), then its one neighbourhood (an owner, a generation, its hosts as a count and ids, and an empty
-    // domain map's count), after the count of neighbourhoods.
+    // From the end: the recorded voters', superseded members' and moved objects' counts, then the record's confirmed and
+    // held hosts (each a count then its ids), then its one neighbourhood (an owner, a generation, its hosts as a count and
+    // ids, and an empty domain map's count), after the count of neighbourhoods.
     let after =
-      4 * size_of::<u32>() + (record.confirmed.len() + record.held.len()) * size_of::<u64>();
+      5 * size_of::<u32>() + (record.confirmed.len() + record.held.len()) * size_of::<u64>();
     let neighbourhood =
       2 * size_of::<u64>() + 2 * size_of::<u32>() + settled.hosts.len() * size_of::<u64>();
     let count_at = bytes.len() - after - neighbourhood - size_of::<u32>();
@@ -2199,6 +2237,37 @@ mod tests {
       decode_regional_configuration(&lying),
       Err(RaftWireError::LengthMismatch),
       "a count beyond the bytes is refused"
+    );
+  }
+
+  /// A-921 part 2's skip: a superseded member round-trips in the current layout, and a configuration of layout 7, which
+  /// carries none, is read with none and nothing else changed. Do: take a member over, have its survivors confirm, admit
+  /// it again; encode in the current layout and in layout 7.
+  #[test]
+  fn a_superseded_member_round_trips_and_layout_seven_reads_none() {
+    use slates_db::register::RegionalConfiguration;
+    let mut config = RegionalConfiguration::formed(
+      vec![A, B, HostId(3), HostId(4)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    config.take_over(A, 3);
+    for survivor in config.survivors_of(A) {
+      config.confirm(A, survivor);
+    }
+    assert!(config.admit(A, None, 3), "admitted again");
+    assert!(config.superseded.contains_key(&A), "superseded");
+    expect_round_trip(&config, "a superseded member survives the round trip");
+    let seven =
+      decode_regional_configuration(&encode_regional_at(&config, REGIONAL_LAYOUT_UNSUPERSEDED));
+    let mut without = config.clone();
+    without.superseded.clear();
+    assert_eq!(
+      seven,
+      Ok(without),
+      "layout 7 reads none, and nothing else changes"
     );
   }
 
@@ -2277,9 +2346,10 @@ mod tests {
     );
     assert!(config.move_object(ObjectId::new(A, 5), A, B, &[A]));
     let bytes = encode_regional_configuration(&config);
-    // The exceptions come before the recorded voters' count alone (none here, A-380): a count, then one entry of an
-    // object id, two words, the `from` flag, its word and the cohort (a count and one host).
-    let voters = size_of::<u32>();
+    // The exceptions come before the superseded members' and the recorded voters' counts alone (none here; A-380, A-921
+    // part 2's skip): a count, then one entry of an object id, two words, the `from` flag, its word and the cohort (a
+    // count and one host).
+    let voters = 2 * size_of::<u32>();
     let entry = OBJECT_BYTES + 4 * size_of::<u64>() + 1 + size_of::<u32>();
     let count_at = bytes.len() - voters - entry - size_of::<u32>();
     let mut lying = bytes.clone();
@@ -2415,10 +2485,10 @@ mod tests {
     assert_eq!(
       (regional_bytes.get(..8), root_bytes.get(..8)),
       (
-        Some(b"RCFG\x07\x00\x00\x00".as_slice()),
+        Some(b"RCFG\x08\x00\x00\x00".as_slice()),
         Some(b"RTCF\x02\x00\x00\x00".as_slice())
       ),
-      "golden: each layout begins with its magic and version, little-endian: the regional one's 7 since A-546, which lists the members whose settle certifies their content (6 since A-538, 5 since A-484, 4 since A-291, 3 since A-380, 2 since A-309); the root one's 2 since A-406, which added the recorded voters"
+      "golden: each layout begins with its magic and version, little-endian: the regional one's 8 since A-921 part 2's skip, which lists the superseded members (7 since A-546, which lists the members whose settle certifies their content, 6 since A-538, 5 since A-484, 4 since A-291, 3 since A-380, 2 since A-309); the root one's 2 since A-406, which added the recorded voters"
     );
     assert_eq!(decode_regional_configuration(&regional_bytes), Ok(regional));
     assert_eq!(decode_root_configuration(&root_bytes), Ok(root));

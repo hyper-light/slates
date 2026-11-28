@@ -113,6 +113,7 @@ pub(crate) mod git_replay;
 pub(crate) mod hg_import;
 pub(crate) mod hg_made;
 pub(crate) mod hg_named;
+pub(crate) mod hg_sized;
 pub(crate) mod hg_tags;
 pub(crate) mod hg_view;
 pub(crate) mod homes;
@@ -273,6 +274,11 @@ pub(crate) struct VcsStores {
   /// lent to nothing ([`VcsStores::git`], [`VcsStores::subversion`] and their kin answer none) until the last record is
   /// replayed; bounded by the partition's repositories.
   rebuild_turns: BTreeMap<RepositoryId, (u64, usize)>,
+  /// The names each repository's rebuild fetched from the region so far (A-936's replay half, main 01a20182's ruling of
+  /// 2026-11-27 20:11): with the records it replayed, its progress ([`VcsStores::rebuild_steps`]), which a replica build
+  /// waiting on it reports so a push's barrier sees it move. Reset at each rebuild's start; bounded by the partition's
+  /// repositories.
+  rebuild_fetched: BTreeMap<RepositoryId, u64>,
   /// The last rebuild's generation: a rebuild started again ends the turns of the one before.
   rebuild_generations: u64,
   /// The git records whose replay is under way a turn at a time (A-722 part 4, [`git_replay`]): at most one a
@@ -368,6 +374,9 @@ pub(crate) struct VcsStores {
   /// Each repository's index merge under way between its slices ([`index_upkeep`]): one a repository, so bounded by the
   /// partition's repositories.
   index_upkeep: index_upkeep::Upkeep,
+  /// Each Mercurial repository's recount of its kept rendered length under way after a rebuild ([`hg_sized`]): one a
+  /// repository, so bounded by the partition's repositories.
+  pub(crate) hg_recounts: hg_sized::Recounts,
   /// Each HTTP commit under way (A-681 part C: a transaction a POST made, between its requests), by repository and
   /// transaction name, with the key of the principal that made it and the monotonic instant of its last step: at most
   /// one a repository and principal, a new POST replacing the older ([`VcsStores::begin_dav_commit`]), so bounded by the
@@ -833,6 +842,14 @@ impl VcsStores {
   /// What the stores hold of the shard's budget.
   pub(crate) fn charged(&self) -> u64 {
     self.charged
+  }
+
+  /// Repository `id`'s rebuild's progress while it runs: the records it replayed and the names it fetched from the
+  /// region, rising as it moves; `None` with no rebuild under way.
+  pub(crate) fn rebuild_steps(&self, id: RepositoryId) -> Option<u64> {
+    let (_, replayed) = self.rebuild_turns.get(&id)?;
+    let replayed = u64::try_from(*replayed).unwrap_or(u64::MAX);
+    Some(replayed.saturating_add(self.rebuild_fetched.get(&id).copied().unwrap_or(0)))
   }
 
   /// Whether repository `id`'s store is being made again from its records, lent to nothing until it is whole.
@@ -4673,13 +4690,16 @@ fn svn_texts_inline(revision: &slates_svn::commit::revision::Revision) -> bool {
     })
 }
 
-/// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]); a
+/// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]), and a
+/// Mercurial one's kept rendered length recounted ([`hg_sized::rebuilt`]); a
 /// Mercurial store's revisions its replays kept from texts the node's changeset store gave noted for a home and let go,
 /// a turn at a time, as a landed push's are ([`let_go_brought_back`]). A Subversion repository's stored texts are not
 /// held again: they are its changesets' on the node's store, read through it (C2 stage B part 2 (b)). A git store's
 /// rebuild holds what its records name, as its live store does: nothing brought back to let go.
 fn replay_ended(state: &mut ShardState, id: RepositoryId) {
   index_upkeep::built(state, id);
+  // A replay names no chunk length: a Mercurial index rebuilt serves no stream until its recount ends.
+  hg_sized::rebuilt(state, id);
   let brought_back = match state.vcs_stores.entries.get_mut(&id) {
     Some(RepositoryStore::Mercurial(store)) => core::mem::take(&mut store.brought_back),
     _ => return,
@@ -5473,6 +5493,7 @@ fn rebuild_sliced_from(state: &mut ShardState, record: &RepositoryRecord) {
   let generation = state.vcs_stores.rebuild_generations.wrapping_add(1);
   state.vcs_stores.rebuild_generations = generation;
   state.vcs_stores.rebuild_turns.insert(id, (generation, 0));
+  state.vcs_stores.rebuild_fetched.insert(id, 0);
   state.vcs_stores.rebuilding.insert(id);
   let task =
     slates_rt::futures::spawn(rebuild_turns(id, generation)).and_then(slates_rt::futures::detach);
@@ -5548,6 +5569,9 @@ async fn names_fetched_for_rebuild(id: RepositoryId, generation: u64) {
     let put = crate::state::with_state(|state| match fetched {
       Some(bytes) if put_names_whole(state, &bytes) == Some(identity) => {
         state.count(NAMES_FETCHED, 1);
+        if let Some(fetched) = state.vcs_stores.rebuild_fetched.get_mut(&id) {
+          *fetched = fetched.saturating_add(1);
+        }
         true
       }
       _ => {

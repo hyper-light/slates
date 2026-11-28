@@ -275,6 +275,21 @@ pub struct RepairWindowHolders {
   pub names_head: Option<u64>,
 }
 
+/// What a node's routing of an object reads when it holds no copy of it (`Daemon::route_view`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteView {
+  /// The regional configuration's version.
+  pub version: u64,
+  /// The object's first owner: its moved owner, else its creator.
+  pub first: slates_db::HostId,
+  /// Whether the configuration keeps the first owner's retirement.
+  pub retired: bool,
+  /// Whether the configuration keeps the first owner's completed takeover.
+  pub completed: bool,
+  /// The owner this node's own routing names, from the records it accepted.
+  pub routed: Option<slates_db::HostId>,
+}
+
 /// A node's homing window as its control shard last derived it, with its terms (A-914, `Daemon::homing_window`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HomingWindowReading {
@@ -1971,6 +1986,30 @@ impl Daemon {
     self.set_state_log_ship_hold(hold)
   }
 
+  /// Test support (main 01a20182's ruling of 2026-11-27 21:11, the creation check): whether this node holds the record of
+  /// the repository `member` (a green's id of its family) belongs to: a register of the family other than `member`'s
+  /// own whose held value is a repository's record, as a holder finds its repository (`replica_build`). What a creation
+  /// answers only once it is at `f + 1` (A-894). Across the shards.
+  pub fn holds_repository_record_of(&self, member: [u8; 16]) -> Result<bool, ObserveError> {
+    let member = slates_db::register::ObjectId(member);
+    let family = member.line_key();
+    for shard in self.shards.clone() {
+      let held = self.observe(Some(shard), move |s| {
+        s.holder_records.iter().any(|(register, acceptor)| {
+          register.line_key() == family
+            && *register != member
+            && acceptor
+              .values(*register)
+              .any(|value| crate::catalog::repository_of(value).is_some())
+        })
+      })?;
+      if held {
+        return Ok(true);
+      }
+    }
+    Ok(false)
+  }
+
   /// Test support (A-927 part 2): the positions of the names log of `member`'s family (a repository's id, or a green's of
   /// it) this node's acceptors hold, ascending, across its shards.
   pub fn names_log_positions(&self, member: [u8; 16]) -> Result<Vec<u64>, ObserveError> {
@@ -3011,6 +3050,30 @@ impl Daemon {
   ) -> Result<Option<slates_db::HostId>, ObserveError> {
     self.observe(self.shards.first().copied(), move |s| {
       crate::owner_location::home_query(s, object).known_owner(s, None)
+    })
+  }
+
+  /// Test support (main 01a20182's order of 2026-11-27 20:35, diag 12's a921 red): what this node's routing of `object`
+  /// reads when it holds no copy of it (`owner_location`'s `known_owner`): its configuration's version, the object's first
+  /// owner (moved, else its creator), whether the configuration keeps that owner's retirement and its completed
+  /// takeover, and the owner this node's own routing names. A one-shot control-shard question.
+  pub fn route_view(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<RouteView, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let configuration = s.council.configuration();
+      let first = configuration
+        .moved
+        .get(&object.placement_key())
+        .map_or_else(|| object.creator(), |moved| moved.owner);
+      RouteView {
+        version: configuration.version,
+        first,
+        retired: configuration.retired.contains_key(&first),
+        completed: configuration.completed.contains_key(&first),
+        routed: s.fleet.object_owner(object),
+      }
     })
   }
 

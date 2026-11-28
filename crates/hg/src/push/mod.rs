@@ -64,6 +64,7 @@ pub mod made;
 pub(crate) mod manifest_row;
 pub mod pins;
 pub mod reply;
+pub mod sized;
 pub mod tree;
 pub mod verify;
 

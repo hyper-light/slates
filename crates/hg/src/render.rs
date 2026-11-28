@@ -104,6 +104,15 @@ pub enum Refused {
   Past(PastAdmission),
   /// A chunk could not be compressed ([`crate::revlog_chunk`]).
   Chunk(ChunkRefused),
+  /// A revision's chunk length the index kept is not its chunk's, or is not kept (goal 93, cut 2): its log's path (as
+  /// [`Refused::Unreadable`] names it) and its number. A stream refuses it rather than send bytes past what its head
+  /// named; its head written, the stream is cut short there.
+  StaleLength {
+    /// The log.
+    log: Vec<u8>,
+    /// The revision's number.
+    rev: u32,
+  },
 }
 
 impl From<PastAdmission> for Refused {
@@ -222,6 +231,30 @@ fn may_inline(log: Log<'_>) -> bool {
   log != Log::Changelog
 }
 
+/// The files a stream sends of `log` holding `revisions` whose chunks hold `data` bytes, and their bytes: an inline log
+/// one file of its entries and chunks, a split one its index file and (where it holds any chunk) its data file. What
+/// the count walk sizes each log as, and what the index keeps as revisions land ([`HgIndex::keep_sized`]).
+pub(crate) fn rendered_files(
+  log: Log<'_>,
+  (revisions, data): (u32, u64),
+) -> crate::index::Rendered {
+  let entries = u64::from(revisions).saturating_mul(to_u64(ENTRY_BYTES));
+  let files = if revlog_chunk::inline(may_inline(log), data) {
+    [entries.saturating_add(data), 0]
+  } else {
+    [entries, data]
+  };
+  files
+    .iter()
+    .filter(|bytes| **bytes > 0)
+    .fold(crate::index::Rendered::default(), |kept, bytes| {
+      crate::index::Rendered {
+        files: kept.files.saturating_add(1),
+        bytes: kept.bytes.saturating_add(*bytes),
+      }
+    })
+}
+
 /// One log rendered as a revlog (module docs): its index file, and its data file where it is split.
 fn revlog(
   index: &HgIndex,
@@ -322,7 +355,10 @@ impl Walked {
 /// Where a streamed `stream_out` stands (A-745).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Stage {
-  /// Not begun: the first log the walk writes is found.
+  /// Not begun, a stream's: the head's counts read from what the index kept as revisions landed (goal 93, cut 2;
+  /// [`HgIndex::rendered`]), none kept serving no stream.
+  Kept,
+  /// Not begun, a recount's ([`Recount`]): the first log the count walks is found.
   Start,
   /// Counting the files and their bytes, which the answer's head names first: the log being sized and its next
   /// revision.
@@ -411,7 +447,7 @@ impl StageKind {
       Stage::Counting(..) => StageKind::Count,
       Stage::Index(..) => StageKind::Index,
       Stage::Data(..) => StageKind::Data,
-      Stage::Start | Stage::Head | Stage::Done => StageKind::Other,
+      Stage::Kept | Stage::Start | Stage::Head | Stage::Done => StageKind::Other,
     }
   }
 }
@@ -558,8 +594,8 @@ impl StoredSource for NotKept {
 
 /// Answers `streaming`'s want from `source`, at once; whether it had one. A source that cannot answer is refused.
 pub fn answer_want(
-  streaming: &mut Streaming,
-  source: &mut impl StoredSource,
+  streaming: &mut impl StoreWants,
+  source: &mut (impl StoredSource + ?Sized),
 ) -> Result<bool, Refused> {
   let Some(want) = streaming.wants().cloned() else {
     return Ok(false);
@@ -590,6 +626,13 @@ struct StoredLog {
   /// Each revision's index entry as the gathering read it, one range walk of the log ([`HgIndex::numbers_from`]): what
   /// its index row is written from, with no search of the index a row.
   numbers: Vec<EntryNumbers>,
+  /// Each revision's chunk length as the index kept it where the revision landed ([`HgIndex::spans_from`], read beside
+  /// its numbers): what its entry names and its chunk is held to. Fewer than its revisions where the index kept fewer.
+  spans: Vec<u32>,
+  /// Their sum: the data file's size, or the chunks' share of an inline index file.
+  data: u64,
+  /// The log the walk writes after it, found as the gathering walked: none after the last.
+  next: Option<Walked>,
 }
 
 /// `stream_out`'s answer made a step at a time (A-745; §4.17.1 "A fetch's answer"), each revision sent as the changeset
@@ -622,6 +665,8 @@ pub struct Streaming {
   wanted_logs: Vec<Walked>,
   /// The index entries of each of those logs, as the gathering read them, in order.
   wanted_numbers: Vec<Vec<EntryNumbers>>,
+  /// The kept chunk lengths of each of those logs, and the log after each, in order.
+  wanted_spans: Vec<(Vec<u32>, Option<Walked>)>,
   /// The rows of the logs held, the one being walked first.
   held: VecDeque<StoredLog>,
   /// The number the next log given takes.
@@ -651,18 +696,13 @@ pub struct Streaming {
   chain_base: u32,
 }
 
-/// A log the count pass sized, for the send pass: each revision's stored chunk length, their sum, and whether the log is
-/// inline.
+/// A log the count walk sized, for the index to keep ([`Recount::keep_counted`]): each revision's chunk length.
 #[derive(Debug)]
 struct SizedLog {
   /// The log.
   log: Walked,
-  /// Each revision's stored chunk length, in order.
+  /// Each revision's chunk length, in order.
   chunks: Vec<u32>,
-  /// Their sum: the data file's size, or the chunks' share of an inline index file.
-  data: u64,
-  /// Whether its chunks follow its entries in its index file.
-  inline: bool,
 }
 
 /// How a stream frames the files it sends.
@@ -705,28 +745,30 @@ struct Gathering {
   wanted: Vec<Walked>,
   /// Each of those logs' index entries, in order.
   numbers: Vec<Vec<EntryNumbers>>,
+  /// Each of those logs' kept chunk lengths and the log after it, in order.
+  spans: Vec<(Vec<u32>, Option<Walked>)>,
   /// What their rows will take.
   bytes: u64,
   /// The log being gathered, its next revision, and its nodes so far.
   at: (Walked, u32, Vec<Node>),
   /// The index entries of the log being gathered, so far.
   at_numbers: Vec<EntryNumbers>,
+  /// The kept chunk lengths of the log being gathered, so far.
+  at_spans: Vec<u32>,
   /// The length of the log being gathered, asked of the index once a log (a search of its runs, 10 to 20 reads of the
   /// content store on a sealed history), not again at each step it resumes.
   at_count: Option<u32>,
-  /// Where the log being gathered stands among the logs the count sized (the send's), whose order is the walk's: the
-  /// next log is the next sized one, with no search. None in the count, which sizes them as it goes.
-  sized_at: Option<usize>,
 }
 
 impl Default for Streaming {
   fn default() -> Self {
     Streaming {
-      stage: Stage::Start,
+      stage: Stage::Kept,
       counted: (0, 0),
       want: None,
       wanted_logs: Vec::new(),
       wanted_numbers: Vec::new(),
+      wanted_spans: Vec::new(),
       held: VecDeque::new(),
       next_seq: 0,
       wanted_chunks: Vec::new(),
@@ -757,7 +799,7 @@ impl Streaming {
   /// Where its count stands: counting until every log is counted; then the files and bytes it sends, or unserved.
   pub fn counted(&self) -> Counted {
     match self.stage {
-      Stage::Start | Stage::Counting(..) => Counted::Counting,
+      Stage::Kept | Stage::Start | Stage::Counting(..) => Counted::Counting,
       _ if self.not_served => Counted::Unserved,
       _ => Counted::Served {
         files: self.counted.0,
@@ -778,11 +820,17 @@ impl Streaming {
     self.want = None;
     let wanted = core::mem::take(&mut self.wanted_logs);
     let mut numbers = core::mem::take(&mut self.wanted_numbers).into_iter();
+    let mut spans = core::mem::take(&mut self.wanted_spans).into_iter();
     if rows.len() != wanted.len() {
       self.not_served = true;
     }
     for (log, rows) in wanted.into_iter().zip(rows) {
       let numbers = numbers.next().unwrap_or_default();
+      let (spans, next) = spans.next().unwrap_or_default();
+      let data = spans
+        .iter()
+        .map(|length| u64::from(*length))
+        .fold(0_u64, u64::saturating_add);
       let mut revisions = Vec::with_capacity(rows.len());
       let mut first = BTreeMap::new();
       for (rev, row) in (0_u32..).zip(rows) {
@@ -800,6 +848,9 @@ impl Streaming {
         revisions,
         first,
         numbers,
+        spans,
+        data,
+        next,
       });
       self.next_seq = self.next_seq.saturating_add(1);
     }
@@ -853,6 +904,7 @@ impl Streaming {
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
     Ok(match stage {
+      Stage::Kept => self.head_from_kept(index),
       Stage::Start => first_log(index, store).map_or(Stage::Head, |log| Stage::Counting(log, 0)),
       Stage::Counting(log, rev) => self.count(index, store, (log, rev))?,
       Stage::Head => self.head(index, store, admission, out)?,
@@ -862,6 +914,16 @@ impl Streaming {
       Stage::Data(log, rev) => self.data_chunk((log, rev), admission, out)?,
       Stage::Done => Stage::Done,
     })
+  }
+
+  /// The head's counts from what the index kept as revisions landed (goal 93, cut 2; [`HgIndex::rendered`]), so no walk
+  /// comes before the head; none kept (a revision not sized, or one no stream can send as it is kept) serves none.
+  fn head_from_kept(&mut self, index: &HgIndex) -> Stage {
+    match index.rendered() {
+      Some(rendered) => self.counted = (rendered.files, rendered.bytes),
+      None => self.not_served = true,
+    }
+    Stage::Head
   }
 
   /// Sizes each step's gathering of rows by the bytes it may touch, `bytes` (a caller's copy budget: the daemon's
@@ -898,25 +960,23 @@ impl Streaming {
         logs: Vec::new(),
         wanted: Vec::new(),
         numbers: Vec::new(),
+        spans: Vec::new(),
         bytes: 0,
         at: (log.clone(), 0, Vec::new()),
         at_numbers: Vec::new(),
+        at_spans: Vec::new(),
         at_count: None,
-        sized_at: self
-          .sized
-          .front()
-          .filter(|sized| sized.log == *log)
-          .map(|_| 0),
       });
     }
-    // A held row is its stored form and its index entry.
+    // A held row is its stored form, its index entry and its kept chunk length.
     let row_bytes = to_u64(
-      core::mem::size_of::<StoredRevision>().saturating_add(core::mem::size_of::<EntryNumbers>()),
+      core::mem::size_of::<StoredRevision>()
+        .saturating_add(core::mem::size_of::<EntryNumbers>())
+        .saturating_add(core::mem::size_of::<u32>()),
     );
     let mut budget = rows_a_step(store);
     let (step_bytes, reads_at) = (self.step_bytes, store.reads());
     let mut walked = 0_u64;
-    let sized = &self.sized;
     let Some(gathering) = self.gathering.as_mut() else {
       return Ok(false);
     };
@@ -939,10 +999,17 @@ impl Streaming {
           .at_numbers
           .try_reserve_exact(rows)
           .map_err(|_| Refused::TooLong)?;
+        gathering
+          .at_spans
+          .try_reserve_exact(rows)
+          .map_err(|_| Refused::TooLong)?;
       }
       // One range walk of the log from where the gathering stands, a row a step after its search, where a search a row
       // read the index's runs each time (goal 93, hg's whole-history gap).
       let mut walk = index.numbers_from(store, at.log(), *rev);
+      // Its kept chunk lengths beside, one range walk of its sized rows (goal 93, cut 2); none for a log never sized,
+      // which the send refuses stale and a recount sizes.
+      let mut spans = index.spans_from(store, at.log(), *rev);
       while *rev < count {
         let spent = step_bytes.map(|bytes| {
           gather_spent(store, (walked, store.reads().saturating_sub(reads_at))) >= bytes
@@ -961,24 +1028,26 @@ impl Streaming {
           })?;
         nodes.push(numbers.node);
         gathering.at_numbers.push(numbers);
+        gathering.at_spans.extend(
+          spans
+            .as_mut()
+            .and_then(|spans| spans.next().flatten())
+            .map(|span| span.len),
+        );
         *rev = rev.saturating_add(1);
         budget = budget.saturating_sub(1);
         walked = walked.saturating_add(1);
       }
-      let next = match gathering.sized_at {
-        Some(position) => {
-          let following = position.saturating_add(1);
-          gathering.sized_at = Some(following);
-          sized.get(following).map(|next| next.log.clone())
-        }
-        None => next_log(at, index, store),
-      };
+      let next = next_log(at, index, store);
       let done = core::mem::take(nodes);
       gathering.logs.push((at.stored_name(), done));
       gathering.wanted.push(at.clone());
       gathering
         .numbers
         .push(core::mem::take(&mut gathering.at_numbers));
+      gathering
+        .spans
+        .push((core::mem::take(&mut gathering.at_spans), next.clone()));
       gathering.at_count = None;
       match next {
         Some(next) => gathering.at = (next, 0, Vec::new()),
@@ -991,13 +1060,14 @@ impl Streaming {
       });
       self.wanted_logs = gathering.wanted;
       self.wanted_numbers = gathering.numbers;
+      self.wanted_spans = gathering.spans;
     }
     Ok(false)
   }
 
-  /// One step of the count, once the log's rows are held: its next revision's chunk sized compressed (its stored bytes
-  /// asked for a batch at a time); past its last, the log counted, inline as one file of its entries and chunks or split
-  /// as its index file and (where it holds any) its data file, then the next log, or the head.
+  /// One step of the count ([`Recount`]), once the log's rows are held: its next revision's chunk sized compressed (its
+  /// stored bytes asked for a batch at a time); past its last, the log's lengths held for the index to keep, then the
+  /// next log, or the end (the head stage, which a recount never takes).
   fn count(
     &mut self,
     index: &HgIndex,
@@ -1035,30 +1105,8 @@ impl Streaming {
       return Ok(Stage::Head);
     }
     let chunks = core::mem::take(&mut self.sizing);
-    let data = chunks
-      .iter()
-      .map(|length| u64::from(*length))
-      .fold(0_u64, u64::saturating_add);
-    let inline = revlog_chunk::inline(may_inline(log.log()), data);
-    let entries = u64::from(count).saturating_mul(to_u64(ENTRY_BYTES));
-    let files = if inline {
-      [entries.saturating_add(data), 0]
-    } else {
-      [entries, data]
-    };
-    for bytes in files {
-      if bytes > 0 {
-        self.counted.0 = self.counted.0.saturating_add(1);
-        self.counted.1 = self.counted.1.saturating_add(bytes);
-      }
-    }
     let next = next_log(&log, index, store);
-    self.sized.push_back(SizedLog {
-      log,
-      chunks,
-      data,
-      inline,
-    });
+    self.sized.push_back(SizedLog { log, chunks });
     Ok(next.map_or(Stage::Head, |next| Stage::Counting(next, 0)))
   }
 
@@ -1278,34 +1326,44 @@ impl Streaming {
     if let Some(plain) = plain
       && self.stored_into((seq, rev), &plain, out)? != length
     {
-      return Err(unreadable());
+      return Err(Refused::StaleLength {
+        log: unreadable_name(log),
+        rev,
+      });
     }
     Ok(Some(length))
   }
 
-  /// The send's next log, the count's next sized one in the walk's order, its index file first; or the send's end. The
-  /// count sized every log in that order, so the send searches the index for none (goal 93, hg's whole-history gap: each
-  /// log's end searched for the next file log and asked its length, 418 reads of 1,298 on a sealed history).
+  /// The send's next log after the one held first, as its gathering found it, its index file first; or the send's end.
   fn next_sized(&self) -> Stage {
     self
-      .sized
+      .held
       .front()
-      .map_or(Stage::Done, |next| Stage::Index(next.log.clone(), 0, 0))
+      .and_then(|held| held.next.clone())
+      .map_or(Stage::Done, |next| Stage::Index(next, 0, 0))
   }
 
-  /// What the count gave `log`: whether it is inline, its chunks' bytes, and revision `rev`'s chunk length (none past
-  /// its last); refused unreadable where the count sized another log.
+  /// What the index kept of `log`, held first (goal 93, cut 2): whether it is inline, its chunks' bytes, and revision
+  /// `rev`'s chunk length (none past its last); refused [`Refused::StaleLength`] where it kept fewer lengths than the
+  /// log has revisions, and unreadable where another log is held first.
   fn sized_at(&self, log: &Walked, rev: u32) -> Result<(bool, u64, Option<u32>), Refused> {
-    let sized = self
-      .sized
+    let held = self
+      .held
       .front()
-      .filter(|sized| sized.log == *log)
+      .filter(|held| held.log == *log)
       .ok_or_else(|| Refused::Unreadable {
         log: unreadable_name(log),
         rev,
       })?;
+    if held.spans.len() != held.revisions.len() {
+      return Err(Refused::StaleLength {
+        log: unreadable_name(log),
+        rev: u32::try_from(held.spans.len()).unwrap_or(NONE),
+      });
+    }
     let at = usize::try_from(rev).map_err(|_| Refused::TooLong)?;
-    Ok((sized.inline, sized.data, sized.chunks.get(at).copied()))
+    let inline = revlog_chunk::inline(may_inline(log.log()), held.data);
+    Ok((inline, held.data, held.spans.get(at).copied()))
   }
 
   /// The index file's end: an inline log (or one with no chunk to send) ends there and the next log begins; a split log's
@@ -1317,7 +1375,6 @@ impl Streaming {
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
     if inline || data == 0 {
-      self.sized.pop_front();
       return Ok(self.next_sized());
     }
     let name = [log.radix().as_slice(), b".d"].concat();
@@ -1387,38 +1444,192 @@ impl Streaming {
     })
   }
 
-  /// A split log's data file's next chunk, its stored bytes (asked for a batch at a time) compressed to the length the
-  /// count gave it, or the log's end and the next log's index file.
+  /// A split log's data file's next chunks, a run a step (goal 93; main 01a20182's reading of 2026-11-27 19:39 and its
+  /// order of 20:30): each its stored bytes (asked for a batch at a time) as a stream sends them, held to the length the
+  /// index kept; the run ends at the log's last chunk (the next log's index file next), at a chunk the store must be
+  /// asked for, or before a chunk that would take its bytes past the step's copy budget ([`Streaming::set_step_bytes`],
+  /// the one a push's chunking and the gathering are held to) or the room, its first chunk written whatever. Before: a
+  /// chunk a step (hg-src at 343703bd7: 139,403 steps for 73.8 MB, 529 bytes and about 30 µs a step).
   fn data_chunk(
     &mut self,
     (log, rev): (Walked, u32),
     admission: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
-    let unreadable = || Refused::Unreadable {
-      log: unreadable_name(&log),
-      rev,
-    };
     let (seq, count) = self.front_log()?;
-    if rev >= count {
-      // The next log's rows let go of this one's ([`Streaming::rows_held`]); chunks asked for after it are kept.
-      self.sized.pop_front();
-      return Ok(self.next_sized());
+    let budget = self.step_bytes.unwrap_or(u64::MAX);
+    let (mut rev, mut written) = (rev, 0_u64);
+    while rev < count {
+      match self.data_one((&log, seq, rev), (written, budget), admission, out)? {
+        Some(length) => {
+          written = written.saturating_add(length);
+          rev = rev.saturating_add(1);
+        }
+        None => return Ok(Stage::Data(log, rev)),
+      }
     }
+    // The next log's rows let go of this one's ([`Streaming::rows_held`]); chunks asked for after it are kept.
+    Ok(self.next_sized())
+  }
+
+  /// Revision `rev`'s chunk of `log` (numbered `seq`) written to `out`, its stored bytes as a stream sends them: its
+  /// length. None, nothing written, where its run has written `written` bytes already and the chunk would take them past
+  /// `budget` or past the room, or where the store must be asked for it ([`Streaming::wants`]). Refused stale where the
+  /// chunk is not the length the index kept.
+  fn data_one(
+    &mut self,
+    (log, seq, rev): (&Walked, u64, u32),
+    (written, budget): (u64, u64),
+    admission: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<Option<u64>, Refused> {
     let length = self
-      .sized
-      .front()
-      .filter(|sized| sized.log == log)
-      .and_then(|sized| sized.chunks.get(usize::try_from(rev).ok()?).copied())
-      .ok_or_else(unreadable)?;
-    let Some(plain) = self.chunk_at(seq, rev, Places::All)? else {
-      return Ok(Stage::Data(log, rev));
-    };
-    admission.charge(u64::from(length))?;
-    if self.stored_into((seq, rev), &plain, out)? != u64::from(length) {
-      return Err(unreadable());
+      .sized_at(log, rev)?
+      .2
+      .map(u64::from)
+      .ok_or_else(|| Refused::Unreadable {
+        log: unreadable_name(log),
+        rev,
+      })?;
+    if written > 0 && (written.saturating_add(length) > budget || admission.left() < length) {
+      return Ok(None);
     }
-    Ok(Stage::Data(log, rev.saturating_add(1)))
+    let Some(plain) = self.chunk_at(seq, rev, Places::All)? else {
+      return Ok(None);
+    };
+    admission.charge(length)?;
+    if self.stored_into((seq, rev), &plain, out)? != length {
+      return Err(Refused::StaleLength {
+        log: unreadable_name(log),
+        rev,
+      });
+    }
+    Ok(Some(length))
+  }
+}
+
+/// The kept rendered length counted again from the changeset store (goal 93, cut 2; main 01a20182's ruling (C) of
+/// 2026-11-27 18:56): what a replay that sized nothing leaves to do (an import's record names no chunk length), a log
+/// at a time. It is the count walk a stream once made before its head, made once here instead: each log's rows asked of
+/// the store a batch at a time, a raw place read and sized as the stream compresses it, a chunk place by its length.
+/// Each log counted is kept in the index ([`Recount::keep_counted`], [`HgIndex::keep_sized`]) before the next step, so
+/// what it holds is one log's lengths at most. A revision the store does not keep, or a changelog no stream can send as
+/// it is kept, ends it with what it kept so far, and the index serves no stream ([`HgIndex::rendered`]).
+#[derive(Debug)]
+pub struct Recount {
+  /// The count walk.
+  walk: Streaming,
+}
+
+impl Default for Recount {
+  fn default() -> Self {
+    Recount {
+      walk: Streaming {
+        stage: Stage::Start,
+        ..Streaming::default()
+      },
+    }
+  }
+}
+
+impl Recount {
+  /// A recount from the first log.
+  pub fn new() -> Recount {
+    Recount::default()
+  }
+
+  /// Sizes each step's gathering of rows by the bytes it may touch ([`Streaming::set_step_bytes`]).
+  pub fn set_step_bytes(&mut self, bytes: u64) {
+    self.walk.set_step_bytes(bytes);
+  }
+
+  /// One step of the count over `index`, what it holds charged to `admission`: whether more follow. A step that needs
+  /// the store's rows or chunks says so ([`Recount::wants`]).
+  ///
+  /// # Errors
+  /// As [`Streaming::step`].
+  pub fn step(
+    &mut self,
+    index: &HgIndex,
+    store: &ContentStore,
+    admission: &mut Admission,
+  ) -> Result<bool, Refused> {
+    if self.walk.want.is_some() {
+      return Ok(true);
+    }
+    if matches!(self.walk.stage, Stage::Head | Stage::Done) {
+      return Ok(false);
+    }
+    // The count writes nothing; a step's bytes go nowhere.
+    let mut nothing = Vec::new();
+    self.walk.step(index, store, admission, &mut nothing)?;
+    Ok(!matches!(self.walk.stage, Stage::Head | Stage::Done) || self.walk.want.is_some())
+  }
+
+  /// Keeps each log counted since the last call in `index` ([`HgIndex::keep_sized`], from its first revision, a
+  /// revision sized already kept as it is): the revisions newly sized.
+  ///
+  /// # Errors
+  /// The index's refusal ([`crate::index::Refused`]).
+  pub fn keep_counted(
+    &mut self,
+    index: &mut HgIndex,
+    store: &mut ContentStore,
+  ) -> Result<u64, crate::index::Refused> {
+    let mut sized = 0_u64;
+    while let Some(counted) = self.walk.sized.pop_front() {
+      let sizes = crate::index::ToSize {
+        from: 0,
+        lengths: &counted.chunks,
+        streamable: true,
+      };
+      if let crate::index::KeptSized::Sized { new } =
+        index.keep_sized(store, counted.log.log(), sizes)?
+      {
+        sized = sized.saturating_add(new);
+      }
+    }
+    Ok(sized)
+  }
+
+  /// What keeping the logs counted since the last [`Recount::keep_counted`] charges the store at most
+  /// ([`HgIndex::sized_charge`]): the room its caller lends that call.
+  pub fn counted_charge(&self) -> u64 {
+    let (revisions, logs, path_bytes) = self.walk.sized.iter().fold(
+      (0_u64, 0_u64, 0_u64),
+      |(revisions, logs, path_bytes), counted| {
+        (
+          revisions.saturating_add(to_u64(counted.chunks.len())),
+          logs.saturating_add(1),
+          path_bytes.saturating_add(to_u64(counted.log.stored_name().len())),
+        )
+      },
+    );
+    HgIndex::sized_charge(revisions, (logs, path_bytes))
+  }
+
+  /// Whether it ended short of every log: a revision the store does not keep, or a changelog no stream can send.
+  pub fn ended_short(&self) -> bool {
+    self.walk.not_served
+  }
+
+  /// The steps taken since the last take, and the content store's reads during them ([`Streaming::take_tally`]).
+  pub fn take_tally(&mut self) -> StageTally {
+    self.walk.take_tally()
+  }
+}
+
+impl StoreWants for Recount {
+  fn wants(&self) -> Option<&Want> {
+    self.walk.wants()
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<StoredRevision>>>) {
+    self.walk.give_rows(rows);
+  }
+
+  fn give_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+    self.walk.give_chunks(chunks);
   }
 }
 

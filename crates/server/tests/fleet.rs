@@ -36507,15 +36507,22 @@ fn founded_git_fleet(
     })
     .unwrap()
     .bytes;
-  // A-894: a creation answers once its record is at f + 1, so at f = 1 another node holds it as the creation answers,
-  // never waited for here. Before, the creation answered before its record shipped, and a test that killed the owner
-  // at once left no node to take the repository over (the A-727 (d1a-3) tests red one run in three or four by that).
+  // A-894, A-915: a creation answers once its record and its names log are at f + 1, so at f = 1 another node holds
+  // both as the creation answers, never waited for here. Before, the creation answered before its record shipped, and a
+  // test that killed the owner at once left no node to take the repository over (the A-727 (d1a-3) tests red one run
+  // in three or four by that). The repository's own record, not its root green's register (`repository` is the root's
+  // id, as the creation answers): the green's version 0 is not what a creation waits for (`live_ship::placement_done`),
+  // and reading it here asked an implementation detail that a slow runner showed timed (main 01a20182's ruling of
+  // 2026-11-27 21:11; diag-winfleet-2's x86_64 red).
   let holders = daemons[1..]
     .iter()
     .filter(|daemon| {
       daemon
-        .repository_takeover(repository)
-        .is_ok_and(|([holds, ..], _)| holds)
+        .holds_repository_record_of(repository)
+        .is_ok_and(|held| held)
+        && daemon
+          .names_log_positions(repository)
+          .is_ok_and(|positions| !positions.is_empty())
     })
     .count();
   let awaited = move_counter(&daemons[0], "fleet.creation.awaited").unwrap_or(0);
@@ -36525,8 +36532,8 @@ fn founded_git_fleet(
   );
   assert!(
     holders >= 1 && awaited == 1,
-    "another node holds the repository's record as its creation answers ({holders} of 2), its answer held for it \
-     ({awaited} held, {awaited_ns} ns)"
+    "another node holds the repository's record and its names log as its creation answers ({holders} of 2), its \
+     answer held for it ({awaited} held, {awaited_ns} ns)"
   );
   let token = enrolled_token(name, &daemons[0], &mut client);
   GitFleet {
@@ -38584,6 +38591,12 @@ fn poll_taken_over_and_unseated(survivors: &[Daemon], gone: HostId) -> bool {
     })
 }
 
+/// Shape: the coordinator periods A-934's test watches a's neighbourhood change not settle while the hold stands: its
+/// red settled within seconds of x's takeover and unseating (a settle is reported each period once all is placed), so
+/// this is that many times over, and leaves the test far inside CI's per-test cap, which the poll's whole budget (4,000
+/// periods) passed on Windows (diag 12, 289 s).
+const SETTLE_WATCH_PERIODS: u64 = 150;
+
 /// A-934 (main 01a20182's ruling of 2026-11-27 15:51, its item 2: §4.8's settle and the state logs). Do: on a four-node
 /// `f = 1` git fleet with a repository on a, push `main`; hold a's state-log parts off y, one of its two remote
 /// candidates (`Daemon::hold_state_log_shipping_from`), and push on top, so the names log's newest part is held by a and
@@ -38609,13 +38622,13 @@ fn a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_c
   let (x, y) = remote_candidates(&fleet);
   let second = push_with_part_held_from(&mut fleet, y);
   let taken = stop_and_take_over(&mut fleet, x);
-  let while_held = settled_within(&fleet, x);
+  let while_held = settled_within(&fleet, x, SETTLE_WATCH_PERIODS);
   let held = (
     names_positions(&fleet),
     fleet.daemons[0].repair_window_holders(fleet.repository),
   );
   fleet.daemons[0].hold_state_log_shipping(false).unwrap();
-  let lifted = settled_within(&fleet, x);
+  let lifted = settled_within(&fleet, x, PERIOD_BUDGET);
   let after = names_positions(&fleet);
   fleet.stop();
   eprintln!(
@@ -38679,10 +38692,10 @@ fn stop_and_take_over(fleet: &mut GitFleet, gone: HostId) -> bool {
 /// Whether a's neighbourhood change away from `gone` settles within [`RETIREMENT_DEADLINE`] (A-934's test): its placement
 /// neighbourhood without `gone`, and the council's settled neighbourhood for a fixed at its current one's version
 /// (`Daemon::council_settlement`).
-fn settled_within(fleet: &GitFleet, gone: HostId) -> bool {
+fn settled_within(fleet: &GitFleet, gone: HostId, periods: u64) -> bool {
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
   let own = fleet.hosts[0];
-  poll_until(&observed, RETIREMENT_DEADLINE, || {
+  poll_for_periods(&observed, RETIREMENT_DEADLINE, periods, || {
     let moved = !fleet.daemons[0].placement_neighbourhood()?.contains(&gone);
     let settlement = fleet.daemons[0].council_settlement(own)?;
     Ok(moved && settlement.is_some_and(|(settled, current)| settled == current))
@@ -38740,10 +38753,12 @@ fn a935_a_candidate_a_death_brings_in_holds_each_greens_newest_version_with_no_p
   let held = candidates_hold_green(&fleet, [x, y]);
   let taken = stop_and_take_over(&mut fleet, x);
   let (reached, reading) = newcomer_holds_newest(&fleet, newcomer);
+  let repair = repair_counts(&fleet, newcomer);
   fleet.stop();
   eprintln!(
     "quiet-newcomer: push {first:?}; candidates held {held}; taken over {taken}; the newcomer {newcomer:?} held the \
-     newest version {reached}: (a's count, the newcomer's replica) {reading:?}"
+     newest version {reached}: (a's count, the newcomer's replica) {reading:?}; the repair's counts (a's merge records \
+     shipped, Behind and CatchingUp heard; the newcomer's Behind answered, chain reads, replicas rebuilt) {repair:?}"
   );
   assert_eq!(first, Ok(()), "the push before the death landed");
   assert!(
@@ -38768,6 +38783,26 @@ fn candidates_hold_green(fleet: &GitFleet, candidates: [HostId; 2]) -> bool {
         .all(|candidate| holders.contains(candidate))
     }))
   })
+}
+
+/// What A-935's repair moved on its way (main 01a20182's ask of 2026-11-27 21:08, the slow arm64 runner's red): a's
+/// merge records shipped and the `Behind` and `CatchingUp` answers it heard, and the newcomer's `Behind` answers, chain
+/// reads wanted and replicas rebuilt, or why they could not be read.
+fn repair_counts(fleet: &GitFleet, newcomer: HostId) -> Result<[u64; 6], ObserveError> {
+  let node = fleet
+    .hosts
+    .iter()
+    .position(|host| *host == newcomer)
+    .expect("the newcomer is a node");
+  let (owner, newcomer) = (&fleet.daemons[0], &fleet.daemons[node]);
+  Ok([
+    move_counter(owner, "merge.record.shipped")?,
+    move_counter(owner, "merge.behind.heard")?,
+    move_counter(owner, "merge.catching_up.heard")?,
+    move_counter(newcomer, "merge.behind.answered")?,
+    move_counter(newcomer, "merge.behind.chain_read")?,
+    move_counter(newcomer, "merge.replica.rebuilt")?,
+  ])
 }
 
 /// What [`newcomer_holds_newest`] last read: a's count of its green's holders and the newcomer's replica of it, or why
@@ -39808,6 +39843,12 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
     });
   // What the node holding none of it would try first: never a, the stale creator (the skip); before, a.
   let tried_first = daemons[stranger].known_owner(object);
+  let route_view = daemons[stranger].route_view(object);
+  // An object of a's from before its false death that the stranger has no route of its own for, one nobody holds: its
+  // direct route comes from the configuration alone, which must still say a lost it (A-921 part 2's skip, main's ruling
+  // of 2026-11-27 20:48). Before, a's readmission dropped what the skip read, and this named a.
+  let unrouted = ObjectId::new(owner, ObjectId(id.bytes).local().wrapping_add(1));
+  let unrouted_first = daemons[stranger].known_owner(unrouted);
   let asked_a_before = summed_count(&daemons[0], "fleet.forward.refused.not_owner_here");
   let mut forwarded = Client::connect(daemons[stranger].instance());
   let served = poll_until(&observed, RETIREMENT_DEADLINE, || {
@@ -39824,7 +39865,8 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
   }
   eprintln!(
     "victims-volume: holders {holders:?}, stranger {stranger}; cut {cut} taken {taken} healed {healed} readmitted \
-     {readmitted}; served {served}; a asked {asked_a}; the stranger's claims {claims}; tried first {tried_first:?}"
+     {readmitted}; served {served}; a asked {asked_a}; the stranger's claims {claims}; tried first {tried_first:?}, \
+     the stranger's route view then {route_view:?}; an unrouted object of a's first tried {unrouted_first:?}"
   );
   assert!(
     placed && taken && readmitted,
@@ -39840,6 +39882,12 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
       .as_ref()
       .is_ok_and(|owner| *owner != Some(owner_host_of_a)),
     "the direct route never names a: {tried_first:?}"
+  );
+  assert!(
+    unrouted_first
+      .as_ref()
+      .is_ok_and(|owner| *owner != Some(owner_host_of_a)),
+    "a stranger's direct route, from the configuration alone, never names a: {unrouted_first:?}"
   );
 }
 

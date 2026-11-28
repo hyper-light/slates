@@ -29,6 +29,14 @@
 //!   (`obsmarkers`' encoding: the version byte, then the marker). A marker is a fact never changed once made, so it is
 //!   a row; the phase roots and bookmarks move with every push, and the shared index never rewrites a row, so they are
 //!   the register's, not the index's.
+//! - a log number row: `X`, then the log's key: the log's number (big-endian), given in the order logs were first
+//!   sized ([`HgIndex::keep_sized`]), so a sized row names its log in four bytes, not its path.
+//! - a sized row: `S`, the log's number and the revision's (each big-endian, so a log's rows are one range in order):
+//!   the revision's chunk as a stream sends it, its length (`u32`) and where it begins among the log's chunks (`u64`),
+//!   each little-endian: its index entry's two numbers (goal 93, cut 2, the kept rendered length; main 01a20182's
+//!   rulings of 2026-11-27 18:56 and 18:58). A revision's chunk length is known where it lands, so the row is inserted
+//!   in the same fork as its log row, and a stream names its head and writes its entries with no count walk. Measured
+//!   on the red's history: see [`SIZED_ROW_BYTES`].
 //!
 //! **Appending** ([`HgIndex::append_changesets`], [`HgIndex::append_revisions`]). A group is taken in the order it
 //! arrives, as 7.2's `revlog.addgroup` takes a changegroup's \[C\]: a node the log holds already is passed over ("this
@@ -82,6 +90,34 @@ const MARKER_ROW: u8 = b'M';
 /// Format: the first byte of a sealed chunk of the branch heads' endings' row key, which the chunk's number follows,
 /// big-endian ([`Endings`]); before every log row, so no walk of a log's rows meets one.
 const ENDINGS_ROW: u8 = b'E';
+
+/// Format: the first byte of a log number row's key, which the log's key follows (module docs).
+const NUMBER_ROW: u8 = b'X';
+
+/// Format: the first byte of a sized row's key, which the log's number and the revision's follow, big-endian (module
+/// docs).
+const SIZED_ROW: u8 = b'S';
+
+/// Format: a sized row's key: its tag, the log's number and the revision's.
+const SIZED_KEY_BYTES: usize = 1 + REV_BYTES + REV_BYTES;
+
+/// Format: a sized row's body: the chunk's length (`u32`) and its offset among the log's chunks (`u64`).
+const SIZED_BODY_BYTES: usize = REV_BYTES + LEN_BYTES;
+
+/// Shape: what a sized row adds a revision, its key and body before the index table's own framing of a row
+/// ([`SIZED_KEY_BYTES`] and [`SIZED_BODY_BYTES`]), the figure main 01a20182's ruling of 2026-11-27 18:58 weighed: about
+/// 21 MB a million revisions, against about 50 for a key naming the path.
+pub const SIZED_ROW_BYTES: usize = SIZED_KEY_BYTES + SIZED_BODY_BYTES;
+
+/// Derived: what the shared index charges a sized row in its tail: its key and body, the body's one-byte count of
+/// contents (`slates_vcs::table::encode_body`, none here) and the tail's slot (`slates_vcs::index::TAIL_SLOT_BYTES`).
+/// What a landing lends for its sized rows ([`HgIndex::sized_charge`]).
+pub const SIZED_ROW_CHARGE: usize = SIZED_ROW_BYTES + 1 + slates_vcs::index::TAIL_SLOT_BYTES;
+
+/// Derived: what the shared index charges a log's number row in its tail, its path's bytes apart: its tag and a file
+/// log key's two fixed bytes ([`FILE_KEY`], [`PATH_END`]), its body (the number) and the body's count of contents, and
+/// the tail's slot.
+const NUMBER_ROW_CHARGE: usize = 1 + 2 + REV_BYTES + 1 + slates_vcs::index::TAIL_SLOT_BYTES;
 
 /// Format: the changelog's log key.
 const CHANGELOG_KEY: u8 = b'c';
@@ -246,6 +282,36 @@ pub struct ChangesetRow<'s> {
   pub branch: &'s [u8],
 }
 
+/// A revision's chunk as a stream sends it, kept where the revision lands (goal 93, cut 2, main 01a20182's rulings of
+/// 2026-11-27 18:56 and 18:58: the kept rendered length): its chunk's length and where it begins among its log's chunks,
+/// the two numbers its index entry names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkSpan {
+  /// Where its chunk begins among its log's chunks.
+  pub offset: u64,
+  /// Its chunk's length.
+  pub len: u32,
+}
+
+/// What a stream's head names (7.2's `generatev1`), kept as revisions land: its files and their bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rendered {
+  /// The files.
+  pub files: u64,
+  /// Their bytes.
+  pub bytes: u64,
+}
+
+/// A revision's place as the changeset store keeps it, to be sized where it lands ([`HgIndex::keep_sized`]): its bytes as
+/// they lie, sized as the stream compresses them, or a revlog chunk already, sized by its length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placed<'b> {
+  /// Its delta or whole as it is.
+  Raw(&'b [u8]),
+  /// A revlog chunk as stock stores it, this long.
+  Chunk(u64),
+}
+
 /// A log's row as a stream's index entry reads it ([`HgIndex::numbers_from`]): its number, its parents' and its link's
 /// numbers (a changeset links to itself), its node, its flags and its text's length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,6 +385,19 @@ pub enum Refused {
     /// The id's length.
     len: u64,
   },
+  /// A sizing out of its log's order ([`HgIndex::keep_sized`]): revision `rev` is sized already, or is past the log's
+  /// last revision.
+  SizedOutOfOrder {
+    /// The revision.
+    rev: u32,
+  },
+  /// A chunk longer than an index entry can name (`u32`), or one the compressor refused to size.
+  Unsizable {
+    /// The revision.
+    rev: u32,
+  },
+  /// The kept totals ran past their arithmetic: a sizing that does not follow what was kept.
+  RenderedOverflow,
 }
 
 impl From<IndexRefused> for Refused {
@@ -705,6 +784,49 @@ pub struct HgIndex {
   /// Seals the store refused after an append (its room): the append stood, its rows charged within the budget, and
   /// the tail is sealed at the next append instead ([`HgIndex::insert`]). Expected none.
   seals_refused: u64,
+  /// What a stream's head names, kept as revisions land and are sized ([`KeptRendered`]).
+  kept: KeptRendered,
+}
+
+/// What a stream's head names, kept as revisions land (goal 93, cut 2; module docs, "a sized row"): the revisions
+/// appended and those sized, the files and bytes the sized ones render to, whether a revision kept as it is cannot be
+/// streamed, and the number the next log sized takes. A field of the index, copied by its fork, so a generation's
+/// totals are its rows'. A stream is served only while every revision appended is sized and none is unstreamable
+/// ([`HgIndex::rendered`]): after a replay that did not size them (an import's record names no chunk length), until
+/// the recount ([`crate::render::Recount`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct KeptRendered {
+  appended: u64,
+  sized: u64,
+  files: u64,
+  bytes: u64,
+  unstreamable: bool,
+  next_log: u32,
+}
+
+/// A log's revisions to size ([`HgIndex::keep_sized`]): each one's chunk length as a stream sends it, from `from` on,
+/// and whether a stream can send them as they are kept (a changelog's delta against another revision than the one
+/// before it cannot be, [`crate::render`]'s `changelog_servable`).
+#[derive(Clone, Copy, Debug)]
+pub struct ToSize<'l> {
+  /// The first revision's number.
+  pub from: u32,
+  /// Each revision's chunk length, in order.
+  pub lengths: &'l [u32],
+  /// Whether a stream can send them as they are kept.
+  pub streamable: bool,
+}
+
+/// What [`HgIndex::keep_sized`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeptSized {
+  /// Sized: the revisions not sized before, kept.
+  Sized {
+    /// The revisions newly sized.
+    new: u64,
+  },
+  /// Not sized: an earlier revision of the log is not, so these wait for the repository's recount, nothing written.
+  Unsized,
 }
 
 /// The buffers a revision's text is rebuilt from its chain through (goal 93, C1; w-perf's attribution of Mercurial's
@@ -734,6 +856,7 @@ impl HgIndex {
       branch_heads: BranchHeads::default(),
       buffers: core::cell::RefCell::new(TextBuffers::default()),
       seals_refused: 0,
+      kept: KeptRendered::default(),
     }
   }
 
@@ -786,6 +909,7 @@ impl HgIndex {
       },
       buffers: core::cell::RefCell::new(TextBuffers::default()),
       seals_refused: 0,
+      kept: self.kept,
     })
   }
 
@@ -1007,6 +1131,200 @@ impl HgIndex {
     }
     let row = self.rows.get(store, &log.row_key(rev))?;
     read_revision(&row)
+  }
+
+  /// Keeps the chunk lengths of `log`'s revisions from `sizes.from` on, where they land (module docs, "a sized row"):
+  /// each one's sized row, in one batch with the log's number row where it has none yet, and the totals a stream's head
+  /// names. A revision sized already with the same span is kept as it is (a recount over revisions a replay sized);
+  /// [`KeptSized::Unsized`], nothing written, where an earlier revision of the log is not sized (a push replayed over
+  /// an imported history before its recount). Refused, nothing changed: a revision past the log's last, a span that
+  /// differs from the one kept, or totals that do not follow.
+  ///
+  /// # Errors
+  /// [`Refused::SizedOutOfOrder`], [`Refused::RenderedOverflow`], or the shared index's refusal.
+  pub fn keep_sized(
+    &mut self,
+    store: &mut ContentStore,
+    log: Log<'_>,
+    sizes: ToSize<'_>,
+  ) -> Result<KeptSized, Refused> {
+    let ToSize {
+      from,
+      lengths,
+      streamable,
+    } = sizes;
+    let end = from
+      .checked_add(u32::try_from(lengths.len()).map_err(|_| Refused::LogFull)?)
+      .ok_or(Refused::LogFull)?;
+    if end > self.len(store, log) {
+      return Err(Refused::SizedOutOfOrder { rev: end });
+    }
+    let (number, numbered) = match self.log_number(store, log) {
+      Some(number) => (number, false),
+      None => (self.kept.next_log, true),
+    };
+    let start = match from.checked_sub(1) {
+      None => 0,
+      Some(last) => match self.span_of(store, number, last) {
+        Some(span) => span.offset.saturating_add(u64::from(span.len)),
+        None => return Ok(KeptSized::Unsized),
+      },
+    };
+    let rows = sized_rows(number, from, (start, lengths))?;
+    let data = rows.last().map_or(start, |(_, span)| {
+      span.offset.saturating_add(u64::from(span.len))
+    });
+    let new = self.sized_new(store, number, from, &rows)?;
+    let totals = self.totals_after(log, sized_through(from, start, (&rows, new)), (end, data))?;
+    self.insert_sized(store, (log, number, numbered), &rows)?;
+    self.kept.files = totals.files;
+    self.kept.bytes = totals.bytes;
+    self.kept.sized = self.kept.sized.saturating_add(new);
+    self.kept.unstreamable |= !streamable;
+    if numbered {
+      self.kept.next_log = number.checked_add(1).ok_or(Refused::LogFull)?;
+    }
+    Ok(KeptSized::Sized { new })
+  }
+
+  /// How many of `rows` (the sized rows of log `number` from `from`) are not held yet, each held one the same span;
+  /// refused [`Refused::SizedOutOfOrder`] at the first that differs, or at one held after one that is not.
+  fn sized_new(
+    &self,
+    store: &ContentStore,
+    number: u32,
+    from: u32,
+    rows: &[(Vec<u8>, ChunkSpan)],
+  ) -> Result<u64, Refused> {
+    let mut new = 0_u64;
+    for (rev, (_, span)) in (from..).zip(rows) {
+      match self.span_of(store, number, rev) {
+        Some(held) if held == *span && new == 0 => {}
+        Some(_) => return Err(Refused::SizedOutOfOrder { rev }),
+        None => new = new.saturating_add(1),
+      }
+    }
+    Ok(new)
+  }
+
+  /// The totals once `log` grows from `revisions` (with `data` bytes of chunks) to `grown`: its files' share before
+  /// taken out and after put in ([`crate::render::rendered_files`]).
+  fn totals_after(
+    &self,
+    log: Log<'_>,
+    (revisions, data): (u32, u64),
+    grown: (u32, u64),
+  ) -> Result<Rendered, Refused> {
+    let before = crate::render::rendered_files(log, (revisions, data));
+    let after = crate::render::rendered_files(log, grown);
+    let files = self
+      .kept
+      .files
+      .checked_sub(before.files)
+      .and_then(|files| files.checked_add(after.files));
+    let bytes = self
+      .kept
+      .bytes
+      .checked_sub(before.bytes)
+      .and_then(|bytes| bytes.checked_add(after.bytes));
+    match (files, bytes) {
+      (Some(files), Some(bytes)) => Ok(Rendered { files, bytes }),
+      _ => Err(Refused::RenderedOverflow),
+    }
+  }
+
+  /// Inserts the sized `rows` of `log` (numbered `number`), with its number row where `numbered`, as one batch.
+  fn insert_sized(
+    &mut self,
+    store: &mut ContentStore,
+    (log, number, numbered): (Log<'_>, u32, bool),
+    rows: &[(Vec<u8>, ChunkSpan)],
+  ) -> Result<(), Refused> {
+    let bodies: Vec<[u8; SIZED_BODY_BYTES]> =
+      rows.iter().map(|(_, span)| sized_body(*span)).collect();
+    let number_key = numbered.then(|| number_key(log));
+    let number_body = number.to_be_bytes();
+    let mut batch: Vec<NewRow<'_>> = rows
+      .iter()
+      .zip(&bodies)
+      .map(|((key, _), body)| NewRow {
+        key,
+        contents: &[],
+        payload: body,
+      })
+      .collect();
+    if let Some(key) = &number_key {
+      batch.push(NewRow {
+        key,
+        contents: &[],
+        payload: &number_body,
+      });
+    }
+    self.insert(store, &batch)?;
+    Ok(())
+  }
+
+  /// What sizing `revisions` revisions over `logs` logs charges the store at most ([`SIZED_ROW_CHARGE`] a revision, and
+  /// a log's number row, its key's `path_bytes` and its body, a log): the room a landing lends its sizing.
+  pub fn sized_charge(revisions: u64, (logs, path_bytes): (u64, u64)) -> u64 {
+    revisions
+      .saturating_mul(to_u64(SIZED_ROW_CHARGE))
+      .saturating_add(logs.saturating_mul(to_u64(NUMBER_ROW_CHARGE)))
+      .saturating_add(path_bytes)
+  }
+
+  /// `log`'s number ([`NUMBER_ROW`]); none for a log never sized.
+  fn log_number(&self, store: &ContentStore, log: Log<'_>) -> Option<u32> {
+    let row = self.rows.get(store, &number_key(log))?;
+    Some(u32::from_be_bytes(row.payload().try_into().ok()?))
+  }
+
+  /// The span the sized row of log `number`'s revision `rev` holds.
+  fn span_of(&self, store: &ContentStore, number: u32, rev: u32) -> Option<ChunkSpan> {
+    let row = self.rows.get(store, &sized_key(number, rev))?;
+    read_span(row.payload())
+  }
+
+  /// `log`'s revision `rev`'s kept chunk span ([`HgIndex::keep_sized`]); none where it is not sized.
+  pub fn chunk_span(&self, store: &ContentStore, log: Log<'_>, rev: u32) -> Option<ChunkSpan> {
+    self.span_of(store, self.log_number(store, log)?, rev)
+  }
+
+  /// The bytes of `log`'s chunks, where every revision of it is sized; none where its last is not.
+  pub fn log_data(&self, store: &ContentStore, log: Log<'_>) -> Option<u64> {
+    let Some(last) = self.len(store, log).checked_sub(1) else {
+      return Some(0);
+    };
+    let span = self.chunk_span(store, log, last)?;
+    Some(span.offset.saturating_add(u64::from(span.len)))
+  }
+
+  /// `log`'s kept chunk spans from revision `from` to its last sized, in order: one range walk of its sized rows
+  /// (`Index::iter_range`), as [`HgIndex::numbers_from`] walks its log rows. None for a log never sized.
+  pub fn spans_from<'s>(
+    &'s self,
+    store: &'s ContentStore,
+    log: Log<'_>,
+    from: u32,
+  ) -> Option<impl Iterator<Item = Option<ChunkSpan>> + use<'s>> {
+    let number = self.log_number(store, log)?;
+    let start = sized_key(number, from);
+    let end = sized_key(number.checked_add(1)?, 0);
+    Some(
+      self
+        .rows
+        .iter_range(store, (&start, &end))
+        .map(|row| read_span(row.payload())),
+    )
+  }
+
+  /// The files a stream of the repository sends and their bytes, where every revision appended is sized and each can
+  /// be streamed as it is kept; none where one is not, which serves no stream (`1\n`, the client clones).
+  pub fn rendered(&self) -> Option<Rendered> {
+    (self.kept.appended == self.kept.sized && !self.kept.unstreamable).then_some(Rendered {
+      files: self.kept.files,
+      bytes: self.kept.bytes,
+    })
   }
 
   /// `log`'s rows from revision `rev` on, in order, each as a stream's index entry reads it ([`EntryNumbers`]; none for
@@ -1377,8 +1695,14 @@ impl HgIndex {
       })
       .collect();
     self.insert(store, &batch)?;
+    self.kept.appended = self.kept.appended.saturating_add(to_u64(planned.len()));
     Ok(())
   }
+}
+
+/// `count` as a `u64`, saturating (a count of rows or bytes in memory never reaches it).
+fn to_u64(count: usize) -> u64 {
+  u64::try_from(count).unwrap_or(u64::MAX)
 }
 
 /// A group's numbering, as 7.2's `addgroup` numbers one.
@@ -1497,6 +1821,90 @@ fn object_key(node: &Node) -> Vec<u8> {
   key.push(OBJECT_ROW);
   key.extend_from_slice(node);
   key
+}
+
+/// The key of `log`'s number row ([`NUMBER_ROW`]).
+fn number_key(log: Log<'_>) -> Vec<u8> {
+  let mut key = Vec::with_capacity(log.key_len().saturating_add(1));
+  key.push(NUMBER_ROW);
+  log.put_key(&mut key);
+  key
+}
+
+/// The key of log `number`'s revision `rev`'s sized row ([`SIZED_ROW`]).
+fn sized_key(number: u32, rev: u32) -> Vec<u8> {
+  let mut key = Vec::with_capacity(SIZED_KEY_BYTES);
+  key.push(SIZED_ROW);
+  key.extend_from_slice(&number.to_be_bytes());
+  key.extend_from_slice(&rev.to_be_bytes());
+  key
+}
+
+/// A sized row's body: the chunk's length, then its offset, little-endian.
+fn sized_body(span: ChunkSpan) -> [u8; SIZED_BODY_BYTES] {
+  let mut body = [0; SIZED_BODY_BYTES];
+  let (len, offset) = body.split_at_mut(REV_BYTES);
+  len.copy_from_slice(&span.len.to_le_bytes());
+  offset.copy_from_slice(&span.offset.to_le_bytes());
+  body
+}
+
+/// A sized row's span, read back; none for a body not [`SIZED_BODY_BYTES`] long.
+fn read_span(body: &[u8]) -> Option<ChunkSpan> {
+  let (len, offset) = body.split_at_checked(REV_BYTES)?;
+  Some(ChunkSpan {
+    len: u32::from_le_bytes(len.try_into().ok()?),
+    offset: u64::from_le_bytes(offset.try_into().ok()?),
+  })
+}
+
+/// The sized rows of log `number` from revision `from`, the first chunk at `start`, each of `lengths` in turn: each
+/// row's key and span.
+fn sized_rows(
+  number: u32,
+  from: u32,
+  (start, lengths): (u64, &[u32]),
+) -> Result<Vec<(Vec<u8>, ChunkSpan)>, Refused> {
+  let mut offset = start;
+  let mut rows = Vec::with_capacity(lengths.len());
+  for (rev, len) in (from..).zip(lengths) {
+    rows.push((sized_key(number, rev), ChunkSpan { offset, len: *len }));
+    offset = offset
+      .checked_add(u64::from(*len))
+      .ok_or(Refused::RenderedOverflow)?;
+  }
+  Ok(rows)
+}
+
+/// What a log rendered to before a sizing of `rows` from revision `from` (its first chunk at `start`), of which the last
+/// `new` were not held: its revisions and its chunks' bytes through the last one held already, a recount's rows over a
+/// replay's (none held: `from` and `start`).
+fn sized_through(from: u32, start: u64, (rows, new): (&[(Vec<u8>, ChunkSpan)], u64)) -> (u32, u64) {
+  let held = rows
+    .len()
+    .saturating_sub(usize::try_from(new).unwrap_or(usize::MAX));
+  match rows.get(..held).and_then(<[_]>::last) {
+    Some((_, span)) => (
+      from.saturating_add(u32::try_from(held).unwrap_or(u32::MAX)),
+      span.offset.saturating_add(u64::from(span.len)),
+    ),
+    None => (from, start),
+  }
+}
+
+/// The length of the chunk a stream sends of a revision placed as `placed` ([`Placed`]): a raw place compressed by the
+/// stream's own compressor (`revlog_chunk::chunk_len`, its count pass), a chunk place its length. What a landing sizes
+/// a revision by once, so no stream compresses to size (main 01a20182's ruling of 2026-11-27 18:56).
+///
+/// # Errors
+/// [`Refused::Unsizable`] where the compressor refuses or the chunk is longer than an entry names.
+pub fn chunk_len_of(placed: Placed<'_>, rev: u32) -> Result<u32, Refused> {
+  let len = match placed {
+    Placed::Raw(bytes) => crate::revlog_chunk::chunk_len(bytes, crate::revlog_chunk::Pass::Count)
+      .map_err(|_| Refused::Unsizable { rev })?,
+    Placed::Chunk(len) => len,
+  };
+  u32::try_from(len).map_err(|_| Refused::Unsizable { rev })
 }
 
 /// A log row's payload's common part.
