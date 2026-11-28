@@ -932,3 +932,7 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     functional test. let_go_landed test-only.
   - Next: the intake-slice reading by stage (separate branch), then (ii) the naming proof. due() narrowing waits for
     main's table on d475c91fd.
+- 2026-11-27 22:49 PST (written then):
+  - BUILT, not on main: agents/w-perf-slice-reading at ea1898ac5 (on d475c91fd): an intake slice's frees into held by
+    stage, a line a doubling (Intake::stage_kind read-only, w-hg noted). Focused server 90, hg 43.
+  - Waiting on main: the 57k on d475c91fd (about 23:05). Next: (ii), the naming proof with the arena oracle.
