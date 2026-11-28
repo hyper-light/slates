@@ -376,7 +376,11 @@
 >   with none is no answer, its host left, its link dialed afresh, and the homing waits and ranks its homes again once
 >   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`
 >   (16 of 16 in main's run at 526859d1e). a914 asserts its second push lands.
-> - **OPEN, a914 still fails 4 of 16 at the record barrier** (main 01a20182's run at 526859d1e, load 42-69; its rulings of
+> - **FIXED, a914 16 of 16 (main 01a20182's run at 02548a267, macOS arm64 debug, load 17-53, 2026-11-27 19:02):** every
+>   run with no homing `retry` and no barrier refusal, A-914 (d)'s red 16 of 16 beside it; at 604aa12a0 and d08595c7e 11 of
+>   16, every red beginning with the first death's push refused `retry`. Closed by A-934 (state logs), A-935 (greens) and
+>   A-914 (c) (the live homing deadline). The history below stays as it was.
+> - **Was OPEN, a914 still fails 4 of 16 at the record barrier** (main 01a20182's run at 526859d1e, load 42-69; its rulings of
 >   2026-11-27 12:02). Every red is the second death's push refused `unable to commit`; no homing ended short at once.
 >   Two shapes:
 >   1. Runs 5 and 13: a green owed at version 3, placed 2, with reads past tolerance ("nothing held, the register's
@@ -409,8 +413,15 @@
 >   each log's newest part stays owed while it has remote candidates, so the owed-part ship re-ships it to a candidate a
 >   change brings in, and the settle waits for it on `f + 1` of the new cohort, naming the log it waits for. Bounded:
 >   one part a state log of a repository the partition holds (design A-934).
-> - **OPEN, being logged (w-shared; main 01a20182's order of 2026-11-27 18:08): a holder's replica build stalls at the
->   second death.** a914 at 604aa12a0 run 10 and at d08595c7e runs 1, 3, 5, 7 and 9 (each after a refused first-death
+> - **FIXED in part (A-936, w-shared, 2026-11-27; main's rulings of 19:09 and 19:31), OPEN for the rest: a holder's
+>   replica build stalls at the second death.** Reproduced on purpose (a refused first-death push, then the second
+>   death): the logs put it on the holder's configuration lag, not the build or the region (the build's replay 5 ms):
+>   each reship refused `foreign_generation`. Now the holder answers `CatchingUp` and the barrier counts it (design
+>   A-936). The no-turn build (main's ×16 at 69fbc8de0, a914 run 2): the build waited on its store's replay, whose two
+>   region reads each spent a whole share on d, dead and not yet suspected; now the replay's steps count as the build's
+>   work done, so the barrier sees it move (A-936's replay half). OPEN, next: the hedged region read, the read's cost. Not seen in a914 since A-914 (c) (16 of 16 at 02548a267): every stalled red followed a refused first
+>   push, so its red must make the condition on purpose, or the logs show a refused push is its only door (main's ruling
+>   of 19:02). a914 at 604aa12a0 run 10 and at d08595c7e runs 1, 3, 5, 7 and 9 (each after a refused first-death
 >   push): the second death's v2 placed at the owner alone, its other live candidate answering `ReplicaBuilding` at 0
 >   turns through the barrier window (`building {X: 0}`), so the push was refused `unable to commit`. A build at 0 turns
 >   has not left `replica_build::laid_out`, which waits while the repository's replica store replays; that replay
@@ -418,8 +429,12 @@
 >   leftovers: a refused attempt lets go of every hold it made at every home (`homes::Attempt::released`), and nothing
 >   homes them again. Now logged: the build's wait on the replay as it begins and ends; each home a region read got
 >   nothing from, with its share and its wait, and a read that ended with none, or found no home besides this node;
->   each names a rebuild could not fetch. Unproven guess: an object of an earlier landed record whose homes were the two
->   dead (d and c), the healer not yet re-homing it before c died.
+>   each names a rebuild could not fetch; and each merge record a holder does not accept, with its green, version, sender
+>   and reason (the counter it counts), once per green, version and reason (`merge_service::note_unaccepted`, main's
+>   ruling of 18:33), for the first-death barrier red where a candidate holding v1 never acknowledged v2 (A-935's kept
+>   v1 retargeted to the newcomer meanwhile: not yet A-935's, one red against none in 16). Unproven guess for the stall:
+>   an object of an earlier landed record whose homes were the two dead (d and c), the healer not yet re-homing it before
+>   c died.
 > - **OPEN, being logged (w-shared; main 01a20182's ruling of 2026-11-27 17:05): a live node's own HTTP edge refused a
 >   connect at 0 ms.** 2816da877's a914 run 3: the first death's push failed "Failed to connect to 127.0.0.1 port 55009
 >   after 0 ms: Couldn't connect to server" on a's own `vcs_http_port` while a was alive, and no "the HTTP edge
@@ -554,7 +569,13 @@
 >     from version 0). Both are reached now. Red first: a successor holding none of the green's records gave it up after
 >     37 attempts; it adopts it in 7 now, and takes a push. A-918 B's newcomer half is closed below. **Owed (main):**
 >     gate 24.
->   - **KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
+>   - **FIXED (w-shared, 2026-11-27; main 01a20182's ruling of 20:48; diag 12's x86_64 red): readmission no longer
+>     clears what the creator skip reads.** `RegionalConfiguration::admit` still drops a readmitted host's completion
+>     record (A-309) and now keeps the fact for routing alone (`superseded`, regional layout 8; at most `completed_bound`,
+>     the earliest let go first, a let-go costing one refused forward), which `owner_location`'s skip reads. Red first on
+>     the Mac: a921's forwarded test asks the stranger's direct route of an object of a's it has no route for; it named a,
+>     and the volume's own route named it too in that run; now none. The entry below stays as the record.
+>   - **Was a KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
 >     A readmission drops the host's completed takeover (`RegionalConfiguration::admit`, A-309) and its retirement is
 >     gone once that completes, so A-921 part 2's creator skip has nothing to read for it: a node that has not yet
 >     learned an object's adopter offers the readmitted creator first. It costs a redirect, never a wrong answer. The
@@ -1182,6 +1203,29 @@
 > deterministic in `crates/rt/tests/spin_kick.rs` (3 of 3 hung, shard parked), green 3 of 3
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
+> **FIXED 2026-11-27 (w-svn; main's git-2000 release rounds, 4 imports of 5 refused at r593): a stepped directory
+> removal judged again over a half-made count.** A step that decided one directory and was spent counting the next
+> one's children left the phase's place before the first, so the next decided it again and refused the revision
+> `DeleteModify` (`Green::decide_rmdirs_some`, A-920's ee0c95e8f). Each decided directory now keeps its place. Bug
+> record `docs/bugs/2026-11-27-an-imports-directory-removals-were-judged-again-over-a-half-made-count.md`; a refused
+> staging now logs what the member holds and the work does there (`ImportBatch::refusal_logged`). Its sibling, latent:
+> the ptrie's removal descent (`ptrie::remove_at`) went on past a child's label without checking the key held it, so
+> below the root removing "ax" beside "ab" took "ab"'s value; `Ptrie::remove` asks `get` first, so no caller met it.
+> Now matched as `get` matches it; the sweep found every other descent (`get`, `insert_at`, `graft_at`, `cut_at`,
+> `under_any`) already matching its labels whole. The oracle asserts an absent key's removal copies no node.
+
+> **Open, measured red on main (A-920, w-svn, 2026-11-27; main's ruling of 20:31): one free returns about 40 MB of pages
+> to the system inside a landing's step.** Release probe 18 read copy's prepare at 2.0 ms of wall on 47 µs of CPU.
+> Debug logs, a footprint read before and after each landing step (`staging::returned`): the slowest step spent 1.7 ms
+> off its CPU while the process footprint fell 40.1 MB, the steps pages were returned in held all of a run's off-CPU
+> time (1.7-2.5 ms), and a run with no return during a landing step spent at most 18 µs off its CPU although 1,218 steps
+> met the reaper dropping. So it is the page return, not the reaper's drops, and neither slicing the reaper's drops
+> (measured: 804-2,442 µs, no better) nor dropping on the shard can split one return. The wide copy test holds
+> `LANDING_OFF_CPU_MOST_NS` to 84a's 1 ms bar and fails where a return stalls a step (2 of 4 debug runs; another run's
+> 8 return steps, 71 MB, stalled none, at most 22 µs off its CPU, so the stall is intermittent): the red the arena piece turns
+> green (the landing's structures in the shard's arena, so a free never hands pages back mid-step). Unexplained, logged,
+> not attributed: one run's 5,025 µs in a step whose footprint did not fall.
+
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
@@ -1208,7 +1252,11 @@
 > ms of the op's 4.29 (debug), and the cost was the identity's hash of the whole op (4.92 ms), which hashes each entry as
 > its digest since 13c. The log write's about 48 bytes a path stays, for a wider probe to judge. Release probe 17's
 > move leader was the test's own setup (the simulated host's copy of the dump), which now holds the dump moved in, never copied; the
-> product's create and begin print apart (`SETUP`). Copy's release unit was an allocator's batch of freed pages returned
+> product's create and begin print apart (`SETUP`). Release probe 18's move leader, `begin` (1.4 ms, CPU-bound, at any
+> load), was the simulated host again: its `open_file` cloned the whole dump as the open's snapshot (debug: 0.43 of
+> `begin`'s 0.46 ms, about twice add's for move's dump). Since (w-svn, main's ruling (a) of 2026-11-27 17:29) an open
+> copies nothing, as a real host's does, and a file displaced while open is retired whole, the files beneath a removed
+> directory too (`SimHost::retire`); held by `crates/vfs/tests/sim_opens.rs` (red: the open held the file's 1 MiB). Copy's release unit was an allocator's batch of freed pages returned
 > in one free (1.2-1.3 ms of system time in release); since the reaper, what a release frees is dropped on the daemon's
 > reaper thread (25 µs the longest unit, debug), owed probe 18's release read. The shard's handed and in-place counts are
 > read by the tests alone, not yet the status report. Move's `stage.committing` was the commit's node moves, a walk of
@@ -3130,8 +3178,11 @@
 > per landing (41 bytes an object); and the Mac's footprint and Linux's RSS readings after b2b (main's). Unmeasured,
 > owed (w-git) once a fleet
 > RSS round measures it: `put_remote` ships the whole pack in one buffer to each remote home (f ≥ 1); another shard of
-> this node as the pack's home is handed its bytes too. Owed (w-git): a node whose store lacks a record's changeset
-> reading its names from their region homes, held by a test of its own (the rebuild test now reads the node's store).
+> this node as the pack's home is handed its bytes too. C4 CLOSED (w-git, 2026-11-27, main's
+> order of 18:44): a node whose store lacks a record's changeset reads its names from their region home, held by a test
+> of its own, `vcs_store::replica::tests::a_replica_reads_the_names_its_node_lacks_from_their_region_home` (a two-shard
+> node: a replica of A's records begun on the shard not homing their names, its changeset read refused
+> `changeset_unread`, the names fetched from their home `names_fetched`, none unfetched, its rows A's).
 > OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
 > "possible repository corruption on the remote side". The repository's encoding never finishes (its first version,
 > master's whole history, begun and never kept; each tag's first version is encoded over everything it reaches, so the
@@ -3446,9 +3497,17 @@
 > pack's length (resident at most twice the pack while judged); staging puts what lands. Owed: the landed half
 > (changesets, a clone's pack derived from them, with w-store); a replay still reads its record's pack whole.
 >
+> **A-722 part 4h (P2, 2026-11-27, w-git; main's order of 18:44).** BUILT: a commit reads and charges its own greens'
+> records alone (one move over 1,000 greens of 20 versions: 3 records read, 22,021 before), its versions pushed and
+> its heads moved in place after its stage's adoption, the charge trued up to its whole recomputation; a commit refused
+> after its plan leaves the store as it was (found: the stage's fork was dropped holding its tables, 397 bytes a
+> refusal), held at every point by the store's oracle. OWED, each its own piece: `landed_runs` over a several-move
+> push's positions; the release's drops of the push's placed and positions maps; a stale stage restaged whole.
+>
 > **A-722 part 4e (2026-11-20, w-git).** BUILT: an overtaken stage made again in the judge's turns; a stage giving no
 > position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live). Owed: the
-> store commit's whole passes; the check's propagation in one unit (57.9 ms at 100 pushes).
+> store commit's whole passes (part 4h above began them: the chains' and the head map's); the check's propagation in
+> one unit (57.9 ms at 100 pushes).
 >
 > **A-753 (2026-11-20, w-git).** BUILT: a create at a commit another branch holds is made from it (empty work); a
 > resent object is read from the index; at the chains' cap a push checkpoints the repository's other members too.

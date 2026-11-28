@@ -85,7 +85,11 @@ enum Open {
   Dir(Vec<Box<str>>),
   File {
     ino: u64,
-    snapshot: SimNode,
+    /// What a directory opened to change its mode answers once it is gone (its node without its entries); none for a
+    /// file, whose open copies nothing, as a real host's does: a file displaced while open is retired whole, so the
+    /// descriptor reads it there ([`SimHost::retire`]). Before 2026-11-27 every open cloned its file's bytes, a cost in
+    /// the file's length inside the product's step (A-920: a 9 MB dump's import began 1.4 ms in, release).
+    snapshot: Option<SimNode>,
     /// Where the file was opened: the first place to look for its inode (a rename or a
     /// replacement moves it, and the tree walk then finds it wherever it sits).
     path: Vec<Box<str>>,
@@ -716,6 +720,20 @@ impl SimHost {
     self.watched.clear();
   }
 
+  /// The bytes of files the open descriptors hold apart from the tree: what an open copied of its file. A real host's
+  /// open copies nothing, so an oracle host's own cost stays flat in a file's length (CLAUDE.md's oracle-host gotcha;
+  /// A-920, main's ruling of 2026-11-27 17:29).
+  pub fn open_bytes_held(&self) -> usize {
+    self
+      .opens
+      .values()
+      .map(|open| match open {
+        Open::File { snapshot, .. } => snapshot.as_ref().map_or(0, |node| node.bytes.len()),
+        Open::Dir(_) | Open::Temp { .. } => 0,
+      })
+      .fold(0, usize::saturating_add)
+  }
+
   /// Overwrites a file in place, same inode, timestamps advanced by `dt_ns` (zero keeps them,
   /// which is the racy case of T-1.11).
   pub fn write_in_place(&mut self, path: &str, bytes: &[u8], dt_ns: i64) {
@@ -759,11 +777,38 @@ impl SimHost {
       .unwrap_or_default();
     if let Some(p) = self.node_mut(&parent)
       && let Some(old) = p.children.remove(&name)
-      && old.kind == HostKind::File
     {
-      self.retired.insert(old.ino, old);
+      self.retire(old);
     }
     self.touch_parent(&parent);
+  }
+
+  /// Keeps what a removed entry leaves an open descriptor, as a real host keeps an unlinked inode alive behind one: a
+  /// file whole, and of a directory removed with everything beneath, each file beneath that an open holds (an open
+  /// copies nothing, so its file lives here once it leaves the tree).
+  fn retire(&mut self, old: SimNode) {
+    if old.kind == HostKind::File {
+      self.retired.insert(old.ino, old);
+      return;
+    }
+    let held: std::collections::BTreeSet<u64> = self
+      .opens
+      .values()
+      .filter_map(|open| match open {
+        Open::File { ino, .. } => Some(*ino),
+        Open::Dir(_) | Open::Temp { .. } => None,
+      })
+      .collect();
+    let mut beneath = vec![old];
+    while let Some(node) = beneath.pop() {
+      if node.kind == HostKind::File {
+        if held.contains(&node.ino) {
+          self.retired.insert(node.ino, node);
+        }
+        continue;
+      }
+      beneath.extend(node.children.into_values());
+    }
   }
 
   /// Renames an entry.
@@ -952,8 +997,8 @@ impl HostFs for SimHost {
     let mut parts = self.dir_parts(dir)?;
     parts.push(name.into());
     self.fault(SimVerb::OpenFile, &format!("/{}", parts.join("/")))?;
-    let node = match self.node(&parts) {
-      Some(n) if n.kind == HostKind::File => n.clone(),
+    let ino = match self.node(&parts) {
+      Some(n) if n.kind == HostKind::File => n.ino,
       Some(_) => return Err(HostError::NotFile),
       None => return Err(HostError::NotFound),
     };
@@ -962,8 +1007,8 @@ impl HostFs for SimHost {
     self.opens.insert(
       h,
       Open::File {
-        ino: node.ino,
-        snapshot: node,
+        ino,
+        snapshot: None,
         path: parts,
       },
     );
@@ -1043,7 +1088,7 @@ impl HostFs for SimHost {
 impl SimHost {
   /// What an open descriptor serves: the inode where it was opened if it still sits there,
   /// else wherever the inode moved to, else the retired copy the descriptor keeps alive, else
-  /// the snapshot taken at the open.
+  /// the snapshot a directory's open to change its mode took.
   fn live_node(&self, file: HostFile) -> Result<&SimNode, HostError> {
     let (ino, snapshot, path) = match self.opens.get(&file.0) {
       Some(Open::File {
@@ -1053,15 +1098,16 @@ impl SimHost {
       }) => (*ino, snapshot, path),
       _ => return Err(HostError::StaleHandle),
     };
-    Ok(
-      self
-        .node(path)
-        .filter(|n| n.ino == ino)
-        .or_else(|| self.sibling_with_ino(path, ino))
-        .or_else(|| self.find_ino(ino))
-        .or_else(|| self.retired.get(&ino))
-        .unwrap_or(snapshot),
-    )
+    // A file's open is always found by one of these (an open copies nothing; [`SimHost::retire`] keeps a file it holds
+    // once the file leaves the tree), so none is a stale descriptor.
+    self
+      .node(path)
+      .filter(|n| n.ino == ino)
+      .or_else(|| self.sibling_with_ino(path, ino))
+      .or_else(|| self.find_ino(ino))
+      .or_else(|| self.retired.get(&ino))
+      .or(snapshot.as_ref())
+      .ok_or(HostError::StaleHandle)
   }
 
   /// The inode under another name in the same directory (an exchange or a rename within the
@@ -1259,7 +1305,7 @@ impl LandFs for SimHost {
       h,
       Open::File {
         ino: node.ino,
-        snapshot: node,
+        snapshot: Some(node),
         path: parts,
       },
     );

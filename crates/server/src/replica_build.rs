@@ -62,6 +62,9 @@ pub(crate) struct ReplicaBuilds {
 struct Under {
   repository: RepositoryId,
   building: Option<slates_merge::push::Building>,
+  /// The most of its repository's store's replay this build saw while it waited on it ([`note_replay`]): counted with its
+  /// turns in the work done it reports.
+  replayed: u64,
   /// The turns done, rising while it runs: what a waiting record's answer reports
   /// (`slates_cluster::content::ContentMessage::ReplicaBuilding`).
   slices_done: u64,
@@ -78,7 +81,26 @@ pub(crate) fn slices_done(state: &ShardState, green: ObjectId) -> Option<u64> {
     .replica_builds
     .building
     .get(&green)
-    .map(|under| under.slices_done)
+    .map(|under| under.slices_done.saturating_add(under.replayed))
+}
+
+/// Notes `green`'s build's repository's store's replay progress (`VcsStores::rebuild_steps`) while the build waits on it
+/// (A-936's replay half, main 01a20182's ruling of 2026-11-27 20:11): kept at the highest it saw, so the work done the
+/// build reports ([`slices_done`]) only rises, and a push's barrier sees a replay move where it makes no turn (a914 at
+/// 69fbc8de0 run 2: two region reads, each a whole share on a home that had just died, 2 s at 0 turns).
+fn note_replay(state: &mut ShardState, green: ObjectId, repository: RepositoryId) {
+  let Some(steps) = state.vcs_stores.rebuild_steps(repository) else {
+    return;
+  };
+  if let Some(under) = state.replica_builds.building.get_mut(&green) {
+    under.replayed = replayed_seen(under.replayed, Some(steps));
+  }
+}
+
+/// The most of a store's replay a build has seen ([`note_replay`]): `held` raised to `steps` where the replay reports
+/// more, and `held` as it was once the replay has ended (`None`), so the work done a build reports never falls.
+fn replayed_seen(held: u64, steps: Option<u64>) -> u64 {
+  steps.map_or(held, |steps| held.max(steps))
 }
 
 /// What a turn of a build left.
@@ -98,7 +120,16 @@ enum Turned {
 /// counted [`VERSIONS_WAITED`].
 pub(crate) fn wanted(state: &mut ShardState, green: ObjectId) {
   state.count(VERSIONS_WAITED, 1);
-  if state.replica_builds.building.contains_key(&green) {
+  if let Some(under) = state.replica_builds.building.get(&green) {
+    // Logged once a build has run a turn and still owes, never per record (main 01a20182's order of 2026-11-27 18:08):
+    // a build begun and never turned shows here as the turns it has at the record that waits.
+    if under.slices_done == 0 {
+      slates_machine::log_line!(
+        "slates-server: partition {}: a record of {green:?} waits on a replica build begun {} ns ago that has run no turn",
+        state.partition,
+        slates_rt::futures::now_ns().saturating_sub(under.began_ns)
+      );
+    }
     return;
   }
   let Some(record) = repository_of(state, green) else {
@@ -140,12 +171,20 @@ pub(crate) fn begin(state: &mut ShardState, green: ObjectId, repository: Reposit
       repository,
       building: None,
       slices_done: 0,
+      replayed: 0,
       began_ns: slates_rt::futures::now_ns(),
       layout: None,
     },
   );
   match slates_rt::futures::spawn(drive(green)).and_then(slates_rt::futures::detach) {
-    Ok(()) => state.count(BEGUN, 1),
+    Ok(()) => {
+      state.count(BEGUN, 1);
+      slates_machine::log_line!(
+        "slates-server: partition {}: a replica build of {green:?} begun at {} ns",
+        state.partition,
+        slates_rt::futures::now_ns()
+      );
+    }
     Err(_) => {
       // No task to run it: the next record that finds the replica owing begins it again.
       state.replica_builds.building.remove(&green);
@@ -206,7 +245,16 @@ async fn drive(green: ObjectId) {
       Some(Turned::Done) | None => break,
     }
   }
-  let _ = crate::state::with_state_counted(|state| state.replica_builds.building.remove(&green));
+  let _ = crate::state::with_state_counted(|state| {
+    if let Some(under) = state.replica_builds.building.remove(&green) {
+      slates_machine::log_line!(
+        "slates-server: partition {}: a replica build of {green:?} ended after {} turns at {} ns",
+        state.partition,
+        under.slices_done,
+        slates_rt::futures::now_ns()
+      );
+    }
+  });
   brought.let_go();
 }
 
@@ -233,6 +281,7 @@ async fn laid_out(green: ObjectId) -> bool {
     let found = crate::state::with_state_counted(|state| {
       let repository = state.replica_builds.building.get(&green)?.repository;
       if state.vcs_stores.is_rebuilding(repository) {
+        note_replay(state, green, repository);
         return Some(Found::Replaying);
       }
       if state.vcs_stores.mercurial_ref(repository).is_none() {
@@ -307,6 +356,7 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
   state.count(SLICES, 1);
   // Its repository's store is made first (`vcs_store::replica`): nothing of the owed push's build is begun until then.
   if state.vcs_stores.is_rebuilding(repository) {
+    note_replay(state, green, repository);
     return Turned::More;
   }
   let Some(replica) = state
@@ -391,12 +441,18 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
       match made {
         Some(Ok(_)) => {
           state.count(MADE, 1);
-          let began = state
+          let (began, turns) = state
             .replica_builds
             .building
             .get(&green)
-            .map_or(0, |under| under.began_ns);
-          state.count_max(MADE_NS, slates_rt::futures::now_ns().saturating_sub(began));
+            .map_or((0, 0), |under| (under.began_ns, under.slices_done));
+          let took = slates_rt::futures::now_ns().saturating_sub(began);
+          state.count_max(MADE_NS, took);
+          // Logged, the build against a holder's configuration lag (main 01a20182's ruling of 2026-11-27 19:09).
+          slates_machine::log_line!(
+            "slates-server: partition {}: a replica of {green:?} was made in {turns} turns, {took} ns after its build began",
+            state.partition
+          );
         }
         other => {
           slates_machine::log_line!(
@@ -417,5 +473,22 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
       state.replica_builds.refused_over.insert(repository);
       Turned::Done
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  /// A-936's replay half (main 01a20182's ruling of 2026-11-27 20:19): the work done a build reports while it waits on
+  /// its store's replay rises with the replay's steps, and never falls once the replay ends. Do: steps 0, 1, 3, a lower
+  /// reading of 2, then the replay ended. Expect 0, 1, 3, 3, 3.
+  #[test]
+  fn a_waiting_builds_replay_seen_rises_with_its_steps_and_never_falls() {
+    let mut held = 0;
+    let mut seen = Vec::new();
+    for steps in [Some(0), Some(1), Some(3), Some(2), None] {
+      held = super::replayed_seen(held, steps);
+      seen.push(held);
+    }
+    assert_eq!(seen, vec![0, 1, 3, 3, 3]);
   }
 }

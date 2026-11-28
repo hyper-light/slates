@@ -153,9 +153,12 @@ impl Query {
           .map_or_else(|| object.creator(), |moved| moved.owner);
         // A first owner the configuration keeps a retirement or a completed takeover of lost its objects to a successor
         // (A-921 part 2): readmitted after a false death it is a member again, but never the owner of what it held
-        // then, so it is not offered; the location round finds the adopter, which claims while it serves.
+        // then, so it is not offered; the location round finds the adopter, which claims while it serves. Its
+        // readmission drops the completion record (A-309) and keeps the fact as `superseded`, so the skip still holds
+        // for a stranger with no route of its own (main 01a20182's ruling of 2026-11-27 20:48; diag 12's x86_64 red).
         let taken_over = configuration.retired.contains_key(&first)
-          || configuration.completed.contains_key(&first);
+          || configuration.completed.contains_key(&first)
+          || configuration.superseded.contains_key(&first);
         (!taken_over && eligible(state, first, RegionId(self.region))).then_some(first)
       })
       .filter(|owner| *owner != local)

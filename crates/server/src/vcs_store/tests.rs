@@ -3190,3 +3190,19 @@ fn t_a664_a_store_made_again_compares_its_index_tables_merged_whole_on_both_side
     });
   });
 }
+
+/// A-936's replay half: a rebuild's progress is the records it replayed and the names it fetched, rising as either does,
+/// and none once it ends. Do: a rebuild of a repository at its second record, two names fetched; then a third record;
+/// then ended. Expect 4, 5, none.
+#[test]
+fn a_rebuilds_steps_are_its_records_replayed_and_names_fetched() {
+  let id = RepositoryId { bytes: [7; 16] };
+  let mut stores = super::VcsStores::default();
+  stores.rebuild_turns.insert(id, (1, 2));
+  stores.rebuild_fetched.insert(id, 2);
+  assert_eq!(stores.rebuild_steps(id), Some(4));
+  stores.rebuild_turns.insert(id, (1, 3));
+  assert_eq!(stores.rebuild_steps(id), Some(5));
+  stores.rebuild_turns.remove(&id);
+  assert_eq!(stores.rebuild_steps(id), None);
+}

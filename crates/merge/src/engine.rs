@@ -4059,6 +4059,19 @@ impl Green {
     }
   }
 
+  /// The keys under `dir/` its head's node maps count (files, directories, symbolic links, hard links and IPC nodes, in
+  /// that order): what a directory's removal holds against the paths the work removes there ([`Green::held_under`]),
+  /// read beside [`Green::head_under`]'s walk where a removal is refused (the git-2000 import's r593, 2026-11-27).
+  pub fn counted_under(&self, dir: &str) -> [usize; 5] {
+    self.held_under(&format!("{dir}/"))
+  }
+
+  /// The version `path` last changed at for the verdict (its own last change, or a copy's above it): what a removal's
+  /// "changed after the work's base" reads ([`Green::changed_after`]), logged where a removal is refused.
+  pub fn last_changed(&self, path: &str) -> u64 {
+    self.changed_last(self.latest_change.get(path), path)
+  }
+
   /// What the green holds at its head under `dir` (A-792): every file, directory, symlink and special node whose
   /// path is `dir` or starts with `dir/` (every path for the root, `""`), each found by one descent of its map, so a
   /// listing of one directory reads that directory's subtree rather than the whole green. [`Green::current_base`]

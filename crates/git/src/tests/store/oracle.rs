@@ -19,8 +19,8 @@ use crate::store::{Found, Repository};
 use crate::unpack::{NoIndex, read_whole};
 
 use super::{
-  EXCHANGE, Made, Ticks, blob, brought_by, commit, ids, made, pack_of, push_and_move, sealed,
-  store, tree,
+  EXCHANGE, Made, Ticks, blob, brought_by, commit, ids, made, pack_of, push_and_move_refused_first,
+  sealed, store, tree,
 };
 
 /// Shape: the paths the generated histories edit: two at the top, two in `d`, one in `d/e`, one in `f`.
@@ -356,10 +356,11 @@ impl Real {
     }
   }
 
-  /// `objects` pushed and `moves` committed ([`push_and_move`]), and kept for a replay.
+  /// `objects` pushed and `moves` committed, refused first at each point after its plan
+  /// ([`push_and_move_refused_first`]), and kept for a replay.
   fn pushed(&mut self, objects: Vec<Made>, moves: &[(u64, Option<ObjectId>)]) {
-    self.pushes.push((objects.clone(), moves.to_vec()));
-    push_and_move(&mut self.repository, &mut self.store, objects, moves).unwrap();
+    push_and_move_refused_first(&mut self.repository, &mut self.store, &objects, moves);
+    self.pushes.push((objects, moves.to_vec()));
   }
 
   /// The store made again from the pushes this one committed, in order, as a restart's replay makes it (A-614
@@ -599,6 +600,7 @@ fn check(real: &Real, model: &Model) {
   }
   check_rows(real, model);
   check_packs(real, model);
+  real.repository.assert_charged_whole();
 }
 
 proptest! {
@@ -612,7 +614,9 @@ proptest! {
   /// first read; then make the store again from its pushes as a restart's replay does, and derive every version there.
   /// Expect: after every step every version's head and D(k), every reached set (each its head's closure), every
   /// commit's row and every path at every head as the map model computes them; no row for an object no push committed;
-  /// an abandoned push changing no byte of the store; the replay walking nothing, and the store it made reading as the
+  /// an abandoned push changing no byte of the store; each push's commit refused first at each point after its plan,
+  /// every refusal leaving the repository's records and its store's bytes as they were, and the charge kept equal to
+  /// its whole recomputation after every step (P2); the replay walking nothing, and the store it made reading as the
   /// model too; and each store empty once its repository is released.
   #[test]
   fn the_git_store_reads_as_its_map_model_over_every_history(sha256 in any::<bool>(), ops in proptest::collection::vec(op(), 1..24)) {

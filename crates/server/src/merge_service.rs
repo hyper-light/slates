@@ -166,6 +166,10 @@ pub struct MergeShardState {
   pub(crate) checkpoints_changed: BTreeSet<ObjectId>,
   /// The greens this holder refused for good after a recomputation mismatch (fatal-and-loud).
   pub refused: BTreeSet<ObjectId>,
+  /// Each green whose latest merge record this holder did not accept, with its version and the reason's counter
+  /// (`note_unaccepted`): what is logged once a reason. Bounded by the greens with a record not accepted here; one goes
+  /// once its record is accepted.
+  pub(crate) unaccepted: BTreeMap<ObjectId, (u64, &'static str)>,
   /// On a holder: each green's membership of its repository's lineage, as the names-log parts this node holds record it
   /// (A-908; `LoggedChange::Joined`, removed at `Left`): how a holder makes a member's replica as the owner makes the
   /// member, a root founding its lineage, a branch branched from its source. One entry a member of a names log held here.
@@ -2772,7 +2776,7 @@ impl PendingGreen {
       .map(|(version, pending)| {
         format!(
           "v{version}: record candidates {:?} acked {:?} joint {:?}; inputs acked {:?}; lacking {:?}; building {:?}; \
-           behind {:?}; shipments {}",
+           behind {:?}; catching up {:?}; shipments {}",
           pending.record.candidates,
           pending.record.acked,
           pending.record.joint,
@@ -2780,6 +2784,7 @@ impl PendingGreen {
           pending.lacking.keys().collect::<Vec<_>>(),
           pending.building,
           pending.behind,
+          pending.catching_up,
           pending.shipments,
         )
       })
@@ -2929,6 +2934,12 @@ pub struct PendingMergeRecord {
   /// replica holds, `None` for none of the green: the latest answer alone, so it holds one entry a target. Bounded by
   /// the candidates; a target leaves once it acknowledges.
   pub behind: BTreeMap<HostId, Option<u64>>,
+  /// Each target that answered it is catching up to the configuration the record names
+  /// (`ContentMessage::CatchingUp`, A-936), with the highest such configuration it answered: a push's barrier reads it
+  /// rising as movement ([`catching_up_heard`]), so an answer counts once per target, version and configuration, and a
+  /// target that keeps answering at one configuration never moves it twice. Bounded by the candidates; a target leaves
+  /// once it acknowledges.
+  pub catching_up: BTreeMap<HostId, u64>,
   /// When it was enqueued, on the host's monotonic clock: what [`SUBMIT_PLACE`] times its placement from.
   pub enqueued_ns: u64,
   /// The shipments that carried its inputs so far ([`SUBMIT_SHIPMENTS`]): inputs larger than one shipment's bound
@@ -3795,6 +3806,7 @@ pub(crate) fn insert_pending(
       lacking: BTreeMap::new(),
       building: BTreeMap::new(),
       behind: BTreeMap::new(),
+      catching_up: BTreeMap::new(),
       enqueued_ns: slates_machine::clock::monotonic_ns(),
       shipments: 0,
       inputs_manifest: None,
@@ -4646,6 +4658,7 @@ fn record_behind_answers(
   answers: &[(HostId, Vec<u8>)],
 ) {
   let mut heard = 0u64;
+  let mut catching_up = 0u64;
   if let Some(pending) = state
     .merge
     .pending
@@ -4655,21 +4668,69 @@ fn record_behind_answers(
     pending
       .behind
       .retain(|host, _| !pending.record.acked.contains(host));
+    pending
+      .catching_up
+      .retain(|host, _| !pending.record.acked.contains(host));
     for (host, answer) in answers {
-      if let Ok(slates_cluster::content::ContentMessage::Behind {
-        object: behind,
-        sequence,
-        reached,
-      }) = slates_cluster::content::ContentMessage::decode(answer)
-        && behind == object
-        && sequence == version
-      {
-        pending.behind.insert(*host, reached);
-        heard = heard.saturating_add(1);
+      match slates_cluster::content::ContentMessage::decode(answer) {
+        Ok(slates_cluster::content::ContentMessage::Behind {
+          object: behind,
+          sequence,
+          reached,
+        }) if behind == object && sequence == version => {
+          pending.behind.insert(*host, reached);
+          heard = heard.saturating_add(1);
+        }
+        Ok(slates_cluster::content::ContentMessage::CatchingUp {
+          object: catching,
+          sequence,
+          generation,
+        }) if catching == object && sequence == version => {
+          note_catching_up(
+            &mut pending.catching_up,
+            *host,
+            generation,
+            &mut catching_up,
+          );
+        }
+        _ => {}
       }
     }
   }
   state.count(BEHIND_HEARD, heard);
+  state.count(CATCHING_UP_HEARD, catching_up);
+}
+
+/// Notes `host` catching up to `generation` for a pending version ([`PendingMergeRecord::catching_up`], A-936): kept only
+/// where it rises, so the barrier's movement counts once per target, version and configuration; `rose` counts each rise.
+fn note_catching_up(
+  catching: &mut BTreeMap<HostId, u64>,
+  host: HostId,
+  generation: u64,
+  rose: &mut u64,
+) {
+  let held = catching.entry(host).or_insert(0);
+  if generation > *held {
+    *held = generation;
+    *rose = rose.saturating_add(1);
+  }
+}
+
+/// Counter: a target's catching-up answer to a pending merge record that rose past the configuration it last answered
+/// ([`record_behind_answers`], A-936). Format: a counter name in the daemon's status report.
+const CATCHING_UP_HEARD: &str = "merge.catching_up.heard";
+
+/// The configurations every target catching up to one of `object`'s pending records answered, summed (A-936): it rises
+/// only as a target answers a newer configuration than it last did, and a push's barrier reads it as movement
+/// (`crate::state_log::push_progress`), as it reads a replica build's turns.
+pub(crate) fn catching_up_heard(state: &ShardState, object: ObjectId) -> u64 {
+  state.merge.pending.get(&object).map_or(0, |pending| {
+    pending
+      .records
+      .values()
+      .flat_map(|record| record.catching_up.values())
+      .fold(0u64, |sum, generation| sum.saturating_add(*generation))
+  })
 }
 
 /// Records what each target that did not acknowledge `version`'s record answered about its inputs, `manifest` (§4.16
@@ -5528,30 +5589,47 @@ pub(crate) fn accept_merge_record(
   peer_host: HostId,
   record: &Record,
 ) -> Vec<u8> {
+  let (reply, unaccepted) = judge_merge_record(state, local, peer_host, record);
+  note_unaccepted(state, (record, peer_host), unaccepted);
+  reply
+}
+
+/// [`accept_merge_record`]'s judgement: its reply, and why the record was not accepted, the counter its reason counts
+/// (`None` where it was accepted, or answered by a version 0's seeding).
+fn judge_merge_record(
+  state: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  record: &Record,
+) -> (Vec<u8>, Option<&'static str>) {
   if let Err(error) = crate::fleet::check_held_record(state, local, peer_host, record) {
     crate::fleet::count_record_refusal(state, record, &error);
-    return slates_db::register::encode_refusal(&error);
+    return (
+      slates_db::register::encode_refusal(&error),
+      Some(crate::fleet::record_refusal_kind(&error)),
+    );
   }
   let object = record.object;
   if state.merge.refused.contains(&object) {
     state.count(RECORD_GREEN_REFUSED, 1);
-    return Vec::new();
+    return (Vec::new(), Some(RECORD_GREEN_REFUSED));
   }
   if state.merge.fault.refuse_records {
     // Test support: the acknowledgement is withheld, so the owner's version cannot commit here.
     state.count(RECORD_WITHHELD, 1);
-    return Vec::new();
+    return (Vec::new(), Some(RECORD_WITHHELD));
   }
   let value = match MergeRecordValue::decode_record(&record.value) {
     Ok(value) => value,
     Err(refused) => {
-      state.count(refused.counter().unwrap_or(INPUTS_UNDECODABLE), 1);
-      return Vec::new();
+      let reason = refused.counter().unwrap_or(INPUTS_UNDECODABLE);
+      state.count(reason, 1);
+      return (Vec::new(), Some(reason));
     }
   };
   if record.sequence != value.version {
     state.count(OUT_OF_ORDER, 1);
-    return Vec::new();
+    return (Vec::new(), Some(OUT_OF_ORDER));
   }
   // A different value at a position this holder holds one is held first, which rewinds a replica built over the value
   // it replaces; the record is then served as the replica's next version (A-373).
@@ -5559,29 +5637,36 @@ pub(crate) fn accept_merge_record(
   match record_standing(state, object, value.version, peer_host) {
     None => {
       state.count(RECORD_NO_STANDING, 1);
-      return Vec::new();
+      return (Vec::new(), Some(RECORD_NO_STANDING));
     }
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
     Some(RecordStanding::Applied) => {
-      return crate::fleet::accept_held_record(state, local, peer_host, record);
+      return (
+        crate::fleet::accept_held_record(state, local, peer_host, record),
+        None,
+      );
     }
     Some(RecordStanding::Next) => {}
     Some(RecordStanding::Behind { reached }) => {
       state.count(BEHIND_ANSWERED, 1);
-      return slates_cluster::content::ContentMessage::Behind {
-        object,
-        sequence: value.version,
-        reached,
-      }
-      .encode();
+      return (
+        slates_cluster::content::ContentMessage::Behind {
+          object,
+          sequence: value.version,
+          reached,
+        }
+        .encode(),
+        Some(BEHIND_ANSWERED),
+      );
     }
   }
   // Version 0 of a green over a base: its replica is seeded from the origin a share at a time (A-286).
   if value.version == 0
     && let Some(manifest) = value.inputs
   {
-    return crate::merge_origin::seed_version_zero(
-      state, local, peer_host, record, &value, manifest,
+    return (
+      crate::merge_origin::seed_version_zero(state, local, peer_host, record, &value, manifest),
+      None,
     );
   }
   let inputs = match value.inputs {
@@ -5590,7 +5675,7 @@ pub(crate) fn accept_merge_record(
       Ok(held) => Some(held),
       Err(reason) => {
         state.count(reason, 1);
-        return Vec::new();
+        return (Vec::new(), Some(reason));
       }
     },
   };
@@ -5604,7 +5689,10 @@ pub(crate) fn accept_merge_record(
     state.store.budget.release(held.charge);
   }
   match recomputed {
-    Ok(()) => crate::fleet::accept_held_record(state, local, peer_host, record),
+    Ok(()) => (
+      crate::fleet::accept_held_record(state, local, peer_host, record),
+      None,
+    ),
     Err(reason) => {
       state.count(reason, 1);
       if reason == RECOMPUTE_MISMATCH {
@@ -5620,9 +5708,36 @@ pub(crate) fn accept_merge_record(
           peer_host
         );
       }
-      Vec::new()
+      (Vec::new(), Some(reason))
     }
   }
+}
+
+/// Logs a merge record this holder did not accept (main 01a20182's ruling of 2026-11-27 18:33: a914's first-death
+/// barrier red, a candidate holding the version before that never acknowledged the push's version): its green, version,
+/// sender and `unaccepted`, the reason's counter, once per green, version and reason, so a record shipped every period
+/// logs once. Accepted, the green's note goes. Bounded by the greens with a record not accepted here.
+fn note_unaccepted(
+  state: &mut ShardState,
+  (record, sender): (&Record, HostId),
+  unaccepted: Option<&'static str>,
+) {
+  let Some(why) = unaccepted else {
+    state.merge.unaccepted.remove(&record.object);
+    return;
+  };
+  let noted = (record.sequence, why);
+  if state.merge.unaccepted.insert(record.object, noted) == Some(noted) {
+    return;
+  }
+  slates_machine::log_line!(
+    "slates-server: partition {}: holder {:?} did not accept green {} version {} from {sender:?}: {why} at {} ns",
+    state.partition,
+    state.fleet.host(),
+    hex(&record.object.0),
+    record.sequence,
+    slates_rt::futures::now_ns()
+  );
 }
 
 /// A version's inputs gathered from this holder's hold, and the charge they hold against the shard's budget until the
@@ -6174,6 +6289,7 @@ mod tests {
       lacking: BTreeMap::new(),
       building: BTreeMap::new(),
       behind: BTreeMap::new(),
+      catching_up: BTreeMap::new(),
       enqueued_ns: 0,
       shipments: 0,
       inputs_manifest: None,
@@ -6295,6 +6411,7 @@ mod tests {
           lacking: BTreeMap::new(),
           building: BTreeMap::new(),
           behind: BTreeMap::new(),
+          catching_up: BTreeMap::new(),
           enqueued_ns: 0,
           shipments: 0,
           inputs_manifest: None,
@@ -6396,6 +6513,7 @@ mod tests {
             lacking: BTreeMap::new(),
             building: BTreeMap::new(),
             behind: BTreeMap::new(),
+            catching_up: BTreeMap::new(),
             enqueued_ns: 0,
             shipments: 0,
             inputs_manifest: None,
@@ -7163,6 +7281,7 @@ mod tests {
           lacking: BTreeMap::new(),
           building: BTreeMap::new(),
           behind: BTreeMap::new(),
+          catching_up: BTreeMap::new(),
           enqueued_ns: 0,
           shipments: 0,
           inputs_manifest: None,

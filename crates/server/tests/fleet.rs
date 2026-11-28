@@ -38412,6 +38412,87 @@ fn homing_counts(daemon: &Daemon) -> HomingCounts {
   ))
 }
 
+/// Shape: how long b and c wait before they answer each home message in the replica-build stall's red: past the first
+/// death's homing deadline, which follows the homing window as it is measured (A-914 (c)) and read 17.1 s at most in
+/// a914c's stretched first death, so the push during it is refused at its homing, on purpose.
+const PAST_THE_HOMING_NS: u64 = 30_000_000_000;
+
+/// The replica-build stall (main 01a20182's orders of 2026-11-27 18:08 and 19:03; a914 at 604aa12a0 run 10 and
+/// d08595c7e runs 1, 3, 5, 7 and 9, each after a refused first-death push). Do: on a four-node `f = 1` git fleet with a
+/// repository on a, push `main`; make b and c answer every home message past the homing's deadline
+/// ([`PAST_THE_HOMING_NS`], `Daemon::delay_home_answers`) and run a914's stretched first death, so its push is refused
+/// at its homing, on purpose; answer at once again, wait out f = 1's repair window ([`repair_window_closed`]); then the
+/// stretched second death, stopping c, and its push. Expect that push to land. Red before: a refused first push leaves
+/// b's replica of the green unbuilt (a holder builds one only when a later version needs it), so b builds it at the
+/// second death, replaying the repository's store from the region while c, one of its homes, has just died, and the push
+/// is refused at its barrier with b `ReplicaBuilding` at 0 turns (`unable to commit`).
+#[test]
+fn a_holders_first_replica_build_at_a_second_death_after_a_refused_push_lands_the_push() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), stores, lease) =
+    started_git_fleet_of("stall-after-refused", &["a", "b", "c", "d"]);
+  let mut fleet = founded_git_fleet(
+    "stall-after-refused",
+    (daemons, hosts),
+    stores,
+    (Some(lease), None),
+  );
+  let first = fleet.push(0, ("first.txt", b"main before any death\n"));
+  delay_home_answers_at(&fleet, PAST_THE_HOMING_NS);
+  let at_d = stretched_death(&mut fleet, 3, "after-d.txt");
+  delay_home_answers_at(&fleet, 0);
+  let (repaired, holders) = repair_window_closed(&fleet);
+  let at_c = stretched_death(&mut fleet, 2, "after-c.txt");
+  let catch_ups = catch_up_counts(&fleet);
+  fleet.stop();
+  eprintln!(
+    "stall-after-refused: first {first:?}; the first death's (window, push, taken, after) {at_d:?}; repaired {repaired} \
+     at {holders:?}; the second death's {at_c:?}; each survivor's (catching up answered, heard, refused foreign \
+     generation, behind heard, merge records shipped) {catch_ups:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before any death landed");
+  assert!(
+    at_d.1.is_err(),
+    "the first death's push was refused, on purpose"
+  );
+  assert!(
+    repaired && at_d.2,
+    "d was taken over and f = 1's repair window closed"
+  );
+  assert_eq!(at_c.1, Ok(()), "the push during the second death landed");
+}
+
+/// Each node's records answered `CatchingUp` (a holder behind the record's configuration), catching-up answers heard
+/// as an owner, records refused `ForeignGeneration`, `Behind` answers heard and merge records shipped (A-936's
+/// non-vacuity, and the kept version's reships), or why they could not be read.
+fn catch_up_counts(fleet: &GitFleet) -> Vec<Result<[u64; 5], ObserveError>> {
+  let names = [
+    "fleet.record.catching_up_answered",
+    "merge.catching_up.heard",
+    "fleet.record.refused.foreign_generation",
+    "merge.behind.heard",
+    "merge.record.shipped",
+  ];
+  fleet
+    .daemons
+    .iter()
+    .map(|daemon| {
+      let mut counts = [0; 5];
+      for (count, name) in counts.iter_mut().zip(names) {
+        *count = move_counter(daemon, name)?;
+      }
+      Ok(counts)
+    })
+    .collect()
+}
+
+/// Makes b and c, the fleet's nodes after a, wait `delay_ns` before they answer each home message (0: at once again).
+fn delay_home_answers_at(fleet: &GitFleet, delay_ns: u64) {
+  for daemon in fleet.daemons.iter().skip(1).take(2) {
+    daemon.delay_home_answers(delay_ns).unwrap();
+  }
+}
+
 /// A node's homing window as read from its status, or why it could not be ([`stretched_death`]'s readings).
 type WindowRead = Result<HomingWindowReading, ObserveError>;
 
@@ -38503,6 +38584,12 @@ fn poll_taken_over_and_unseated(survivors: &[Daemon], gone: HostId) -> bool {
     })
 }
 
+/// Shape: the coordinator periods A-934's test watches a's neighbourhood change not settle while the hold stands: its
+/// red settled within seconds of x's takeover and unseating (a settle is reported each period once all is placed), so
+/// this is that many times over, and leaves the test far inside CI's per-test cap, which the poll's whole budget (4,000
+/// periods) passed on Windows (diag 12, 289 s).
+const SETTLE_WATCH_PERIODS: u64 = 150;
+
 /// A-934 (main 01a20182's ruling of 2026-11-27 15:51, its item 2: §4.8's settle and the state logs). Do: on a four-node
 /// `f = 1` git fleet with a repository on a, push `main`; hold a's state-log parts off y, one of its two remote
 /// candidates (`Daemon::hold_state_log_shipping_from`), and push on top, so the names log's newest part is held by a and
@@ -38528,13 +38615,13 @@ fn a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_c
   let (x, y) = remote_candidates(&fleet);
   let second = push_with_part_held_from(&mut fleet, y);
   let taken = stop_and_take_over(&mut fleet, x);
-  let while_held = settled_within(&fleet, x);
+  let while_held = settled_within(&fleet, x, SETTLE_WATCH_PERIODS);
   let held = (
     names_positions(&fleet),
     fleet.daemons[0].repair_window_holders(fleet.repository),
   );
   fleet.daemons[0].hold_state_log_shipping(false).unwrap();
-  let lifted = settled_within(&fleet, x);
+  let lifted = settled_within(&fleet, x, PERIOD_BUDGET);
   let after = names_positions(&fleet);
   fleet.stop();
   eprintln!(
@@ -38598,10 +38685,10 @@ fn stop_and_take_over(fleet: &mut GitFleet, gone: HostId) -> bool {
 /// Whether a's neighbourhood change away from `gone` settles within [`RETIREMENT_DEADLINE`] (A-934's test): its placement
 /// neighbourhood without `gone`, and the council's settled neighbourhood for a fixed at its current one's version
 /// (`Daemon::council_settlement`).
-fn settled_within(fleet: &GitFleet, gone: HostId) -> bool {
+fn settled_within(fleet: &GitFleet, gone: HostId, periods: u64) -> bool {
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
   let own = fleet.hosts[0];
-  poll_until(&observed, RETIREMENT_DEADLINE, || {
+  poll_for_periods(&observed, RETIREMENT_DEADLINE, periods, || {
     let moved = !fleet.daemons[0].placement_neighbourhood()?.contains(&gone);
     let settlement = fleet.daemons[0].council_settlement(own)?;
     Ok(moved && settlement.is_some_and(|(settled, current)| settled == current))
@@ -39727,6 +39814,12 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
     });
   // What the node holding none of it would try first: never a, the stale creator (the skip); before, a.
   let tried_first = daemons[stranger].known_owner(object);
+  let route_view = daemons[stranger].route_view(object);
+  // An object of a's from before its false death that the stranger has no route of its own for, one nobody holds: its
+  // direct route comes from the configuration alone, which must still say a lost it (A-921 part 2's skip, main's ruling
+  // of 2026-11-27 20:48). Before, a's readmission dropped what the skip read, and this named a.
+  let unrouted = ObjectId::new(owner, ObjectId(id.bytes).local().wrapping_add(1));
+  let unrouted_first = daemons[stranger].known_owner(unrouted);
   let asked_a_before = summed_count(&daemons[0], "fleet.forward.refused.not_owner_here");
   let mut forwarded = Client::connect(daemons[stranger].instance());
   let served = poll_until(&observed, RETIREMENT_DEADLINE, || {
@@ -39743,7 +39836,8 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
   }
   eprintln!(
     "victims-volume: holders {holders:?}, stranger {stranger}; cut {cut} taken {taken} healed {healed} readmitted \
-     {readmitted}; served {served}; a asked {asked_a}; the stranger's claims {claims}; tried first {tried_first:?}"
+     {readmitted}; served {served}; a asked {asked_a}; the stranger's claims {claims}; tried first {tried_first:?}, \
+     the stranger's route view then {route_view:?}; an unrouted object of a's first tried {unrouted_first:?}"
   );
   assert!(
     placed && taken && readmitted,
@@ -39759,6 +39853,12 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
       .as_ref()
       .is_ok_and(|owner| *owner != Some(owner_host_of_a)),
     "the direct route never names a: {tried_first:?}"
+  );
+  assert!(
+    unrouted_first
+      .as_ref()
+      .is_ok_and(|owner| *owner != Some(owner_host_of_a)),
+    "a stranger's direct route, from the configuration alone, never names a: {unrouted_first:?}"
   );
 }
 
