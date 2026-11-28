@@ -47,6 +47,36 @@ pub struct Greens {
   releasing: bool,
   /// The holds the engines let go gave back (A-760 (b) 4d), owed to the content store's next free decision.
   given_back: Vec<slates_merge::engine::NameHold>,
+  /// The holds owed and not yet applied, its takes and its gives each in the order they were owed: a step applies them
+  /// from the front, the takes first ([`Greens::take_owed_holds`]; A-920 7c's bound, main's ruling of 2026-11-27
+  /// 21:46), so it moves no hold it does not apply.
+  owed: OwedHolds,
+}
+
+/// The holds owed and not yet applied ([`Greens::take_owed_holds`]): its takes and its gives, each in the order owed.
+#[derive(Default)]
+pub struct OwedHolds {
+  /// The takes, oldest first.
+  pub takes: VecDeque<slates_merge::named::Identity>,
+  /// The gives, oldest first.
+  pub gives: VecDeque<slates_merge::named::Identity>,
+}
+
+impl OwedHolds {
+  /// Whether none is owed.
+  pub fn is_empty(&self) -> bool {
+    self.takes.is_empty() && self.gives.is_empty()
+  }
+
+  /// `holds` owed after those owed already, each to its own queue.
+  fn owe(&mut self, holds: impl IntoIterator<Item = slates_merge::engine::NameHold>) {
+    for hold in holds {
+      match hold {
+        slates_merge::engine::NameHold::Take(name) => self.takes.push_back(name),
+        slates_merge::engine::NameHold::Give(name) => self.gives.push_back(name),
+      }
+    }
+  }
 }
 
 /// A repository's lineage taken out of one [`Greens`] whole, with its members' handles, to be put in another
@@ -254,6 +284,46 @@ impl Greens {
   /// those given back by the engines let go since: what the shard applies at its next free decision
   /// (`vcs_store::name_holds::freeing`). A lineage with a member taken out keeps its own until it is put back.
   pub fn take_name_holds(&mut self) -> Vec<slates_merge::engine::NameHold> {
+    let owed = std::mem::take(&mut self.owed);
+    let mut holds: Vec<slates_merge::engine::NameHold> = owed
+      .takes
+      .into_iter()
+      .map(slates_merge::engine::NameHold::Take)
+      .chain(
+        owed
+          .gives
+          .into_iter()
+          .map(slates_merge::engine::NameHold::Give),
+      )
+      .collect();
+    holds.extend(self.take_given_holds());
+    holds
+  }
+
+  /// The holds owed and not yet applied, moved out whole (O(1)), every hold the engines gave back since owed behind
+  /// them first: what a step of `vcs_store::name_holds::apply_some` applies from the front and puts back
+  /// ([`Greens::put_back_owed_holds`]), so it moves no hold it does not apply (A-920 7c's bound; red before: each step
+  /// took the whole list and pushed back what it left, quadratic in the holds).
+  pub fn take_owed_holds(&mut self) -> OwedHolds {
+    let given = self.take_given_holds();
+    self.owed.owe(given);
+    std::mem::take(&mut self.owed)
+  }
+
+  /// `owed`, taken by [`Greens::take_owed_holds`] and applied from its front in part, put back before any owed since
+  /// (none can be: a step's apply runs on its shard with no engine between); the count of holds owed since, which a
+  /// correct caller never meets.
+  pub fn put_back_owed_holds(&mut self, owed: OwedHolds) -> usize {
+    let since = std::mem::replace(&mut self.owed, owed);
+    let moved = since.takes.len().saturating_add(since.gives.len());
+    self.owed.takes.extend(since.takes);
+    self.owed.gives.extend(since.gives);
+    moved
+  }
+
+  /// The holds every engine here took and gave back since the last call, the given-back list's first: what
+  /// [`Greens::take_name_holds`] gathers behind the holds owed already.
+  fn take_given_holds(&mut self) -> Vec<slates_merge::engine::NameHold> {
     let mut holds = std::mem::take(&mut self.given_back);
     for green in self.alone.values_mut() {
       holds.extend(green.track_name_holds());
@@ -266,11 +336,10 @@ impl Greens {
     holds
   }
 
-  /// Puts `holds`, taken by [`Greens::take_name_holds`] and not yet applied, back before any owed since, in order: the
-  /// next free decision applies them first (`vcs_store::name_holds::apply_some`, A-920 7c).
-  pub fn put_back_name_holds(&mut self, mut holds: Vec<slates_merge::engine::NameHold>) {
-    holds.append(&mut self.given_back);
-    self.given_back = holds;
+  /// `holds` owed before any owed since, each in order: a test's owed holds.
+  #[cfg(test)]
+  pub fn owe_name_holds(&mut self, holds: Vec<slates_merge::engine::NameHold>) {
+    self.owed.owe(holds);
   }
 
   /// Installs a lone engine for `id`; the engine it replaced, its holds given back (it is the caller's, untracked).

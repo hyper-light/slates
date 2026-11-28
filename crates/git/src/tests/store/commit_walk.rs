@@ -183,7 +183,8 @@ fn a_landing_of_several_moves_maps_none_of_its_positions_in_its_step() {
   assert!(store.is_empty());
 }
 
-/// Maps every unsettled landing of `repository` in turns of a unit's quantum: the turns taken.
+/// Maps every unsettled landing of `repository` in turns of a unit's quantum, each turn answering done exactly when none
+/// is left: the turns taken.
 fn settle_all(repository: &mut Repository, store: &mut slates_vcs::ContentStore) -> u64 {
   let mut clock = Ticks(0);
   let mut turns = 0_u64;
@@ -193,8 +194,54 @@ fn settle_all(repository: &mut Repository, store: &mut slates_vcs::ContentStore)
       clock: &mut clock,
       ns: 1,
     };
-    if repository.settle_landings_turn(store, quantum).unwrap() {
+    let done = repository.settle_landings_turn(store, quantum).unwrap();
+    // A turn answers done exactly when none is left, so its task gives its slot back that turn (a quantum spent on the
+    // last landing's runs once answered more, and the server's task held its slot a turn past the landing's mapping).
+    assert_eq!(done, !repository.landings_unsettled(), "turn {turns}");
+    if done {
       return turns;
     }
   }
+}
+
+/// P2 piece 3 (CLAUDE.md §3: a step over user-scaled data is bounded). Do: stage one push of a line of 600 commits and
+/// land it moving one green. Expect: the landing's step frees none of the push's maps by object. The push holds none
+/// after it, and gives up every entry it held, with the positions its stage gave, to be freed after the step
+/// (`Push::take_shedding`). They are freed an entry a unit in more than one turn, none left, and the store is empty
+/// once released. Red before: the step freed the push's commits and places and the stage's positions, and gave up
+/// nothing.
+#[test]
+fn a_landing_frees_none_of_its_pushs_maps_by_object_in_its_step() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let objects: Vec<Made> = line(format, BROUGHT).into_iter().flatten().collect();
+  let mut push = staged_push(&mut repository, &mut store, objects.clone());
+  let held = push.held_entries();
+  let admitted = repository
+    .admit(&store, &push, 1, Some(head_of(&objects)))
+    .unwrap();
+  repository
+    .commit(&mut store, &mut push, &[admitted])
+    .unwrap();
+  let mut shedding = push.take_shedding();
+  let given_up = held.saturating_add(u64::try_from(objects.len()).unwrap());
+  assert_eq!((push.held_entries(), shedding.len()), (0, given_up));
+  let mut clock = Ticks(0);
+  let (mut turns, mut freed) = (0_u64, 0_u64);
+  loop {
+    turns = turns.saturating_add(1);
+    let (done, now) = shedding.turn(Quantum {
+      clock: &mut clock,
+      ns: 1,
+    });
+    freed = freed.saturating_add(now);
+    if done {
+      break;
+    }
+  }
+  assert_eq!((freed, shedding.is_empty()), (given_up, true));
+  assert!(turns > 1, "freed in {turns} turn");
+  repository.release(&mut store).unwrap();
+  assert!(store.is_empty());
 }

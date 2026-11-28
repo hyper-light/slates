@@ -362,6 +362,12 @@ pub(crate) struct VcsStores {
   /// The git repositories whose landings of several moves a task maps by position now ([`settle_landings_sliced`]):
   /// bounded by the partition's repositories.
   settling_landings: std::collections::BTreeSet<RepositoryId>,
+  /// Landed pushes' maps by object being freed a slice a turn ([`shed_sliced`]), and whether the task that frees them
+  /// runs: bounded by the pushes landed since it last ran.
+  shedding: (
+    std::collections::VecDeque<slates_git::store::Shedding>,
+    bool,
+  ),
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
@@ -2786,6 +2792,8 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   sealed.objects = RecordWriter::default();
   sealed.homed_committed();
   settle_landings_sliced(state, repository);
+  let shedding = sealed.push.take_shedding();
+  shed_sliced(state, shedding);
   // A synchronous audit shard's history can bring nothing back (a bring-back awaits the node's store), so its landed
   // packs stay resident ([`KEEP_LANDED`]); a daemon's edges and tasks, and every let-go test, let them go.
   #[cfg(test)]
@@ -2850,6 +2858,12 @@ impl VcsStores {
   pub(crate) fn settles(&self, id: RepositoryId) -> bool {
     self.settling_landings.contains(&id)
   }
+
+  /// The landed pushes' maps by object still queued to be freed ([`shed_sliced`]), and whether its task runs.
+  #[cfg(test)]
+  pub(crate) fn sheds(&self) -> (usize, bool) {
+    (self.shedding.0.len(), self.shedding.1)
+  }
 }
 
 /// One turn of repository `id`'s landings mapped by position, for the shard's step quantum, a unit at least: whether
@@ -2879,6 +2893,65 @@ fn settle_landings_turn(state: &mut ShardState, id: RepositoryId) -> bool {
     }
   }
 }
+
+/// Queues what a landed push gave up of its maps by object (`slates_git::store::Shedding`, P2 piece 3) to be freed a
+/// slice a turn, never in the landing's step, and starts the task that frees the queue where none runs. Unspawned,
+/// counted [`SHED_UNSPAWNED`], the queue waits for the next landing to start one.
+fn shed_sliced(state: &mut ShardState, shedding: slates_git::store::Shedding) {
+  if shedding.is_empty() {
+    return;
+  }
+  state.vcs_stores.shedding.0.push_back(shedding);
+  if state.vcs_stores.shedding.1 {
+    return;
+  }
+  state.vcs_stores.shedding.1 = true;
+  let turns = async {
+    loop {
+      // Each slice waits while a publication of the shard's image is owed past its bound (A-870 piece 2), as the
+      // landed let-go's do.
+      crate::content_holder::image_resumed().await;
+      if crate::state::with_state_counted(shed_turn) != Some(false) {
+        break;
+      }
+      slates_rt::futures::yield_now().await;
+    }
+    let _ = crate::state::with_state_counted(|state| state.vcs_stores.shedding.1 = false);
+  };
+  let spawned = slates_rt::futures::spawn(turns).and_then(slates_rt::futures::detach);
+  if spawned.is_err() {
+    state.vcs_stores.shedding.1 = false;
+    state.count(SHED_UNSPAWNED, 1);
+  }
+}
+
+/// One turn of the queue [`shed_sliced`] keeps: the oldest landed push's maps freed an entry a unit for the shard's
+/// step quantum, a unit at least, counted [`SHED_ENTRIES`]. Whether the queue is empty.
+fn shed_turn(state: &mut ShardState) -> bool {
+  let ns = state.config.step_quantum_ns();
+  let mut clock = crate::git_push::ShardClock;
+  let queue = &mut state.vcs_stores.shedding.0;
+  let Some(oldest) = queue.front_mut() else {
+    return true;
+  };
+  let (done, freed) = oldest.turn(slates_git::store::hook_view::Quantum {
+    clock: &mut clock,
+    ns,
+  });
+  if done {
+    queue.pop_front();
+  }
+  let empty = queue.is_empty();
+  state.count(SHED_ENTRIES, freed);
+  empty
+}
+
+/// Format: the status counter of the entries of landed pushes' maps by object freed after their landings' steps
+/// (`shed_turn`).
+pub(crate) const SHED_ENTRIES: &str = "vcs_store.landed.shed_entries";
+
+/// Format: the status counter of the tasks to free landed pushes' maps that could not be spawned (`shed_sliced`).
+pub(crate) const SHED_UNSPAWNED: &str = "vcs_store.landed.shed_unspawned";
 
 /// Format: the status counter of the tasks to map a repository's landings of several moves that could not be spawned
 /// (`settle_landings_sliced`): the landings wait for the repository's next commit.
