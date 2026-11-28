@@ -97,9 +97,62 @@ pub(crate) const UNJOINED_LOG_WHOLE: &str = "merge.takeover.adopted_unjoined.log
 #[derive(Debug, Default)]
 pub(crate) struct LedgerReads {
   wanted: BTreeMap<ObjectId, Wanted>,
-  /// The registers whose last read went past tolerance (A-927 part 2: a successor's adoption refuses on it, never reads
-  /// again for it). Bounded by the registers this node holds an acceptor of: pruned to them as one is added.
-  past_tolerance: std::collections::BTreeSet<ObjectId>,
+  /// The registers whose last read went past tolerance, each with the configuration version this node had installed
+  /// then (A-927 part 2: a successor's adoption refuses on it). Refused only while that configuration stands
+  /// ([`LedgerReads::refuses_past_tolerance`]): a read past tolerance while this node's candidacy was still owed found
+  /// nothing it could hold, and once its configuration moves (its candidacy installed, another member gone) the same read
+  /// can find the cohort it lacked, so the next ask reads again, once an install (main 01a20182's reading of 2026-11-27
+  /// 22:09: winfleet-3's a935 red, one read past tolerance and 52 `Behind` answers after it never read again). Bounded by
+  /// the registers this node holds an acceptor of: pruned to them as one is added.
+  past_tolerance: BTreeMap<ObjectId, u64>,
+}
+
+impl LedgerReads {
+  /// Whether `register`'s read is refused for going past tolerance under the configuration `installed` (one read an
+  /// install, [`LedgerReads::past_tolerance`]): a mark made under an older configuration is let go, counted
+  /// [`READ_AGAIN_AFTER_INSTALL`] by the caller, and the read goes ahead.
+  fn refuses_past_tolerance(&mut self, register: ObjectId, installed: u64) -> PastTolerance {
+    match self.past_tolerance.get(&register) {
+      None => PastTolerance::Clear,
+      Some(marked) if *marked >= installed => PastTolerance::Refused,
+      Some(_) => {
+        self.past_tolerance.remove(&register);
+        PastTolerance::ReadAgain
+      }
+    }
+  }
+}
+
+/// What a register's last read past tolerance says of a read now ([`LedgerReads::refuses_past_tolerance`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PastTolerance {
+  /// No read of it went past tolerance.
+  Clear,
+  /// One did under the configuration installed now: refused.
+  Refused,
+  /// One did under an older configuration: its mark let go, read again.
+  ReadAgain,
+}
+
+/// Counter: a register read again after its last read went past tolerance under an older configuration
+/// ([`LedgerReads::refuses_past_tolerance`]). Format: a counter name in the daemon's status report.
+pub(crate) const READ_AGAIN_AFTER_INSTALL: &str = "fleet.ledger_read.read_again_after_install";
+
+/// Whether `register`'s read goes ahead given its last read past tolerance, counting one read again
+/// ([`LedgerReads::refuses_past_tolerance`]).
+fn past_tolerance_clears(state: &mut ShardState, register: ObjectId) -> bool {
+  let installed = state.fleet.configuration().version;
+  match state
+    .ledger_reads
+    .refuses_past_tolerance(register, installed)
+  {
+    PastTolerance::Clear => true,
+    PastTolerance::Refused => false,
+    PastTolerance::ReadAgain => {
+      state.count(READ_AGAIN_AFTER_INSTALL, 1);
+      true
+    }
+  }
 }
 
 /// What a successor's adoption of a family green whose join it does not know does next (A-927 part 2, [`join_read`]).
@@ -154,7 +207,7 @@ pub(crate) fn want_chain(
   held: Option<u64>,
   through: u64,
 ) -> bool {
-  if state.ledger_reads.past_tolerance.contains(&register) {
+  if !past_tolerance_clears(state, register) {
     return false;
   }
   let fresh = !state.ledger_reads.wanted.contains_key(&register);
@@ -174,7 +227,7 @@ pub(crate) fn join_read(state: &mut ShardState, green: ObjectId) -> JoinRead {
   if crate::merge_service::membership(state, crate::merge_service::replica_key(green)).is_some() {
     return JoinRead::Joined;
   }
-  if state.ledger_reads.past_tolerance.contains(&register) {
+  if !past_tolerance_clears(state, register) {
     return JoinRead::Unjoined(UNJOINED_PAST_TOLERANCE);
   }
   if state.ledger_reads.wanted.contains_key(&register) {
@@ -488,8 +541,9 @@ async fn read_once(
       let held = &s.holder_records;
       s.ledger_reads
         .past_tolerance
-        .retain(|kept| held.get(kept).is_some());
-      s.ledger_reads.past_tolerance.insert(register);
+        .retain(|kept, _| held.get(kept).is_some());
+      let installed = s.fleet.configuration().version;
+      s.ledger_reads.past_tolerance.insert(register, installed);
       return;
     }
     let held = hold_adopted(s, (register, wanted.owner), local, &adoption.adopted);
@@ -625,4 +679,33 @@ fn hold_adopted(
     }
   }
   held
+}
+
+#[cfg(test)]
+mod past_tolerance_tests {
+  use super::{LedgerReads, PastTolerance};
+  use slates_db::register::ObjectId;
+
+  /// A read past tolerance is refused again only while the configuration it went past under stands (main 01a20182's
+  /// reading of 2026-11-27 22:09, winfleet-3's a935 red: a newcomer's one chain read, past tolerance while its candidacy
+  /// was owed, never read again). Do: mark a register past tolerance at configuration 5; ask under 5, then under 6, then
+  /// under 6 again. Expect refused, then read again (its mark let go), then clear.
+  #[test]
+  fn a_read_past_tolerance_is_read_again_once_an_install_moves_the_configuration() {
+    let register = ObjectId([9; 16]);
+    let mut reads = LedgerReads::default();
+    reads.past_tolerance.insert(register, 5);
+    assert_eq!(
+      reads.refuses_past_tolerance(register, 5),
+      PastTolerance::Refused
+    );
+    assert_eq!(
+      reads.refuses_past_tolerance(register, 6),
+      PastTolerance::ReadAgain
+    );
+    assert_eq!(
+      reads.refuses_past_tolerance(register, 6),
+      PastTolerance::Clear
+    );
+  }
 }
