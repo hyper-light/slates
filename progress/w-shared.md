@@ -773,3 +773,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Pushed: 9feb04958, 834c9a3dc, bda853c47 and the merge. Main runs the wall and a914 x16.
 - The first-death push assertion was held back: one run tripped A-914 (c) (homing `retry`). Options sent to main; the patch is in ~/.local/state/w-shared/patches/.
 - Next: log the 0 ms connect refusal on a live node's vcs_http_port (bind, close and the test's connect, with times).
+
+## 2026-11-27 17:29 PST: port logs and a914 (d2) landed (slates 5c6f50367)
+- 310636d1a: the edge logs its listener's bind and close (a Drop guard); a failed test connect logs its port, time and a probe.
+- 5c6f50367: a refused first-death push fails a914 at once, told by slates_server::HOMED_SHORT.
+- Next: the green sibling (GAP-A9-7 record half), red first: a quiet newcomer must hold each green's newest placed version.
