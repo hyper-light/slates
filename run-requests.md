@@ -7715,3 +7715,9 @@ At or past the tip carrying the encode keep's slice (named in w-git's landing no
 - **Platform:** macOS arm64 (the MacBook), release, quiet if possible; stock `hg` on PATH.
 - **Command, from the worktree root at 0f5e9faee or later:** `cargo test --release -p slates-hg --lib -- a_shards_first_gathering_steps_are_held_to_their_slice_at_the_probes_first_cost --nocapture`. Run it three times. It prints "first cost: N ns a row (B bytes at R B/s); K budget-ended gathering steps, p50 P ns, most M; the slice S ns".
 - **Red would be:** p50 above the slice plus one row's cost, which fails the test. Also worth reading: the first cost against about 84 ns a row (the release cost learned online at 54fb9a3ba, BENCHMARKS and GAPS). N far above it means the probe overestimates and a shard's first stream runs a row a step until it learns; N under it means the first stream runs past its slices.
+
+## 2026-11-28 01:54 PST, w-interop: the hg incremental push's counters (1360fd527)
+- **Why:** main's order (the one-changeset push after the whole-history push, 12.2x stock's at 47e37df66). Logs first: round 3's record has no counters around that push, and the anchor log has one owner line, "a texts request served in 188106000 ns, 47770000 ns behind other work".
+- **Platform:** macOS arm64, release, as main's hg rounds run.
+- **Command:** main's `~/slates-work/main-ship/hg-stream-round.sh` at 1360fd527 or later, unchanged (hg_scale.sh now keeps `status.before-incremental-push-RUN.json` and `.after-` with KEEP_LOGS). One run is enough, `... hg_scale.sh hg SRC WORK 1 3600`.
+- **What to send me:** the line "slates moved incremental-push RUN: name=delta ..." from results.txt, every counter the push moved, largest first, and the two status files. Nothing in it is red by itself; it's what the next piece reads.
