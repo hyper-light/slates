@@ -1471,7 +1471,7 @@ fn fetch_after_tagged_push(
     assert!(said.iter().all(|reason| reason == b"ok"));
     read_on_the_shard(daemon, repository, (None, neighbour))
   };
-  let took_ns = read
+  let (took_ns, brought) = read
     .recv()
     .expect("the read answered")
     .unwrap_or_else(|missed| panic!("{missed}"));
@@ -1481,21 +1481,25 @@ fn fetch_after_tagged_push(
     yielded: after[4] - before[4],
     handed: after[2] - before[2],
     took_ns,
+    brought,
   }
 }
 
 /// What [`fetch_after_tagged_push`] saw of a fetch's derivation: its read turns, those of them it gave the shard's
-/// other tasks, the hand-overs, and its own time.
+/// other tasks, the hand-overs, its own time, and the let-go windows brought back on its shard while it read (a landed
+/// pack's let-go behind the push may run during the read, whose reads then bring its windows back: the design's own
+/// interleaving, read in main 01a20182's A/B of 2026-11-28).
 #[derive(Debug)]
 struct Fetched {
   turns: u64,
   yielded: u64,
   handed: u64,
   took_ns: u64,
+  brought: u64,
 }
 
 /// A fetch's read of `repository` ([`git_derive::derive_for_read`]) as a task of the shard, timed there from its start to
-/// its end. Given `pushed` (set once the push behind which the read must arrive has answered), it waits first, a step
+/// its end, with the let-go windows brought back on the shard meanwhile. Given `pushed` (set once the push behind which the read must arrive has answered), it waits first, a step
 /// quantum at a time, until the derivation behind that push has kept a turn under way while its task still runs, and
 /// begins in that same poll, so the task behind cannot finish between the look and the read. Refused where the task
 /// behind ended before a look found its derivation under way, or where none began behind a push that answered.
@@ -1505,7 +1509,7 @@ fn read_on_the_shard(
   daemon: &crate::Daemon,
   repository: RepositoryId,
   (pushed, neighbour): (Option<&'static std::sync::atomic::AtomicBool>, bool),
-) -> std::sync::mpsc::Receiver<Result<u64, String>> {
+) -> std::sync::mpsc::Receiver<Result<(u64, u64), String>> {
   use crate::vcs_store::git_derive::{BEHIND, behind_and_under_way, derive_for_read};
   let (done, read) = std::sync::mpsc::channel();
   crate::daemon::observe_first(daemon, move |state| {
@@ -1535,13 +1539,17 @@ fn read_on_the_shard(
         }
       }
       let neighbour = neighbour.then(yielding_neighbour);
+      let brought_before = crate::state::with_state(|state| brought_back_count(state)).unwrap_or(0);
       let began = slates_rt::futures::now_ns();
       derive_for_read(repository).await;
       let took = slates_rt::futures::now_ns().saturating_sub(began);
+      let brought = crate::state::with_state(|state| brought_back_count(state))
+        .unwrap_or(0)
+        .saturating_sub(brought_before);
       if let Some(ended) = neighbour {
         ended.store(true, std::sync::atomic::Ordering::Release);
       }
-      let _ = done.send(Ok(took));
+      let _ = done.send(Ok((took, brought)));
     })
     .expect("the read's task");
     slates_rt::futures::detach(task).expect("the read's task detached");
@@ -1633,7 +1641,10 @@ fn a_fetch_arriving_mid_derivation_is_no_later_than_one_with_nothing_behind() {
   let mid = fetch_after_tagged_push(&daemon, "mid-derivation", (true, false));
   let alone = fetch_after_tagged_push(&daemon, "nothing-behind", (false, false));
   daemon.stop();
-  eprintln!("mid-derivation: {mid:?}; alone: {alone:?}");
+  eprintln!(
+    "mid-derivation: {mid:?}; alone: {alone:?}; windows brought back while handed {}, alone {}",
+    mid.brought, alone.brought
+  );
   assert_turns_alone_but_the_hand_overs(&mid, &alone);
   assert!(
     mid.took_ns <= 2 * alone.took_ns,
