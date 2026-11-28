@@ -1065,7 +1065,7 @@ fn build_whole(
   with_trees(made, root, held).map(|(root, trees)| Some((root, trees, Stepped::Built)))
 }
 
-/// Gives back each hold of `held` in `repository`'s content store, as [`made`] gives back a refused step's.
+/// Gives back each hold of `held` in `repository`'s content store, as [`made_holding`] gives back a refused step's.
 fn give_back(stores: &mut VcsStores, repository: RepositoryId, held: &[ContentId]) {
   if let Some((content, _)) = stores.git(repository) {
     for id in held {
