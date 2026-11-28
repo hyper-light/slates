@@ -591,6 +591,14 @@
 >     which no longer waits on them. Red first, both: the peers re-keyed a within its 1 s detection (22 to 197 ms,
 >     against 4.4 to 7.6 s), and no peer condemned a while a silent one held its edges (3 of 3 red before). The
 >     adoption guard is gone, and A919's owner-restart test runs again (6 of 6 with the owed-part scene).
+>   - **FIXED, A-921 part 5's re-key window (w-shared, 2026-11-28; main 01a20182's ruling of 00:42):** on
+>     windows-11-arm the answers-peers test went red 5 then 7 runs in 16 (winfleet-5, -6): a peer's detector condemned
+>     the warm-restarted a by its own probes 327 to 669 ms after its last answer, two or three 65-87 ms periods, before
+>     it re-keyed a (a refuted at incarnation 1 once keyed). A peer now holds a's probes unjudged from learning of its
+>     new process until the re-key's install or one detection (`fleet.plane.rekey_*`), a local change to vendored
+>     hyper-swim (`Detector::hold_judging`, vendor README item 4). Bound: a process that dies just after its restart
+>     is condemned within one detection plus `detection_bound`. **Owed:** proposed to hyper-raft's owner as a feature
+>     gate (through Ada); main reruns winfleet on both Windows lanes.
 >   - **FIXED, v3_takeover's adoption stall (A-933, w-shared, 2026-11-27):** about 1 run in 80 on Linux CI, a
 >     successor gave a taken-over green up "waiting on its adoption". Its rebuild could reach neither the record
 >     adoption (A-364: it checked the adopted record alone, so a successor short of version 0 never became

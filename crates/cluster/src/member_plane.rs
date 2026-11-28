@@ -516,6 +516,13 @@ impl MemberPlane {
     &self.detector
   }
 
+  /// Holds `peer`'s probes unjudged while its owner re-keys the peer's restarted process, or judges them again (A-921
+  /// part 5; vendored hyper-swim's local `Detector::hold_judging`): held, an unanswered probe of it is counted
+  /// (`Detector::unjudged`), never suspecting it or making its condemnation pending. Whether the detector holds `peer`.
+  pub fn hold_judging(&mut self, peer: HostId, held: bool) -> bool {
+    self.detector.hold_judging(hyper_swim::HostId(peer.0), held)
+  }
+
   /// The detector's period tail and the largest of its recent periods (A-914), each `None` before one was timed.
   pub fn period_reading(&self) -> (Option<u64>, Option<u64>) {
     (self.periods.tail_ns(), self.recent_periods.max_ns())

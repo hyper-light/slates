@@ -1113,3 +1113,84 @@ fn a_far_member_that_dies_is_condemned_by_every_survivor_and_no_live_one_is() {
     "a survivor's own probes condemned the far member, within its stated bound"
   );
 }
+
+/// Shape: the unanswered probes of its silent member each holder in
+/// [`a_restarted_member_held_unjudged_through_its_rekey_is_condemned_only_once_released`] holds unjudged: twice the two
+/// or three in which SWIM condemns an unanswered, told member.
+const REKEY_HELD_PROBES: u64 = 6;
+
+/// A-921 part 5's re-key window at the plane (main's ruling of 2026-11-28 00:42; windows-11-arm, winfleet-5 and -6, 5
+/// and 7 runs in 16). A peer holds a warm-restarted member's probes unjudged from learning of its new process until it
+/// re-keys it: until then they reach the member under its old process's keys, unanswered, and it cannot refute a
+/// suspicion it cannot hear. Do: three members, every pair judged; member 3 falls silent both ways (its process
+/// restarting, unkeyed), and members 1 and 2 hold its probes unjudged (`MemberPlane::hold_judging`) until each has held
+/// [`REKEY_HELD_PROBES`] of them; then release it, member 3 still silent. Expect: while held, neither holds member 3 dead
+/// (red before: condemned after two or three unanswered probes, 327 to 669 ms after its last answer at 65 to 87 ms
+/// periods on windows-11-arm), each counting its held probes (`Detector::unjudged`, the non-vacuity); released, both
+/// come to hold it dead.
+#[test]
+fn a_restarted_member_held_unjudged_through_its_rekey_is_condemned_only_once_released() {
+  let mut fleet = judged_network();
+  fleet.killed.push(3);
+  for holder in HOLDERS {
+    let member = fleet.members.get_mut(&holder).unwrap();
+    assert!(
+      member.hold_judging(HostId(3), true),
+      "member {holder} holds member 3"
+    );
+  }
+  let held = fleet.run_until(HORIZON_NS, |fleet| {
+    for holder in HOLDERS {
+      assert_ne!(
+        fleet.liveness(holder, 3),
+        Some(Liveness::Dead),
+        "member {holder} condemned member 3 while it held its probes unjudged"
+      );
+    }
+    HOLDERS
+      .iter()
+      .all(|holder| fleet.members[holder].detector().unjudged() >= REKEY_HELD_PROBES)
+  });
+  assert!(
+    held,
+    "each holder held {REKEY_HELD_PROBES} probes of member 3 unjudged"
+  );
+  for holder in HOLDERS {
+    fleet
+      .members
+      .get_mut(&holder)
+      .unwrap()
+      .hold_judging(HostId(3), false);
+  }
+  let started = fleet.now_ns;
+  let condemned = fleet.run_until(started + HORIZON_NS, |fleet| {
+    HOLDERS
+      .iter()
+      .all(|holder| fleet.liveness(*holder, 3) == Some(Liveness::Dead))
+  });
+  assert!(
+    condemned,
+    "released, member 3 still silent is condemned by both"
+  );
+}
+
+/// Shape: the members that hold member 3 in
+/// [`a_restarted_member_held_unjudged_through_its_rekey_is_condemned_only_once_released`]: the other two.
+const HOLDERS: [u64; 2] = [1, 2];
+
+/// A three-member network run until every pair's detector has configured from its evidence.
+fn judged_network() -> Network {
+  let mut fleet = Network::new();
+  let judged = fleet.run_until(HORIZON_NS, |fleet| {
+    (1..=MEMBERS).all(|me| {
+      (1..=MEMBERS).filter(|peer| *peer != me).all(|peer| {
+        fleet.members[&me]
+          .detector()
+          .verdict(hyper_swim::HostId(peer))
+          .is_some()
+      })
+    })
+  });
+  assert!(judged, "every pair's detector configured from its evidence");
+  fleet
+}
