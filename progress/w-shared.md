@@ -808,3 +808,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - The catch-up runs on the forward lane (an inline wait held the session carrying the council's appends); "newer" also covers the copy's acceptor authority (the install walk lags), with install_on_copy ahead.
 - Result: foreign_generation refusals 15 to 0; caught up 2, short 0. Still red: the barrier window expired during the 1.9 s catch-up wait; v2 accepted at the barrier's moment.
 - Asked main: (a) a typed catching-up answer counted as barrier progress (recommended), (b) widen the window during config change, (c) none.
+
+## 2026-11-27 19:56 PST: A-936 landed (slates 69fbc8de0)
+- a494ebac8: the holder answers CatchingUp (kind 12) to a newer-configuration record; the barrier counts each (holder, version, generation) once; install_on_copy ahead of the walk.
+- Stall red 2/3 locally; the remaining red (a build at no turn) is now logged. Units 21/21 + 66/66; fleet 8/8.
+- Next: main's x16; then bound the kept-v1 reships to a holder answering Behind (9 a run).
