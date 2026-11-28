@@ -2953,6 +2953,10 @@ struct CommitRun {
   changed: ChangedPaths,
   /// The version's change entries recorded so far, in path order.
   entries: Vec<ChangeEntry>,
+  /// The earlier entries its paths' change makes no longer their paths' last, each its version and path: marked at its
+  /// publish, so no reader at the head sees the walk change before the head does (A-752 part 3c U3). Bounded by the
+  /// paths it changed.
+  unmarked: Vec<(u64, String)>,
   phase: CommitPhase,
 }
 
@@ -6626,6 +6630,16 @@ impl Green {
   /// Publishes an ended commit run of increment `id` (A-752 part 3c U1): its delta pushed, which moves the head to its
   /// version, and the increment accepted as it, both last, so no reader at the head saw any of it before. Its version.
   fn publish_run(&mut self, run: &mut CommitRun, id: [u8; 32]) -> u64 {
+    // Each earlier entry its paths' change made no longer their last: a seek in that version's sorted list (A-752 part
+    // 3c U3).
+    for (earlier, path) in core::mem::take(&mut run.unmarked) {
+      if let Some(entries) = self.changes.get_mut(&earlier)
+        && let Ok(at) = entries.binary_search_by(|entry| entry.path.as_str().cmp(&path))
+        && let Some(entry) = entries.get_mut(at)
+      {
+        entry.last = false;
+      }
+    }
     self.deltas.push(core::mem::take(&mut run.delta));
     self.accepted.insert(id, run.version);
     run.version
@@ -6774,15 +6788,8 @@ impl Green {
     let bytes = change_bytes(&path);
     match self.latest_change.insert(path.clone(), version) {
       None => self.changes_bytes = self.changes_bytes.saturating_add(bytes),
-      // The earlier version's entry is no longer the path's last: a seek in that version's sorted list.
-      Some(earlier) => {
-        if let Some(entries) = self.changes.get_mut(&earlier)
-          && let Ok(at) = entries.binary_search_by(|entry| entry.path.as_str().cmp(&path))
-          && let Some(entry) = entries.get_mut(at)
-        {
-          entry.last = false;
-        }
-      }
+      // The earlier version's entry is no longer the path's last, marked so at the publish ([`Green::publish_run`]).
+      Some(earlier) => run.unmarked.push((earlier, path.clone())),
     }
     self.changes_bytes = self.changes_bytes.saturating_add(bytes);
     let index = u32::try_from(run.entries.len()).unwrap_or(u32::MAX);
@@ -8479,6 +8486,7 @@ impl Green {
             at: [0; 3],
           },
           entries: Vec::new(),
+          unmarked: Vec::new(),
           phase: CommitPhase::Effects,
         });
         return Some(ApplyStep::More);

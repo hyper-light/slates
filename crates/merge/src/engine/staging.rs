@@ -6,8 +6,10 @@
 //! the head until the publish moves the head to it, last (`Green::publish_run`: its delta pushed and its increment
 //! accepted). The value histories (modes, IPC nodes, directories, symbolic and hard links, attributes) are appended in
 //! place and taken back at a refusal: where each key's history stood before the stage first touched it is marked
-//! ([`Marks`]), and a refusal truncates it there. **Owed (later units):** the change index taken back alike, the identity's changes and `change_one`'s `last` held to
-//! the publish, the current maps forked into the stage, and the content history's values copied with their chunks
+//! ([`Marks`]), and a refusal truncates it there. The change index's version list is recorded above the head and taken
+//! out at a refusal, and the earlier entries it makes no longer last are marked at the publish (U3). **Owed (later
+//! units):** the identity's changes held to the publish, the current maps (`latest_change` among them) forked into
+//! the stage, and the content history's values copied with their chunks
 //! held; until then a refusal leaves those as the steps made them, and the stage holds no bytes of its own.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -163,6 +165,17 @@ impl Green {
   /// Gives `staging` up before it is published: the head and the accepted increments unmoved, and each history it
   /// appended in place taken back to where it stood (module docs: owed for the maps later units stage).
   pub fn abandon_staging(&mut self, staging: Staging) {
+    // A run that ended recorded its version's change entries, above the head (A-752 part 3c U3): taken out. The earlier
+    // entries it would have marked no longer last are marked only at a publish.
+    let ended = staging
+      .committing
+      .run
+      .commit
+      .as_ref()
+      .map(|commit| commit.version);
+    if let Some(version) = ended.filter(|version| *version > self.head()) {
+      self.changes.remove(&version);
+    }
     drop(staging);
     let Some(marks) = self.stage_marks.take() else {
       return;

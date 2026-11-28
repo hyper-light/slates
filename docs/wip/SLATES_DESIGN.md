@@ -58341,6 +58341,14 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
     file's bytes): a stage given up after any turn leaves every value history, the head and the accepted increments as
     they were (red with the mode history alone taken back: given up after 6 turns, a value history changed); every
     value read up to the head is unchanged between steps (held by U0 and U1 already).
+  - **U3, the change index.** A commit records its version's change entries at its run's end, above the head (read by
+    no reader, U0), and a refusal of a run that ended takes them out. The earlier entry a path's change makes no
+    longer its last was marked so as the path was recorded, mid-commit, so a reader's walk saw it change before the
+    head did; it is marked at the publish now (`CommitRun::unmarked`, `Green::publish_run`). Red first
+    (`engine::publish_tests`): between every two steps the walk, its last flags and the paths changed since each
+    version read as before (red: a reader saw the stage's changes at unit 15), and a stage given up after any turn,
+    its last included, leaves the change index as it was (red: given up after 15 turns, it was changed).
+    `latest_change` and `changes_bytes`, which the commit still writes as it goes, are the current maps' unit's.
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;

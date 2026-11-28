@@ -235,6 +235,77 @@ fn given_up_in_every_dimension_after(works: &[Changes], turns: u64) -> Result<bo
   Ok(false)
 }
 
+/// The change index as every reader reads it at the head: its walk, each entry's version, place, path and whether it is
+/// its path's last, and the paths changed between each version and the head.
+fn changes_read(green: &Green) -> String {
+  let head = green.head();
+  let walk: Vec<String> = green
+    .changes_after(0, None)
+    .map(|change| format!("{change:?}"))
+    .collect();
+  let mut read = format!("head {head} walk {walk:?}\n");
+  for version in 0..=head {
+    read.push_str(&format!(
+      "{version}: {:?}\n",
+      green.changed_between(version, head)
+    ));
+  }
+  read
+}
+
+/// [`staged_unseen_in_every_dimension`]'s steps with the change index read between them ([`changes_read`]).
+fn changes_unseen(green: &mut Green, inc: &Increment) -> Result<Option<u64>, String> {
+  let Judgment::Accepted(held) = green.judge(inc) else {
+    return Ok(None);
+  };
+  let before = changes_read(green);
+  let mut staging = green.begin_staging(held);
+  loop {
+    let stepped = green.staging_step(&mut staging, &mut || true);
+    if changes_read(green) != before {
+      return Err(format!(
+        "a reader saw the stage's changes at unit {}",
+        staging.units()
+      ));
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  Ok(green.publish(staging).map(|(version, _)| version))
+}
+
+/// [`given_up_in_every_dimension_after`] with the change index as it is held ([`super::Green::changes`]) the guard,
+/// given up after the stage's last step too.
+fn changes_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let mut green = submitted_in_every_dimension(before);
+  let inc = work_in_every_dimension(&green, last, u64::MAX);
+  let Judgment::Accepted(held) = green.judge(&inc) else {
+    return Ok(true);
+  };
+  let was = format!("{:?}", green.changes);
+  let mut staging = green.begin_staging(held);
+  let mut staged = false;
+  for _ in 0..turns {
+    if let StagingStep::Staged = green.staging_step(&mut staging, &mut || true) {
+      staged = true;
+      break;
+    }
+  }
+  green.abandon_staging(staging);
+  if format!("{:?}", green.changes) != was {
+    return Err(format!(
+      "a stage given up after {turns} turns left the change index changed"
+    ));
+  }
+  Ok(staged)
+}
+
 /// The works [`proptest`] generates: one to eight, each of one to four changes.
 fn works() -> impl Strategy<Value = Vec<Changes>> {
   prop::collection::vec(
@@ -314,6 +385,41 @@ proptest! {
       let prefix = steps.get(..end).unwrap_or_default();
       for turns in 0u64.. {
         if given_up_in_every_dimension_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+
+  /// A-752 part 3c U3 (the change index, the reader at v). Do: as U2's, the change index read between every two steps.
+  /// Expect its walk (each entry's last flag too) and the paths changed between each version and the head as before the
+  /// stage, and the same version for every accepted work as the twin's, whose change index reads alike after each.
+  /// Red before: the commit marked the path's earlier entry no longer its last as it recorded the path, mid-commit.
+  #[test]
+  fn a_staged_verdicts_change_index_moves_only_at_its_publish(steps in works()) {
+    let (mut whole, mut staged) = (submitted_in_every_dimension(&[]), submitted_in_every_dimension(&[]));
+    for (id, changes) in (1u64..).zip(&steps) {
+      let inc = work_in_every_dimension(&whole, changes, id);
+      let (outcome, _) = whole.submit_resolved(&inc);
+      let version = changes_unseen(&mut staged, &inc).map_err(TestCaseError::fail)?;
+      let accepted = match outcome {
+        super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+        _ => None,
+      };
+      prop_assert_eq!(version, accepted);
+      prop_assert_eq!(changes_read(&staged), changes_read(&whole));
+    }
+  }
+
+  /// A-752 part 3c U3 (the change index, a refusal at every turn, its last too). Do: as U2's, the stage given up after
+  /// every turn up to and past its last. Expect the change index held exactly as before. Red before: a stage given up
+  /// once its run had ended kept its version's entries, and the earlier entries it had marked no longer last.
+  #[test]
+  fn a_stage_given_up_at_any_turn_leaves_the_change_index_as_it_was(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if changes_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
           break;
         }
       }
