@@ -7704,4 +7704,8 @@ At or past the tip carrying the encode keep's slice (named in w-git's landing no
 - Green: no spinning line naming the git encode (`git_encode`, `encode_ahead`, `encode_within`); `.keep` 0 past
   budget, or where any, fewer units past than before the slice. Red: a spinning line in the encode, or `.keep` past
   budget as before; send me the line and the four by-stage counts. The encoding's start (`Encoding::fragments`
-  reading D(k) whole) is the next piece, so a `.walk` count past budget is expected until it lands.
+  reading D(k) whole) is the next piece, so a `.walk` count past budget is expected until it lands. (Landed since as
+  ef064149f, so `.walk` should be clean too.)
+- The same run's `deepen` row (`git fetch --deepen 100`, after `tag-push` and `tag-delete`): PASS or FAIL and its
+  seconds. 2026-11-21 it failed "bad pack header"; 2026-11-20 it took 217 s. Green: PASS. Red: the row's stderr, and
+  the anchor log's lines around it.

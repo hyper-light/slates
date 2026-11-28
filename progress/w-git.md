@@ -951,3 +951,5 @@
   (Stage::Read, reach::SetReading; 113 runs in one unit before, at most a leaf's now). Both encode whole units named
   on 00:50 are sliced; main's v2.0.0 run under load (~02:30) checks the rest. NEXT: deepen's bad pack and its 217 s
   (w-bugs', read_objects), after a check that it is still open on today's main.
+- 11-28 01:17 PST: deepen's bad pack checked on today's main: the matrix row's sequence (tag pushed and deleted, then deepen 100)
+  answers whole through the edge; guard test landed. Stock git's row and its seconds added to main's v2.0.0 run request.
