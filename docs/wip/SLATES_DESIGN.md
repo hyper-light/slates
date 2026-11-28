@@ -58361,6 +58361,70 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
     first (`engine::publish_tests`): what the verdict reads of each path's last changes reads as before between
     every two steps (red: a reader saw the stage's last changes at unit 8), and a stage given up after any turn,
     its last included, leaves the six maps as they were (red: given up after 8 turns, a map was changed).
+  - **U5, the identity's marks aside, its published backlog drained first.** Every reader of the head identity folds
+    first (`Green::head_identity` → `fold_identity_step`: each key in `identity_dirty` popped and recomputed from the
+    current maps), so a commit that marked its keys dirty and took a changed file's entry out of the sum in place let
+    a reader's fold between its turns take the stage into the sum with the head unmoved. The marks go aside
+    (`last_changes::IdentityAside`: the keys changed, those taken out at their first change and the entries taken;
+    inserts and no read), and `publish_run` moves them in. A key a published commit left dirty, unfolded, is still
+    recomputed from the current maps, which the commit writes in place until they are forked (w-svn's), and a key's
+    fold reads beyond it (`copied_entries`, a copy's `copy_entries_after`); so a staged commit's first steps fold the
+    published backlog, a key a step, before its first write (`Green::staging_step`), and `identity_dirty` stays
+    empty through its writes (main's rulings of 02:46 and 02:47, drain-first). `identity_dirty` and `identity_out`
+    themselves stay plain sets, written only at the publish and by the fold. Both rules end with the current maps
+    forked into the stage, and are deleted in that change. Red first (`engine::publish_tests`): over works in every
+    dimension on a green whose identity owes the earlier works' keys, a reader folding between every two steps from
+    the first, the second and so on reads the serial twin's identity at the head (its sum and its fold's bookkeeping),
+    and after the publish the twin's at the new head; a stage given up after any turn leaves the identity a reader
+    reads at the twin's (red, marks in place: a reader's fold saw the stage at unit 8; red, marks aside but no drain:
+    the same at unit 8 and after a refusal at 8 turns); and main's move case, `a` renamed onto `e` unfolded and `a`
+    made again (holds with or without the drain: that key's fold reads no partner the stage wrote).
+  - **U6, the seven chunk-free current maps forked into the stage** (main 01a20182's ruling of 03:10). The IPC
+    nodes', directories', modes', symbolic and hard links', attributes' and links-to maps are forked at the stage's
+    begin (`staging::Forks`, one count each, no arena of their own); each staging step swaps them in with the
+    green's arenas lent to them (`Dim::swap_with_fork`, twice is none), runs its unit, and swaps them back, so the
+    commit reads and writes only its forks and every reader between steps the published maps. A publish swaps them in
+    for good and gives the published roots back (`Dim::release_fork`), a refusal gives the forks back: either frees
+    only the nodes the stage copied, O(the paths it changed × their depth). Red first (`engine::publish_tests`):
+    between every two steps the seven maps read as before (red, and red with the swap a no-op: a reader saw the
+    stage's current maps at unit 10), and a stage given up after any turn leaves them and their arenas' live nodes
+    as they were (red with the release a no-op: given up after 10 turns, nodes [0, 0, 2, 0, 0, 0, 0] from all 0).
+    The content map is U7's (hold-on-copy holders), and U5's drain-first rule stays until it: the fold reads it.
+  - **U7, the content map forked; the drain-first rule deleted** (main's rulings of 03:10 to 03:41). The content map
+    (`Files`) joins the stage's forks: `Files::swap_with_fork` and `release_fork` give a freed node's blocks back
+    through the block table as holders, so a node the stage copied and the published one it shares release each block
+    once. The fold's copy reads are bounded by the head (`copy_entries_after`, `copies_above_after`, every caller a
+    reader: the fold, `identity_moves`, a branch's reverts). With every current map forked, a reader's fold reads only
+    published maps, so U5's drain-first rule is deleted. Deleting it exposed `mark_dirty` skipping a key dirty in the
+    published set: a reader's fold between turns folded that key at the head and the stage's own change to it was never
+    marked, so the identity after the publish kept the old entry; `mark_dirty` now marks every key it changes aside and
+    takes an entry out of the sum only for a key first changed since the identity was read. Red first: the content map
+    read between every two steps as before (red: a reader saw the stage's content map at unit 12) and a stage given up
+    leaving the map and its arena's live nodes as they were (red: given up after 12 turns, changed); U5's identity
+    reds hold with the drain gone and go red with the content fork stubbed out (a reader's fold saw the stage at unit
+    8); the published identity red that found `mark_dirty`'s skip shrank to one unlink of `a`; `engine::copy_tests`'s
+    staged replace over `dst/a`, unfolded, reads the serial twin's identity from every turn (red with the head bound
+    taken off the copy reads: a reader's fold saw the stage at unit 4). **Gap until U8, and its rule** (ruling (b)):
+    the content history is still written in place, so a stage given up after `set_file`'s re-anchor leaves the
+    published history naming the stage's new block (blocks 6 live against 5); the refusal's blocks assertion is U8's
+    red, and no production path drives a staged commit until U8 has landed (`repository::push`'s landing is wired to it
+    after U8, not before).
+  - **U8, the content history forked with chunk-holding copies** (main's rulings of 01:29, 03:10, 03:41 and 04:01).
+    The content history (`Dim<history::Entries>`, A-920 arena unit 1) joins the stage's forks. Its every mutation goes
+    through `history::HistoryHolders` (`Dim::{get_mut_held, insert_held, remove_held, release_fork_held}`): a node a
+    fork copies holds every chunk its values name (`Value::hold`, a piece's first reference each), and the last node
+    holding entries freed gives their chunks back, so a stage's copies and the published values release each chunk
+    once. A staged commit re-anchors a changed file's history in full (`history::reanchor`'s `layered` false while a
+    stage runs): the layered route repoints the path's shared anchor chunk to the new block and layers it, which every
+    published value naming it would read. That closes U7's gap. Red first: a stage given up after any turn leaves the
+    content history, every value's bytes read through the chunks, the content map's live blocks and nodes and the
+    chunk guard as they were (red: a reader saw the stage's content history at unit 8, and a stage given up after 8
+    turns left it changed; U7's blocks, 6 against 5, back to the twin's); guards removed, each red: copies holding no
+    chunks (chunk 0 freed while a value named it: holds {1, 2, 3, 4} against named {0, 1, 2, 3, 4}), and a stage
+    allowed the layered route (`copy_tests`'s staged one-byte overwrites: a reader saw the stage's content history at
+    unit 9, the anchor repointed). The chunk recount holds of a history with no layered anchor; a layer holds its
+    overwritten bytes' chunk outside any value, so the overwrite tests hold every chunk's holds to what they were.
+    Removed: `Dim::get_mut` (unit 1's), its one caller now `get_mut_held`.
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
@@ -61816,6 +61880,32 @@ Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent::let_go
 - **Tests.** `slates-server` `vcs_store::git_encode::tests::t_a860_a_repository_gone_idle_lets_go_of_the_objects_its_reads_keep`
   (the encoding's reads kept 417 bytes here; once the fetch ended, back to the 32 before; red before: 417 held).
 
+### A pack's intake reads its objects through buffers it reuses, never one an object (2026-11-28, w-git; main 01a20182's ruling of 01:23; GAPS' 772-787 MiB; A-719, A-861)
+- **Why.** GAPS' 772-787 MiB a landed git/git v2.0.0 push kept for its 56 MB pack: the largest share was memory the
+  system allocator kept free after the push's peak. Read against today's code (main 01a20182's order of 2026-11-28
+  01:21), the push's live inflated bytes are bounded (the entry being read and a delta's object; its objects read
+  lately, a chain's worth, A-861; the deltas waiting for a base, held on the admission), but its intake made a buffer of
+  each entry's size for every entry, another for every delta's object, and a SHA-1 detection state for every object
+  named, each made and freed in turn: about 164,488 of each at v2.0.0, 2.3 GB of buffers, the pattern an allocator
+  answers by keeping memory. Ada's rule is no allocation where the design avoids one (main's ruling of 01:23).
+- **Change.** The pack reader (`unpack::Reader`) keeps two buffers, one an entry's data is inflated into and one a
+  delta's object is made into (`delta::apply_into`), each reused entry after entry and grown only for a longer one;
+  while in use each holds its entry's bytes on the admission (the entry's hold, as before), and between entries it keeps
+  at most the room of the pack's longest entry so far. A delta that waits for a later base takes its buffer with it, its
+  bytes outliving the entry, and gives it back once applied. Its keeper is lent each object (`ObjectRef`, `Keep::keep`),
+  not given it: a keeper that keeps the bytes copies them. The objects a push's intake and a replay's site queue for
+  their owners to admit after the reader's call are copied into one buffer each owner keeps from call to call
+  (`unpack::Queued`, the push's `queue_bytes`), at most one call's objects, which their holds charge while queued; the
+  push keeps each as read lately by a copy into its chunk (`Push::keep_read_lent`). Every object is named with the
+  reader's one hasher, made fresh in place (`Hasher::name`), never a new SHA-1 detection state an object.
+- **Tests.** `slates-git` `tests/intake_buffers.rs` (its own binary, the slates allocator global): 4,000 whole objects
+  of 4 KiB read a client's piece at a time into a keeper that keeps nothing; the reader allocates 516,949 bytes reading
+  16,384,000 (red 20,192,853 with an object a buffer, 3,812,949 with the buffers reused but a hasher an object); the
+  objects handed over whole. The pushes', replays' and checks' suites unchanged, byte for byte.
+- **Owed.** Main's RSS round over git/git v2.0.0 (git_interop's resident memory test, the peak and the after-push
+  reading against the bound 178.2 MiB). The reader's per-entry records (`Reader::entries`, a record an entry, the rest
+  of the 516,949) grow with the pack, by doubling.
+
 ### A-861 — Objects read lately lie in chunks given back whole, never on the system heap (2026-11-22, w-shared; main 01a20182's rulings of 04:24 and 04:56 PST, goal 93; A-742, A-860)
 Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent`: chunks, a hash index, one order queue;
 `let_go` gives back every chunk; `true_up`, `release`), `crates/git/src/store/push.rs`, `repository.rs` and
@@ -64563,6 +64653,12 @@ GAPS.
   Red, made deterministic with a task waiting through the read a yield at a time
   (`a_fetch_handed_a_derivation_while_its_shard_has_other_work_takes_no_more_turns_than_alone`): every turn counted,
   935 against 3, 934 of them yielded. Green with the reader's own turns, 1 against 1.
+- **The handed read is a live fetch (2026-11-28, w-git; main 01a20182's ruling of 03:02, after its intake-buffers
+  A/B).** Every handed run of both arms brought one window back, 8 to 11 ms of the read: the landed pack's let-go behind
+  the push ran during the read, since the test's read held no live fetch, where a fetch's answer is counted live from
+  its arrival (`vcs_share::Live::fetch`) and a let-go is never made under one (`vcs_store::landed_let_go_may`). The
+  test's read now holds the live fetch, and the handed read is held to bringing back none (red: 1; green: 0, handed
+  43.1 ms against alone's 44.2).
 - **Whether any is due, from counts (2026-11-25, main 01a20182's sample).** A 3 s sample of git/git's clone waiting for
   its first pack bytes found the encoding behind the push spending a third of its time in
   `Repository::derivations_due` (309 of its 951 samples), which every derivation and encoding turn asks before it

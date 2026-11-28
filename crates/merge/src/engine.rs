@@ -69,20 +69,55 @@ use crate::ops_doc::{NodeOrigin, Op, OpKind, OpsDoc};
 use crate::range::Range;
 use crate::verdict::MergeConflictClass;
 
-/// An increment's encoding under way ([`Increment::encode_step`]): its bytes so far and where it stands.
+/// An increment's encoding under way ([`Increment::encode_step`]): its bytes so far and where it stands, and the buffer
+/// it writes into.
+///
+/// **Its buffer never grows** (A-920, main's ruling of 2026-11-28 01:38). The encoding is measured first, a piece of
+/// its ops document a unit, and its buffer reserved once at that exact length: written as it went, the buffer doubled
+/// through 64 KiB to 2 MiB for an import's 1,250,037-byte increment, and each doubling freed the last on the shard, one
+/// of them inside a landing step whose footprint fell 29.8 MB (1.19 ms off its CPU, debug). A buffer handed in
+/// ([`IncrementEncoding::with_buffer`]) is written into when it holds the measured length, and otherwise set aside for
+/// the caller to free where it chooses ([`IncrementEncoding::take_outgrown`]).
 #[derive(Debug, Default)]
 pub struct IncrementEncoding {
   out: Vec<u8>,
   stage: EncodeStage,
   /// Where the header left the document's length to fill in.
   at: usize,
+  /// The encoding's exact length, once measured.
+  measured: Option<usize>,
+  /// The handed-in buffer, when it was too small for the measured length.
+  outgrown: Option<Vec<u8>>,
+}
+
+impl IncrementEncoding {
+  /// An encoding that writes into `buffer`, emptied, when its room holds the encoding's exact length.
+  pub fn with_buffer(mut buffer: Vec<u8>) -> IncrementEncoding {
+    buffer.clear();
+    IncrementEncoding {
+      out: buffer,
+      ..IncrementEncoding::default()
+    }
+  }
+
+  /// The encoding's exact length, once its measure has ended: the room its buffer was reserved at.
+  pub fn measured(&self) -> Option<usize> {
+    self.measured
+  }
+
+  /// The handed-in buffer, when it was too small for the measured length and a buffer of that length was made in its
+  /// place: the caller's to free where it chooses.
+  pub fn take_outgrown(&mut self) -> Option<Vec<u8>> {
+    self.outgrown.take()
+  }
 }
 
 /// Where an [`IncrementEncoding`] is.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 enum EncodeStage {
+  /// Its ops document's length summed from this piece, and the sum so far: the measure the buffer is reserved by.
+  Measure { piece: usize, doc: usize },
   /// Its id, base and the document length's place.
-  #[default]
   Header,
   /// Its ops document, from this piece.
   Doc(usize),
@@ -92,6 +127,12 @@ enum EncodeStage {
   Evidence(usize),
   /// Its named runs, from this one.
   Runs(usize),
+}
+
+impl Default for EncodeStage {
+  fn default() -> Self {
+    EncodeStage::Measure { piece: 0, doc: 0 }
+  }
 }
 
 /// Format: the bytes of an increment's encoded document length (a `u64`, [`Increment::encode`]).
@@ -156,7 +197,9 @@ impl Increment {
   }
 
   /// [`Increment::encode`] taken a slice at a time (A-920 6b: an import's revision of 9,000 files encoded whole in its
-  /// landing's entry step), from `encoding` ([`IncrementEncoding::default`]), a unit at least, until `spent`: its header,
+  /// landing's entry step), from `encoding` ([`IncrementEncoding::default`] or [`IncrementEncoding::with_buffer`]), a unit
+  /// at least, until `spent`: its ops document measured a piece a unit and its buffer reserved at the exact length
+  /// (A-920, [`IncrementEncoding`]'s "Its buffer never grows"), then its header,
   /// its ops document a piece a unit ([`crate::ops_doc::OpsDoc::encode_piece`], its length filled in once every piece
   /// is written), its inline bytes `chunk` a unit, then each evidence reference and named run a unit. Once it ends,
   /// [`Increment::encode`]'s bytes.
@@ -176,10 +219,37 @@ impl Increment {
     }
   }
 
+  /// One unit of [`Increment::encode_step`]'s measure, at the ops document's `piece` with `doc` bytes summed before it:
+  /// the piece's length added, or past the last piece, the buffer reserved at the encoding's exact length (the handed-in
+  /// one set aside when it is too small) and the header next.
+  fn measure_unit(&self, encoding: &mut IncrementEncoding, (piece, doc): (usize, usize)) {
+    encoding.stage = match self.doc.piece_len(piece) {
+      Some(len) => EncodeStage::Measure {
+        piece: piece.saturating_add(1),
+        doc: doc.saturating_add(len),
+      },
+      None => {
+        let exact = self.encoded_len_with(doc);
+        if encoding.out.capacity() < exact {
+          let small = core::mem::replace(&mut encoding.out, Vec::with_capacity(exact));
+          encoding.outgrown = (small.capacity() > 0).then_some(small);
+        }
+        encoding.measured = Some(exact);
+        EncodeStage::Header
+      }
+    };
+  }
+
   /// One unit of [`Increment::encode_step`]: whether any is left.
   fn encode_unit(&self, encoding: &mut IncrementEncoding, chunk: usize) -> bool {
-    let IncrementEncoding { out, stage, at } = encoding;
+    if let EncodeStage::Measure { piece, doc } = encoding.stage {
+      self.measure_unit(encoding, (piece, doc));
+      return true;
+    }
+    let IncrementEncoding { out, stage, at, .. } = encoding;
     match stage {
+      // Measured above: this unit is the measure's.
+      EncodeStage::Measure { .. } => {}
       EncodeStage::Header => {
         out.extend_from_slice(&self.id);
         out.extend_from_slice(&self.base.to_le_bytes());
@@ -1503,6 +1573,9 @@ pub struct Green {
   /// The last changes the commit under way wrote, moved into the six maps above at its publish (A-752 part 3c U4,
   /// [`last_changes`]): written, never read.
   aside: last_changes::Aside,
+  /// The identity marks of the commit under way, moved in at its publish (A-752 part 3c U5,
+  /// [`last_changes::IdentityAside`]): written, never read.
+  identity_aside: last_changes::IdentityAside,
   /// Every accepted increment's identity and the version it committed: the idempotency record a
   /// retry of an accepted submit is answered from. Bounded by the chain (one entry per committed
   /// version), which the partition caps in bytes; recovery rebuilds it by replaying the chain.
@@ -3672,22 +3745,28 @@ impl Green {
   /// a copy's entry may stand for, A-586) its entry is taken out of the sum now, from its current bytes, so the fold
   /// adds its entry at the head and reads no history for it: one hash a changed file, not two and a reconstruction.
   /// Every other key is only marked, its move made whole by the fold.
+  ///
+  /// Written aside until the commit's publish (A-752 part 3c U5, [`last_changes::IdentityAside`]). A key a published
+  /// commit left dirty, unfolded, is marked too, its entry left as it is: a reader's fold between a staged commit's turns
+  /// may fold it at the head from the published maps, which the stage's forks leave as they were (U7), and the stage's
+  /// mark makes the fold after the publish move it again, from there; with no fold between, the publish's mark is the
+  /// key's own. Only a key first changed since the identity was read has its entry taken out here.
   fn mark_dirty(&mut self, key: IdentityKey) {
-    if self.identity_dirty.contains(&key) {
+    if !self.identity_aside.dirty(key.clone()) || self.identity_dirty.contains(&key) {
       return;
     }
     if let IdentityKey::File(path) = &key
       && self.copies.is_empty()
     {
       if let Some(digest) = self.content.digest_of(path) {
-        self.identity.remove(&file_entry(path, digest));
+        self
+          .identity_aside
+          .taken(key.clone(), file_entry(path, digest));
       }
-      self.identity_out.insert(key.clone());
       self
         .identities_taken_at_change
         .set(self.identities_taken_at_change.get().saturating_add(1));
     }
-    self.identity_dirty.insert(key);
   }
 
   /// `key`'s own entries at the head (none where it is absent; a copy's are its records', none here).
@@ -5149,10 +5228,17 @@ impl Green {
       self.history_lists = self.history_lists.saturating_add(value.list_bytes());
       self.history_current = self.history_current.saturating_add(current_bytes(value));
     }
-    match self.content_history.get_mut(&path) {
+    // Its map's copied nodes hold their values' chunks (A-752 part 3c U8, a stage's fork).
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
+    match self.content_history.get_mut_held(&path, &mut holders) {
       Some(history) => history.push((version, value)),
       None => {
-        self.content_history.insert(path, vec![(version, value)]);
+        self
+          .content_history
+          .insert_held(path, vec![(version, value)], &mut holders);
       }
     }
   }
@@ -5217,22 +5303,36 @@ impl Green {
   /// go and the history keeps only what the change overwrote or removed. The file's block named whole (A-728) with
   /// nothing re-anchored for a path with no latest value, or one the ops keep nothing of.
   fn content_value(&mut self, path: &str, ops: &[Op]) -> crate::history::Value {
+    // A staged commit re-anchors in full: the layered route repoints the path's shared anchor chunk, which the
+    // published values name too (A-752 part 3c U8).
+    let layered = self.stage_marks.is_none();
     let Green {
       content_history,
       chunks,
       content,
       ..
     } = self;
-    let anchored = content
-      .block_of(path)
-      .zip(content_history.get_mut(path))
+    let block = content.block_of(path);
+    let mut holders = crate::history::HistoryHolders {
+      chunks,
+      blocks: content.blocks_mut(),
+    };
+    let history = content_history.get_mut_held(path, &mut holders);
+    let anchored = block
+      .zip(history)
       .filter(|(_, history)| history.last().is_some_and(|(_, latest)| latest.is_some()))
       .and_then(|(block, history)| {
         let values = history
           .iter_mut()
           .filter_map(|(_, value)| value.as_mut())
           .collect();
-        crate::history::reanchor(values, chunks, content.blocks_mut(), (block, ops))
+        crate::history::reanchor(
+          values,
+          holders.chunks,
+          holders.blocks,
+          (block, ops),
+          layered,
+        )
       });
     let Some(anchored) = anchored else {
       return self.named_value(path);
@@ -5286,9 +5386,13 @@ impl Green {
   /// (`crate::history::Value::supersede`): its own block is history from here, whole or, once the change re-anchors the
   /// path's history, cut to what the change removed (A-728 part 4, A-793).
   fn supersede_latest(&mut self, path: &str) {
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
     let Some(latest) = self
       .content_history
-      .get_mut(path)
+      .get_mut_held(path, &mut holders)
       .and_then(|history| history.last_mut())
       .and_then(|(_, value)| value.as_mut())
     else {
@@ -5365,7 +5469,11 @@ impl Green {
 
   /// Drops `path`'s content history, its chunks released and the running totals with it.
   fn clear_content_history(&mut self, path: &str) {
-    let Some(history) = self.content_history.remove(path) else {
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
+    let Some(history) = self.content_history.remove_held(path, &mut holders) else {
       return;
     };
     if let Some((_, Some(latest))) = history.last() {
@@ -6511,8 +6619,8 @@ impl Green {
     );
     if self.modes.remove(path).is_some() {
       self
-        .identity_dirty
-        .insert(IdentityKey::Mode(path.to_owned()));
+        .identity_aside
+        .dirty(IdentityKey::Mode(path.to_owned()));
       self.aside.mode(path.to_owned(), version);
       self
         .mode_history
@@ -6532,8 +6640,8 @@ impl Green {
       let at = self.seed_of(&self.xattr_history, &key, path, version);
       seed(&mut self.xattr_history, &key, Some(Some(value)), at);
       self
-        .identity_dirty
-        .insert(IdentityKey::Xattr(key.0.clone(), key.1.clone()));
+        .identity_aside
+        .dirty(IdentityKey::Xattr(key.0.clone(), key.1.clone()));
       self.aside.xattr(key.clone(), version);
       self
         .xattr_history
@@ -6648,6 +6756,11 @@ impl Green {
         entry.last = false;
       }
     }
+    core::mem::take(&mut self.identity_aside).publish_into((
+      &mut self.identity_dirty,
+      &mut self.identity_out,
+      &mut self.identity,
+    ));
     core::mem::take(&mut self.aside).publish_into(last_changes::Targets {
       removed: &mut self.file_removed,
       modes: &mut self.mode_changed,
@@ -9152,7 +9265,11 @@ impl Green {
       folding.phase = FoldPhase::Release;
       return;
     };
-    if let Some(history) = self.content_history.get_mut(path) {
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
+    if let Some(history) = self.content_history.get_mut_held(path, &mut holders) {
       let folded = fold_entries(history, folding.floor);
       if !folded.is_empty() && history.len() == 1 {
         folding.alone.push(path.clone());
@@ -9255,7 +9372,11 @@ impl Green {
     let mut dropped = Vec::new();
     let mut alone = Vec::new();
     for path in paths {
-      let Some(history) = self.content_history.get_mut(path) else {
+      let mut holders = crate::history::HistoryHolders {
+        chunks: &mut self.chunks,
+        blocks: self.content.blocks_mut(),
+      };
+      let Some(history) = self.content_history.get_mut_held(path, &mut holders) else {
         continue;
       };
       let folded = fold_entries(history, floor);
@@ -9298,9 +9419,13 @@ impl Green {
       return;
     }
     let named = self.named_value(path);
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
     let Some((_, slot)) = self
       .content_history
-      .get_mut(path)
+      .get_mut_held(path, &mut holders)
       .and_then(|history| history.last_mut())
     else {
       return;

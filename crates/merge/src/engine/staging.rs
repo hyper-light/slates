@@ -2,19 +2,46 @@
 //! to 01:42): its commit's changes made where no reader at the head sees them, and published in one step at its end,
 //! so a reader never waits on a commit's turns and a commit refused part-way publishes nothing.
 //!
-//! **Built so far (U1, U2).** Every read names its version (U0), so what the commit appends at its own version is above
-//! the head until the publish moves the head to it, last (`Green::publish_run`: its delta pushed and its increment
-//! accepted). The value histories (modes, IPC nodes, directories, symbolic and hard links, attributes) are appended in
-//! place and taken back at a refusal: where each key's history stood before the stage first touched it is marked
-//! ([`Marks`]), and a refusal truncates it there. The change index's version list is recorded above the head and taken
-//! out at a refusal, and the earlier entries it makes no longer last are marked at the publish (U3). **Owed (later
-//! units):** the identity's changes held to the publish, the current maps (`latest_change` among them) forked into
-//! the stage, and the content history's values copied with their chunks
-//! held; until then a refusal leaves those as the steps made them, and the stage holds no bytes of its own.
+//! **What it holds.** Every read names its version (U0), so what the commit appends at its own version is above the
+//! head until the publish moves the head to it, last (`Green::publish_run`: its delta pushed and its increment
+//! accepted, U1). The value histories are appended in place and taken back at a refusal, each key marked where its
+//! history stood at the stage's first touch ([`Marks`], U1 and U2). The change index's version list is recorded above
+//! the head and taken out at a refusal, and the earlier entries it makes no longer last are marked at the publish
+//! (U3). Each key's last change and the identity's marks are written aside and moved in at the publish
+//! (`last_changes`, U4 and U5). The eight current maps and the content history are forked at the stage's begin, and
+//! the commit's steps read and write the forks, every reader between steps the published ones ([`Forks`], U6 to U8):
+//! a reader's fold of the identity reads only what is published, and a node of the content history the stage copies
+//! holds its values' chunks (`history::HistoryHolders`), so the stage's copies and the published values release each
+//! chunk once. A staged commit re-anchors a changed file's history in full, never by the layered route, which repoints
+//! the path's shared anchor chunk (U8). **Owed:** the commit's scalars written back at the publish, then the staged
+//! commit wired into a push's landing (main 01a20182's order of 2026-11-28 03:10).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{ApplyStep, Committing, Green, Judged};
+use crate::dims::{Dim, Files, Xattrs};
+use crate::special::SpecialNode;
+
+/// The stage's forks of the green's eight current maps (A-752 part 3c U6 and U7; main 01a20182's ruling of 2026-11-28
+/// 03:10): made at the stage's begin, one count each, holding no arena of their own; the commit's steps
+/// read and write them ([`Green::swap_forks`] puts them in place for a step and back), every reader between steps
+/// the published maps. A publish swaps them in for good and releases the published roots; a refusal releases them.
+/// What a release frees is the nodes the stage copied: O(the paths it changed × their depth).
+struct Forks {
+  /// The content history (A-752 part 3c U8): a node the stage copies holds its entries' chunks
+  /// ([`crate::history::HistoryHolders`]), and a freed node gives them back, so each chunk is released once.
+  content_history: Dim<crate::history::Entries>,
+  /// The content map (A-752 part 3c U7): a node the stage copies holds the blocks it names, and a freed node lets them
+  /// go, so the stage's copies and the published ones release each block once.
+  content: Files,
+  specials: Dim<SpecialNode>,
+  dirs: Dim<()>,
+  modes: Dim<u32>,
+  symlinks: Dim<String>,
+  hardlinks: Dim<String>,
+  xattrs: Xattrs,
+  links_to: Dim<BTreeSet<String>>,
+}
 
 /// Where each history a stage appends in place stood before its first touch (A-752 part 3c U1 and U2): a key's
 /// entries then, or none for a key with no history. Bounded by the keys the verdict's commit touches.
@@ -66,6 +93,8 @@ fn take_back<K: Ord, E>(marks: BTreeMap<K, Option<usize>>, histories: &mut BTree
 /// A held verdict being staged ([`Green::begin_staging`]): its commit under way, and whether it is staged whole.
 pub struct Staging {
   committing: Committing,
+  /// The stage's forks of the current maps; `None` once given back.
+  forks: Option<Forks>,
   staged: bool,
   units: u64,
 }
@@ -114,8 +143,10 @@ impl Green {
   /// Begins staging `judged`, a verdict held at this green's head ([`Green::staging_step`]): one stage at a time.
   pub fn begin_staging(&mut self, judged: Judged) -> Staging {
     self.stage_marks = Some(Box::default());
+    let forks = self.fork_maps();
     Staging {
       committing: self.begin_committing(judged),
+      forks: Some(forks),
       staged: false,
       units: 0,
     }
@@ -128,23 +159,92 @@ impl Green {
     spent: &mut dyn FnMut() -> bool,
   ) -> StagingStep {
     staging.units = staging.units.saturating_add(1);
+    let Some(forks) = staging.forks.as_mut() else {
+      return StagingStep::Staged;
+    };
+    // The commit reads and writes the stage's forks, never the published maps (A-752 part 3c U6).
+    self.swap_forks(forks);
+    let stepped = self.commit_unit(&mut staging.committing, spent);
+    self.swap_forks(forks);
+    if let StagingStep::Staged = stepped {
+      staging.staged = true;
+    }
+    stepped
+  }
+
+  /// One unit of `committing`'s prepare or commit steps, the publish left to [`Green::publish`].
+  fn commit_unit(
+    &mut self,
+    committing: &mut Committing,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> StagingStep {
     let Committing {
       run,
       post_state,
       runs,
       ..
-    } = &mut staging.committing;
+    } = committing;
     let Some(commit) = run.commit.as_mut() else {
       return match self.prepare_step(run, (post_state, runs), spent) {
         ApplyStep::Lend(unlent) => StagingStep::Lend(unlent),
         _ => StagingStep::More,
       };
     };
-    if !self.commit_step(commit, spent) {
-      return StagingStep::More;
+    if self.commit_step(commit, spent) {
+      StagingStep::Staged
+    } else {
+      StagingStep::More
     }
-    staging.staged = true;
-    StagingStep::Staged
+  }
+
+  /// The stage's forks of the eight current maps, one count each ([`Forks`]).
+  fn fork_maps(&mut self) -> Forks {
+    Forks {
+      content_history: self.content_history.fork(),
+      content: self.content.fork(),
+      specials: self.specials.fork(),
+      dirs: self.dirs.fork(),
+      modes: self.modes.fork(),
+      symlinks: self.symlinks.fork(),
+      hardlinks: self.hardlinks.fork(),
+      xattrs: self.xattrs.fork(),
+      links_to: self.links_to.fork(),
+    }
+  }
+
+  /// Exchanges the green's eight current maps with `forks`, the arenas staying in the green: the stage's
+  /// in place for a step, and the published back after it. Twice is none.
+  fn swap_forks(&mut self, forks: &mut Forks) {
+    self
+      .content_history
+      .swap_with_fork(&mut forks.content_history);
+    self.content.swap_with_fork(&mut forks.content);
+    self.specials.swap_with_fork(&mut forks.specials);
+    self.dirs.swap_with_fork(&mut forks.dirs);
+    self.modes.swap_with_fork(&mut forks.modes);
+    self.symlinks.swap_with_fork(&mut forks.symlinks);
+    self.hardlinks.swap_with_fork(&mut forks.hardlinks);
+    self.xattrs.swap_with_fork(&mut forks.xattrs);
+    self.links_to.swap_with_fork(&mut forks.links_to);
+  }
+
+  /// Gives `forks`' holds back in the green's arenas: the nodes no published map shares freed.
+  fn release_forks(&mut self, forks: Forks) {
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
+    self
+      .content_history
+      .release_fork_held(forks.content_history, &mut holders);
+    self.content.release_fork(forks.content);
+    self.specials.release_fork(forks.specials);
+    self.dirs.release_fork(forks.dirs);
+    self.modes.release_fork(forks.modes);
+    self.symlinks.release_fork(forks.symlinks);
+    self.hardlinks.release_fork(forks.hardlinks);
+    self.xattrs.release_fork(forks.xattrs);
+    self.links_to.release_fork(forks.links_to);
   }
 
   /// Publishes a staged `staging`, moving the head to its version last: its version and what the chain records of it;
@@ -155,6 +255,11 @@ impl Green {
       return None;
     }
     let mut staging = staging;
+    // The stage's forks become the green's maps; the published roots they replace are given back (A-752 part 3c U6).
+    if let Some(mut forks) = staging.forks.take() {
+      self.swap_forks(&mut forks);
+      self.release_forks(forks);
+    }
     let Committing { run, applied, .. } = &mut staging.committing;
     let commit = run.commit.as_mut()?;
     self.stage_marks = None;
@@ -167,6 +272,10 @@ impl Green {
   pub fn abandon_staging(&mut self, staging: Staging) {
     // A run that ended recorded its version's change entries, above the head (A-752 part 3c U3): taken out. The earlier
     // entries it would have marked no longer last are marked only at a publish.
+    let mut staging = staging;
+    if let Some(forks) = staging.forks.take() {
+      self.release_forks(forks);
+    }
     let ended = staging
       .committing
       .run
@@ -177,8 +286,9 @@ impl Green {
       self.changes.remove(&version);
     }
     drop(staging);
-    // The last changes it wrote aside are dropped (A-752 part 3c U4).
+    // The last changes and identity marks it wrote aside are dropped (A-752 part 3c U4, U5).
     self.aside = super::last_changes::Aside::default();
+    self.identity_aside = super::last_changes::IdentityAside::default();
     let Some(marks) = self.stage_marks.take() else {
       return;
     };

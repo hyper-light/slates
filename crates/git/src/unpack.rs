@@ -15,7 +15,7 @@
 //! - `conclude_pack`, a delta never resolved refused ("pack has %d unresolved deltas").
 //!
 //! The pack's header and trailer are A-591's ([`pack::read_header`], [`pack::Refusal`]); each entry's header and each
-//! delta are A-582 part 3's ([`entry::read`], [`delta::apply`]); each name is A-600's ([`name_of`]). The inflater is
+//! delta are A-582 part 3's ([`entry::read`], [`delta::apply`]); each name is A-600's ([`name_of`](crate::object_name::name_of)). The inflater is
 //! flate2 over zlib-rs, the workspace's one deflate engine (A-607).
 //!
 //! **What it does.** [`Reader::read`] takes the bytes a stream has delivered, in any cuts, and reads as far as they go:
@@ -48,13 +48,14 @@
 //! one fixed size for a reader, zlib's documented window and state, not scaled by the input, and is not charged.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use flate2::{Decompress, FlushDecompress, Status};
 
 use crate::away::WaitOnce;
 use crate::delta;
 use crate::entry::{self, PACK_HEADER_LEN, Representation};
-use crate::object_name::{CollisionAttack, Hasher, Kind, ObjectFormat, ObjectId, name_of};
+use crate::object_name::{CollisionAttack, Hasher, Kind, ObjectFormat, ObjectId};
 use crate::pack::{self, idx::Idx};
 use crate::{Admission, Hold, PastAdmission, to_u64};
 
@@ -132,6 +133,131 @@ pub struct Object {
   pub chain: Option<Chain>,
 }
 
+/// An object as the reader hands it to its keeper ([`Keep::keep`]): [`Object`]'s fields, its content borrowed from the
+/// reader's buffer, which the reader reuses for the next entry (main 01a20182's ruling of 2026-11-28 01:23: one buffer
+/// an object was 2.3 GB made and freed for git/git v2.0.0's push). A keeper that keeps the bytes copies them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectRef<'b> {
+  /// Where its entry begins in the pack.
+  pub offset: u64,
+  /// The bytes its entry takes in the pack: its header and its compressed data.
+  pub stored: u64,
+  /// Its type; a delta's is its base's.
+  pub kind: Kind,
+  /// Its name.
+  pub id: ObjectId,
+  /// Its content.
+  pub content: &'b [u8],
+  /// For an object stored as a delta, its place in its chain.
+  pub chain: Option<Chain>,
+}
+
+impl ObjectRef<'_> {
+  /// The object, its content copied.
+  pub fn to_object(&self) -> Object {
+    Object {
+      offset: self.offset,
+      stored: self.stored,
+      kind: self.kind,
+      id: self.id,
+      content: self.content.to_vec(),
+      chain: self.chain,
+    }
+  }
+}
+
+/// The objects a keeper queues for its owner to admit once the reader's call returns (a push's intake, a replay's site:
+/// the call reads read only, the admission needs the shard's state), each with the hold its bytes took, their bytes
+/// copied into one buffer the owner reuses call after call (main 01a20182's ruling of 2026-11-28 01:23: an object a
+/// buffer was 2.3 GB made and freed for git/git v2.0.0's push). The buffer's room is at most one call's objects, which
+/// their holds charge while they are queued.
+#[derive(Debug, Default)]
+pub struct Queued {
+  /// Each queued object by its position in pack order: its record and its hold.
+  objects: BTreeMap<usize, (QueuedObject, Hold)>,
+  /// Every queued object's bytes, end to end.
+  bytes: Vec<u8>,
+}
+
+/// A queued object's record ([`Queued`]): [`ObjectRef`]'s fields, its content where it lies in the queue's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueuedObject {
+  offset: u64,
+  stored: u64,
+  kind: Kind,
+  id: ObjectId,
+  chain: Option<Chain>,
+  at: usize,
+  len: usize,
+}
+
+impl QueuedObject {
+  /// The object, its content read from `bytes`, the queue's ([`Queued::into_parts`]).
+  pub fn object<'b>(&self, bytes: &'b [u8]) -> ObjectRef<'b> {
+    let end = self.at.saturating_add(self.len);
+    ObjectRef {
+      offset: self.offset,
+      stored: self.stored,
+      kind: self.kind,
+      id: self.id,
+      content: bytes.get(self.at..end).unwrap_or_default(),
+      chain: self.chain,
+    }
+  }
+}
+
+impl Queued {
+  /// An empty queue over `bytes`, a buffer its owner kept from the last call, emptied: its room reused.
+  pub fn reusing(mut bytes: Vec<u8>) -> Queued {
+    bytes.clear();
+    Queued {
+      objects: BTreeMap::new(),
+      bytes,
+    }
+  }
+
+  /// Queues `object`, the pack's at position `at`, with `hold`: its bytes copied in. Refused where the system will not
+  /// give the room, the hold handed back for its owner to release.
+  pub fn keep(
+    &mut self,
+    at: usize,
+    object: ObjectRef<'_>,
+    hold: Hold,
+  ) -> Result<(), (Refusal, Hold)> {
+    if self.bytes.try_reserve(object.content.len()).is_err() {
+      let refused = Refusal::AllocationRefused {
+        bytes: to_u64(object.content.len()),
+      };
+      return Err((refused, hold));
+    }
+    let start = self.bytes.len();
+    self.bytes.extend_from_slice(object.content);
+    let queued = QueuedObject {
+      offset: object.offset,
+      stored: object.stored,
+      kind: object.kind,
+      id: object.id,
+      chain: object.chain,
+      at: start,
+      len: object.content.len(),
+    };
+    self.objects.insert(at, (queued, hold));
+    Ok(())
+  }
+
+  /// The content of the object queued at position `at`, named `id`; none where none is.
+  pub fn content(&self, at: usize, id: &ObjectId) -> Option<&[u8]> {
+    let (queued, _) = self.objects.get(&at)?;
+    (queued.id == *id).then(|| queued.object(&self.bytes).content)
+  }
+
+  /// The objects queued in pack order with their holds, and the buffer their bytes lie in, for the owner to admit and
+  /// keep for its next call.
+  pub fn into_parts(self) -> (Vec<(QueuedObject, Hold)>, Vec<u8>) {
+    (self.objects.into_values().collect(), self.bytes)
+  }
+}
+
 /// A pack read whole: its objects in pack order, and its trailer, the checksum of every byte before it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unpacked {
@@ -152,7 +278,7 @@ pub trait Keep: Contents {
   fn keep(
     &mut self,
     at: usize,
-    object: Object,
+    object: ObjectRef<'_>,
     hold: Hold,
     admission: &mut Admission,
   ) -> Result<(), Refusal>;
@@ -195,7 +321,7 @@ impl Keep for Held {
   fn keep(
     &mut self,
     at: usize,
-    object: Object,
+    object: ObjectRef<'_>,
     _hold: Hold,
     _admission: &mut Admission,
   ) -> Result<(), Refusal> {
@@ -209,8 +335,9 @@ impl Keep for Held {
         })?;
       self.objects.resize_with(at.saturating_add(1), || None);
     }
+    // The whole pack held in memory: each object's bytes copied out of the reader's buffer, as this keeper keeps them.
     if let Some(slot) = self.objects.get_mut(at) {
-      *slot = Some(object);
+      *slot = Some(object.to_object());
     }
     Ok(())
   }
@@ -258,7 +385,7 @@ impl<O: ?Sized> Keep for Beside<'_, O> {
   fn keep(
     &mut self,
     at: usize,
-    object: Object,
+    object: ObjectRef<'_>,
     hold: Hold,
     admission: &mut Admission,
   ) -> Result<(), Refusal> {
@@ -512,6 +639,10 @@ struct Made {
   hold: Hold,
 }
 
+/// What an entry's end settles beside `T`, its record or its delta's state: the object made, for its keeper, and the
+/// delta's buffer once applied, for the next entry.
+type Settled<T> = (T, Option<Made>, Option<Vec<u8>>);
+
 /// An object a delta is applied to: one of the pack's, or one outside it.
 struct Source<'s> {
   /// Its type.
@@ -582,6 +713,15 @@ pub struct Reader<'index, L: Locate + ?Sized = NoIndex> {
   held: Held,
   /// The waiting deltas' resolution under way between turns ([`Reader::resolve_turn`]), once the pack is whole.
   resolving: Option<Resolving>,
+  /// The buffer an entry's data is inflated into, reused entry after entry and grown only for a longer one; given up to
+  /// a delta that waits for its base, whose bytes outlive the entry (main 01a20182's ruling of 2026-11-28 01:23).
+  inflating: Vec<u8>,
+  /// The buffer a delta's object is made into, reused likewise. While in use each holds its entry's bytes on the
+  /// admission (the entry's hold); between entries it keeps at most the room of the pack's longest entry so far.
+  making: Vec<u8>,
+  /// The hasher every object is named with, made fresh in place for each ([`Hasher::name`]); in a cell, since naming is
+  /// a look at what was read.
+  naming: core::cell::RefCell<Hasher>,
 }
 
 /// A clock that never moves: a turn under it is never spent, so it resolves to the end ([`Reader::finish_into`]).
@@ -651,6 +791,20 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       entries: Vec::new(),
       held: Held::default(),
       resolving: None,
+      inflating: Vec::new(),
+      making: Vec::new(),
+      naming: core::cell::RefCell::new(Hasher::raw(format)),
+    }
+  }
+
+  /// Takes `buffer` back for the next entry, emptied: into whichever of the reader's two is given up, the larger kept
+  /// where both are held.
+  fn give_back(&mut self, mut buffer: Vec<u8>) {
+    buffer.clear();
+    if self.inflating.capacity() == 0 {
+      self.inflating = buffer;
+    } else if buffer.capacity() > self.making.capacity() {
+      self.making = buffer;
     }
   }
 
@@ -881,7 +1035,8 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     self.partial.clear();
     let size = usize::try_from(header.size)
       .map_err(|_| Refusal::AllocationRefused { bytes: header.size })?;
-    let mut content = Vec::new();
+    let mut content = core::mem::take(&mut self.inflating);
+    content.clear();
     reserve(&mut content, size)?;
     content.resize(size, 0);
     self.inflater.reset(true);
@@ -918,27 +1073,34 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       return Ok(Some(took));
     };
     let stored = self.at.saturating_sub(data.began);
-    let (record, made) = self.record(data, stored, admission, keep)?;
+    let mut making = core::mem::take(&mut self.making);
+    let recorded = self.record(data, stored, (admission, keep), &mut making);
+    self.give_back(making);
+    let (record, made, spent) = recorded?;
+    if let Some(spent) = spent {
+      self.give_back(spent);
+    }
     let at = self.entries.len();
     let offset = record.offset;
     self.entries.push(record);
     if let Some(made) = made {
-      self.kept(at, (offset, stored), made, admission, keep)?;
+      let buffer = self.kept(at, (offset, stored), made, admission, keep)?;
+      self.give_back(buffer);
     }
     self.remaining = self.remaining.saturating_sub(1);
     self.stage = self.after_entry();
     Ok(Some(took))
   }
 
-  /// The record of an entry whose data has ended: its object named, its delta applied, or its delta waiting; and the
-  /// object made, for its keeper.
+  /// The record of an entry whose data has ended: its object named, its delta applied (made into `making`), or its
+  /// delta waiting; the object made, for its keeper; and the delta's buffer once applied, for the next entry.
   fn record<K: Keep + ?Sized>(
     &self,
     data: Data,
     stored: u64,
-    admission: &mut Admission,
-    keep: &mut K,
-  ) -> Result<(Record, Option<Made>), Refusal> {
+    (admission, keep): (&mut Admission, &mut K),
+    making: &mut Vec<u8>,
+  ) -> Result<Settled<Record>, Refusal> {
     let Data {
       header,
       began,
@@ -946,11 +1108,11 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       hold,
       ..
     } = data;
-    let (state, made) = match header.representation {
+    let (state, made, spent) = match header.representation {
       Representation::Whole(kind) => {
         let named = Resolved {
           kind,
-          id: name_object(self.format, kind, &content, began)?,
+          id: name_object(&self.naming, kind, &content, began)?,
           chain: None,
         };
         let made = Made {
@@ -958,14 +1120,20 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
           content,
           hold,
         };
-        (State::Resolved(named), Some(made))
+        (State::Resolved(named), Some(made), None)
       }
       Representation::OfsDelta { base } => {
         let entry = self
           .entry_at(base)
           .ok_or(Refusal::BaseNotAnEntry { at: began, base })?;
         let delta = (content, hold);
-        self.delta_state(delta, Base::Entry(entry), None, began, (admission, keep))?
+        self.delta_state(
+          delta,
+          (Base::Entry(entry), None),
+          began,
+          (admission, keep),
+          making,
+        )?
       }
       Representation::RefDelta { base } => {
         let placed = self.index.offset_of(&base);
@@ -981,7 +1149,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
           None => Base::Id(base),
         };
         let delta = (content, hold);
-        self.delta_state(delta, base, expected, began, (admission, keep))?
+        self.delta_state(delta, (base, expected), began, (admission, keep), making)?
       }
     };
     let record = Record {
@@ -989,10 +1157,11 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       stored,
       state,
     };
-    Ok((record, made))
+    Ok((record, made, spent))
   }
 
-  /// Hands `made`, the object of the entry at position `at` (its offset and stored length `place`), to `keep`.
+  /// Hands `made`, the object of the entry at position `at` (its offset and stored length `place`), to `keep`, its
+  /// bytes lent: the buffer they lie in, for the reader to reuse.
   fn kept<K: Keep + ?Sized>(
     &self,
     at: usize,
@@ -1000,21 +1169,22 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     made: Made,
     admission: &mut Admission,
     keep: &mut K,
-  ) -> Result<(), Refusal> {
+  ) -> Result<Vec<u8>, Refusal> {
     let Made {
       named,
       content,
       hold,
     } = made;
-    let object = Object {
+    let object = ObjectRef {
       offset,
       stored,
       kind: named.kind,
       id: named.id,
-      content,
+      content: &content,
       chain: named.chain,
     };
-    keep.keep(at, object, hold, admission)
+    keep.keep(at, object, hold, admission)?;
+    Ok(content)
   }
 
   /// A delta's state: applied at once when its base is an entry already resolved, waiting otherwise; and the object it
@@ -1022,16 +1192,17 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
   fn delta_state<K: Keep + ?Sized>(
     &self,
     (delta, hold): (Vec<u8>, Hold),
-    base: Base,
-    expected: Option<ObjectId>,
+    (base, expected): (Base, Option<ObjectId>),
     at: u64,
     (admission, keep): (&mut Admission, &mut K),
-  ) -> Result<(State, Option<Made>), Refusal> {
+    making: &mut Vec<u8>,
+  ) -> Result<Settled<State>, Refusal> {
     if let Base::Entry(entry) = base
-      && let Applied::Made(made) = self.applied(entry, &delta, expected, at, (admission, &*keep))?
+      && let Applied::Made(made) =
+        self.applied(entry, (&delta, expected), at, (admission, &*keep), making)?
     {
       keep.release(hold, admission);
-      return Ok((State::Resolved(made.named), Some(made)));
+      return Ok((State::Resolved(made.named), Some(made), Some(delta)));
     }
     let waiting = Waiting {
       delta,
@@ -1039,7 +1210,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       base,
       expected,
     };
-    Ok((State::Waiting(waiting), None))
+    Ok((State::Waiting(waiting), None, None))
   }
 
   /// `delta` applied to the entry at `base`, its bytes read back from `keep`: the object it made; or not yet, where
@@ -1049,10 +1220,10 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
   fn applied<K: Keep + ?Sized>(
     &self,
     base: usize,
-    delta: &[u8],
-    expected: Option<ObjectId>,
+    (delta, expected): (&[u8], Option<ObjectId>),
     at: u64,
     (admission, keep): (&mut Admission, &K),
+    making: &mut Vec<u8>,
   ) -> Result<Applied, Refusal> {
     let Some(Record {
       state: State::Resolved(source),
@@ -1088,26 +1259,27 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       depth,
     };
     self
-      .apply_to_source(source, delta, at, admission)
+      .apply_to_source(source, (delta, at), admission, making)
       .map(Applied::Made)
   }
 
   /// `delta`, the entry at `at`'s, applied to `source`: the object it makes, of the source's type, one delta deeper,
-  /// its bytes held on `admission`.
+  /// its bytes held on `admission`, made into `making`'s buffer, which the object then holds.
   fn apply_to_source(
     &self,
     source: Source<'_>,
-    delta: &[u8],
-    at: u64,
+    (delta, at): (&[u8], u64),
     admission: &mut Admission,
+    making: &mut Vec<u8>,
   ) -> Result<Made, Refusal> {
-    let (content, hold) = held_while(admission, |admission| {
-      delta::apply(source.content, delta, admission)
+    let mut content = core::mem::take(making);
+    let ((), hold) = held_while(admission, |admission| {
+      delta::apply_into(source.content, delta, admission, &mut content)
         .map_err(|refusal| Refusal::Delta { at, refusal })
     })?;
     let named = Resolved {
       kind: source.kind,
-      id: name_object(self.format, source.kind, &content, at)?,
+      id: name_object(&self.naming, source.kind, &content, at)?,
       chain: Some(Chain {
         base: source.id,
         depth: source.depth.saturating_add(1),
@@ -1375,8 +1547,10 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     else {
       return Ok(false);
     };
-    let made = self.apply_to_source(source, &waiting.delta, *offset, admission)?;
-    self.settle(child, made, (admission, keep))?;
+    let mut making = core::mem::take(&mut self.making);
+    let made = self.apply_to_source(source, (&waiting.delta, *offset), admission, &mut making);
+    self.give_back(making);
+    self.settle(child, made?, (admission, keep))?;
     Ok(true)
   }
 
@@ -1396,14 +1570,16 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     else {
       return Ok(Applied::BaseWaiting);
     };
+    let mut making = core::mem::take(&mut self.making);
     let applied = self.applied(
       parent,
-      &waiting.delta,
-      waiting.expected,
+      (&waiting.delta, waiting.expected),
       *offset,
       (admission, &*keep),
-    )?;
-    let made = match applied {
+      &mut making,
+    );
+    self.give_back(making);
+    let made = match applied? {
       Applied::Made(made) => made,
       Applied::BaseWaiting => return Ok(Applied::BaseWaiting),
       Applied::BaseAway(away) => return Ok(Applied::BaseAway(away)),
@@ -1427,8 +1603,11 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     let state = core::mem::replace(&mut record.state, State::Resolved(made.named));
     if let State::Waiting(waiting) = state {
       keep.release(waiting.hold, admission);
+      self.give_back(waiting.delta);
     }
-    self.kept(child, place, made, admission, keep)
+    let buffer = self.kept(child, place, made, admission, keep)?;
+    self.give_back(buffer);
+    Ok(())
   }
 
   /// Why the delta at `first`, the first still waiting in pack order, never resolved: its chain walked base by base, at
@@ -1515,12 +1694,15 @@ fn inflate(inflater: &mut Decompress, data: &mut Data, rest: &[u8]) -> Result<In
 /// The name of an object of `kind` whose content is `content`, in `format`: refused when the content carries a
 /// collision attack.
 fn name_object(
-  format: ObjectFormat,
+  naming: &core::cell::RefCell<Hasher>,
   kind: Kind,
   content: &[u8],
   at: u64,
 ) -> Result<ObjectId, Refusal> {
-  name_of(format, kind, content).map_err(|attack| Refusal::Collision { at, attack })
+  naming
+    .borrow_mut()
+    .name(kind, content)
+    .map_err(|attack| Refusal::Collision { at, attack })
 }
 
 /// Runs `make` within what `admission` has left, then holds on it what `make` charged: what it made, and the hold that

@@ -1162,8 +1162,17 @@ fn copied_dir(to: &str, (from, rev): (&str, u64)) -> String {
   )
 }
 
-/// [`imported_whole_and_stepped`]'s reading: the youngest revision, the longest step, its window, and the copies grafted.
-type ImportedWholeAndStepped = (Result<u64, String>, u64, u64, (u64, u64, u64, u64), u64);
+/// [`imported_whole_and_stepped`]'s reading: the youngest revision, the longest step, its window, and the copies grafted;
+/// and its landing steps' most off the CPU with the large frees its prepare steps made (`staging::returned`) and the
+/// fewer of its shard's two kept rooms' reuses (`staging::IncrementBuffer`); and its import batch's measures' large
+/// frees on the shard with the commit states they handed the reaper (`ImportBatch::measure_pending`).
+type ImportedWholeAndStepped = (
+  Result<u64, String>,
+  u64,
+  u64,
+  (u64, u64, u64, u64),
+  (u64, u64, u64, (u64, u64)),
+);
 
 /// `dump` imported on a store-backed shard: its youngest revision, the shard's longest step and its window, and the
 /// copies the green grafted (`Green::copies_grafted`).
@@ -1197,15 +1206,33 @@ fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWhol
       print_phases(name);
       // Each landing step's most off its CPU, and the steps the allocator handed pages back in (`staging::returned`).
       let off_cpu = on(|state| {
-        use crate::repository::svn_commit::staging::{LANDING_OFF_CPU_MOST_NS, returned};
+        use crate::repository::svn_commit::staging::{
+          ENTRY_INDEX_REUSED, INCREMENT_BUFFER_REUSED, LANDING_OFF_CPU_MOST_NS, returned,
+        };
         let back = returned::taken();
         let most = count(state, LANDING_OFF_CPU_MOST_NS);
+        // The fewer of the two kept rooms' reuses: both rooms are taken again once a first use has given them back.
+        let reused = count(state, INCREMENT_BUFFER_REUSED).min(count(state, ENTRY_INDEX_REUSED));
+        // The import batch's commit states handed to the reaper whole at their measures' ends.
+        let reaped = count(state, crate::import_batch::COMMITTING_REAPED);
         eprintln!(
           "OFFCPU {name} landing_off_cpu_most_ns={most} returned_steps={} returned_off_ns={} returned_bytes={} \
-           slowest_fell_bytes={} slowest_off_ns={}",
-          back.steps, back.off_ns, back.bytes, back.slowest.0, back.slowest.1
+           slowest_fell_bytes={} slowest_off_ns={} prepare_large_frees={} kept_rooms_reused={reused} \
+           measure_large_frees={} committing_reaped={reaped}",
+          back.steps,
+          back.off_ns,
+          back.bytes,
+          back.slowest.0,
+          back.slowest.1,
+          back.prepare_large_frees,
+          back.measure_large_frees
         );
-        most
+        (
+          most,
+          back.prepare_large_frees,
+          reused,
+          (back.measure_large_frees, reaped),
+        )
       });
       (
         loaded
@@ -1234,7 +1261,7 @@ fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWhol
   );
   eprintln!(
     "{name}: a landing step's most off its CPU {} us",
-    read.5 / 1000
+    read.5.0 / 1000
   );
   (read.0, read.1, read.2, read.3, read.5)
 }
@@ -1636,6 +1663,18 @@ fn phases_line(name: &str, (wall_ns, cpu_ns): (u64, u64), spans: &[super::phase:
   )
 }
 
+/// A wide import's batch measures freed no block of 64 KiB or more on the shard, and handed each commit's state to the
+/// reaper whole (`(measure_large_frees, committing_reaped)`; A-920, main's order of 2026-11-28 04:24: a 9,000-file
+/// revision's commit state, its 9,216,000-byte post-state among 8 large blocks, 15,250,904 bytes, was dropped on the
+/// shard at its measure's end, debug).
+fn measure_freed_nothing_large((large, reaped): (u64, u64)) {
+  assert_eq!(
+    large, 0,
+    "the batch measures freed {large} blocks of 64 KiB or more"
+  );
+  assert!(reaped > 0, "no commit state was handed to the reaper");
+}
+
 /// Goal 93 (main's order of 2026-11-26 after probe 8: no fixture copied or moved a wide tree, so the commit's copies
 /// and node moves never ran wide). Do: import [`wide_trunk`]'s revision 1 adding `trunk` and [`WIDE_REVISION_FILES`]
 /// files of [`WIDE_TEXT_BYTES`] under it, and a revision 2 copying `trunk` at revision 1 to `branch`. Expect the import
@@ -1648,12 +1687,15 @@ fn t_a920_a_revision_copying_a_tree_of_thousands_of_files_imports_with_every_ste
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1))],
   );
-  let (loaded, longest_ns, window_ns, (grafted, _, walk_most, _), _) =
+  let (loaded, longest_ns, window_ns, (grafted, _, walk_most, _), (_, _, _, measure)) =
     imported_whole_and_stepped("wide-copy", dump);
   assert_eq!(loaded, Ok(2));
-  // A landing step's most off its CPU is printed (OFFCPU) and not yet held to 84a's 1 ms bar: it is held there again
-  // with the fix that ends one free's return of about 50 MB of pages inside a step (main's ruling of 2026-11-27 22:16:
-  // a red lands with its fix). The page-return reading is process-wide (`Facts::footprint_now`).
+  measure_freed_nothing_large(measure);
+  // A landing step's most off its CPU is printed (OFFCPU), not asserted: in a debug lib test on a loaded Mac a step is
+  // preempted past 84a's 1 ms bar with no page return (1.70 ms with no footprint fall at load 39, and 34.7 ms in the
+  // server set's run, 2026-11-28), so main's bare-metal release rounds hold the bar (main's ruling of 2026-11-28 02:42).
+  // The fix that ended one free's return of 25-115 MB inside a landing step, the shard's kept increment buffer, is held
+  // by its count (`prepare_large_frees`, the move's test). The page-return reading is process-wide.
   assert!(grafted > 0, "no copy grafted");
   // The copy's tree walked a file a unit in its revision's recording (A-920 9a: its 9,000 files in one unit, 23.5-30.6
   // ms, debug).
@@ -1683,8 +1725,24 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1)), moved],
   );
-  let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most, gone_most), _) =
-    imported_whole_and_stepped("wide-move", dump);
+  let (
+    loaded,
+    longest_ns,
+    window_ns,
+    (grafted, build_units, walk_most, gone_most),
+    (_, large, reused, measure),
+  ) = imported_whole_and_stepped("wide-move", dump);
+  // A landing's prepare frees no large buffer on its shard: each version's increment encoded into the shard's kept
+  // buffer, reserved once at its exact length (A-920, main's ruling of 2026-11-28 01:38: its buffer doubled through 64
+  // KiB to 2 MiB, freeing each smaller one, the 512 KiB one inside the step whose footprint fell 29.8 MB, debug).
+  // Each of the shard's kept rooms was taken again with its room (its non-vacuity count): the increment's buffer by a
+  // later version's encoding, the entry's index by a later entry or import measure.
+  assert!(reused > 0, "a kept room was never reused");
+  measure_freed_nothing_large(measure);
+  assert_eq!(
+    large, 0,
+    "the landings' prepare steps freed {large} buffers of 64 KiB or more"
+  );
   // The move's delete of the trunk walked, noted gone and its paths made ops a path a unit in its build (A-920 9b: the
   // row 13.7 ms and the build's end 6.6 ms for 9,001 paths in one unit each, debug; and its tree listed whole in the
   // row's unit, 2.2 ms, red at 9,000).

@@ -294,9 +294,11 @@ pub(crate) fn install(end: Option<ReaperEnd>) {
 
 /// What a release step's caller took, `reaped`, handed to the calling thread's reaper to be dropped there; dropped in
 /// place, counted, when the reaper's queue is at its bound or the thread has none. Nothing taken is nothing sent.
-pub(crate) fn reap(reaped: Reaped) {
+/// Whether it was handed (or was nothing): false when it was dropped in place, so a caller can count that where a run
+/// reads it (`ImportBatch::measure_pending`'s `repository.import.committing_dropped_inline`).
+pub(crate) fn reap(reaped: Reaped) -> bool {
   if reaped.is_empty() {
-    return;
+    return true;
   }
   let taken = reaped.taken();
   let back = END.with(|end| match end.try_borrow() {
@@ -322,6 +324,7 @@ pub(crate) fn reap(reaped: Reaped) {
     }
     counts.set(now);
   });
+  handed
 }
 
 /// What the calling shard thread has handed its reaper and dropped in place so far: read by the tests that hold a

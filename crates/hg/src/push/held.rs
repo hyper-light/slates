@@ -223,6 +223,96 @@ impl crate::render::StoreWants for TextAsk {
   }
 }
 
+/// The texts of file revisions of several logs asked of the node's changeset store at once (goal 93; main 01a20182's
+/// ruling of 2026-11-28 03:47: a line's owed build read 2,384 let-go texts back an ask each, a row's want and a text's,
+/// 4,780 asks at about 1.25 ms of waiting each): every revision's row in one want, then their texts in one, within `most`
+/// bytes together. Taken, each revision the store kept a row of, with its path and its text, in the order asked.
+pub struct FilesAsk {
+  /// The revisions asked, each its file's path and its node.
+  asked: Vec<(Vec<u8>, Node)>,
+  /// What is asked next.
+  want: Option<crate::render::Want>,
+  /// The most bytes the texts may hold together.
+  most: u64,
+  /// Where in [`FilesAsk::asked`] each revision whose row the store gave stands, in order: what the texts are given for.
+  found: Vec<usize>,
+  /// The texts, once given.
+  texts: Option<Vec<Vec<u8>>>,
+}
+
+impl FilesAsk {
+  /// The ask of the texts of `asked`, each a file's path and a revision's node, within `most` bytes together: their rows
+  /// first, each under its file's path.
+  pub fn new(asked: Vec<(Vec<u8>, Node)>, most: u64) -> Self {
+    let logs = asked
+      .iter()
+      .map(|(path, node)| (path.clone(), vec![*node]))
+      .collect();
+    FilesAsk {
+      want: Some(crate::render::Want::Rows { logs }),
+      asked,
+      most,
+      found: Vec::new(),
+      texts: None,
+    }
+  }
+
+  /// The revisions asked, each its path and node.
+  pub fn asked(&self) -> &[(Vec<u8>, Node)] {
+    &self.asked
+  }
+
+  /// The texts the store gave, each with its path and node, in the order asked; none where it gave no text of any.
+  pub fn taken(self) -> Vec<(Vec<u8>, Node, Vec<u8>)> {
+    let Some(texts) = self.texts else {
+      return Vec::new();
+    };
+    self
+      .found
+      .into_iter()
+      .zip(texts)
+      .filter_map(|(at, text)| {
+        let (path, node) = self.asked.get(at)?.clone();
+        Some((path, node, text))
+      })
+      .collect()
+  }
+}
+
+impl crate::render::StoreWants for FilesAsk {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self.want.as_ref()
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    let mut texts = Vec::new();
+    for (at, log) in rows.into_iter().enumerate() {
+      if let Some(row) = log.into_iter().next().flatten() {
+        self.found.push(at);
+        texts.push(row.text);
+      }
+    }
+    self.want = (!texts.is_empty()).then_some(crate::render::Want::Texts {
+      texts,
+      most: self.most,
+    });
+  }
+
+  fn give_chunks(&mut self, _chunks: Vec<Vec<u8>>) {
+    self.want = None;
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    self.want = None;
+    self.texts = Some(texts);
+  }
+
+  fn texts_past(&mut self) {
+    self.want = None;
+    self.texts = None;
+  }
+}
+
 /// The texts of revisions of one log asked of the node's changeset store at once, by node (goal 93, C1 (1); main's ruling
 /// of 2026-11-24 03:17: a replay reads the changesets' texts let go once landed, as many as a unit's room holds in one
 /// want): their rows under the log's path, then their texts within `most` bytes. Taken, each node with its text, in

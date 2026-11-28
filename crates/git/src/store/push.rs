@@ -538,6 +538,17 @@ impl Push {
     self.reading.get_mut().recent().keep(place, kind, bytes);
   }
 
+  /// [`Push::keep_read`] of an object lent by its reader, whose buffer the reader reuses (main 01a20182's ruling of
+  /// 2026-11-28 01:23): its bytes copied where they are kept.
+  pub fn keep_read_lent(&mut self, offset: u64, kind: Kind, bytes: &[u8]) {
+    let place = self.own(offset);
+    self
+      .reading
+      .get_mut()
+      .recent()
+      .keep_lent(place, kind, bytes);
+  }
+
   /// The bytes the push's reading keeps lately ([`super::packed::Recent`]).
   pub fn kept_lately(&self) -> usize {
     self.reading.borrow_mut().recent().bytes()

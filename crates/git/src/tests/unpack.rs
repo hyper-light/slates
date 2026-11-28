@@ -818,11 +818,11 @@ impl Keep for Elsewhere {
   fn keep(
     &mut self,
     at: usize,
-    object: Object,
+    object: super::ObjectRef<'_>,
     hold: Hold,
     admission: &mut Admission,
   ) -> Result<(), Refusal> {
-    self.objects.insert(at, object);
+    self.objects.insert(at, object.to_object());
     admission.release(hold);
     Ok(())
   }
@@ -1306,7 +1306,7 @@ impl Keep for ReadBackAway {
   fn keep(
     &mut self,
     at: usize,
-    object: super::Object,
+    object: super::ObjectRef<'_>,
     hold: crate::Hold,
     admission: &mut Admission,
   ) -> Result<(), super::Refusal> {

@@ -395,6 +395,399 @@ fn last_changes_given_up_after(works: &[Changes], turns: u64) -> Result<bool, St
   Ok(staged)
 }
 
+/// Two greens given every path and `works` whole, the second never read since, so its identity holds every key the
+/// works changed unfolded (A-579): the serial twin, folded at its head, and the green a stage runs on.
+fn twins_unfolded(works: &[Changes]) -> (Green, Green) {
+  (
+    submitted_in_every_dimension(works),
+    submitted_in_every_dimension(works),
+  )
+}
+
+/// The identity a reader reads of `green` at its head, folding what is owed ([`Green::head_identity`]), with the fold's
+/// bookkeeping after it.
+fn identity_read(green: &mut Green) -> String {
+  let identity = green.head_identity();
+  format!("{} {identity:?} {:?}", green.head(), green.identity_folded)
+}
+
+/// Stages `inc`'s accepted verdict on `staged` one unit a step, a reader folding its identity between every two steps
+/// from the `from`th on (its first fold the first to meet the stage's in-place writes, so no earlier read drains the
+/// backlog for the stage), each read held to `at_head` (the serial twin's at the head before the stage), then publishes
+/// it: its version, none for any other judgment, and whether a read was made.
+fn identity_unseen(
+  staged: &mut Green,
+  inc: &Increment,
+  (at_head, from): (&str, u64),
+) -> Result<(Option<u64>, bool), String> {
+  let Judgment::Accepted(held) = staged.judge(inc) else {
+    return Ok((None, false));
+  };
+  let mut staging = staged.begin_staging(held);
+  let mut read_once = false;
+  loop {
+    let stepped = staged.staging_step(&mut staging, &mut || true);
+    if staging.units() > from {
+      read_once = true;
+      let read = identity_read(staged);
+      if read != at_head {
+        return Err(format!(
+          "a reader's fold saw the stage at unit {}: {read} against {at_head}",
+          staging.units()
+        ));
+      }
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  Ok((
+    staged.publish(staging).map(|(version, _)| version),
+    read_once,
+  ))
+}
+
+/// [`identity_unseen`] on fresh twins of a green given `before` whole, for `last`, the reader's first fold after the
+/// `from`th step: whether a read was made (`false` once `from` is past the stage's steps).
+fn identity_unseen_from(before: &[Changes], last: &Changes, from: u64) -> Result<bool, String> {
+  let (mut serial, mut staged) = twins_unfolded(before);
+  let at_head = identity_read(&mut serial);
+  let inc = work_in_every_dimension(&serial, last, u64::MAX);
+  let (version, read) = identity_unseen(&mut staged, &inc, (&at_head, from))?;
+  let (outcome, _) = serial.submit_resolved(&inc);
+  let accepted = match outcome {
+    super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+    _ => None,
+  };
+  if version != accepted {
+    return Err(format!("staged {version:?}, serial {accepted:?}"));
+  }
+  let (staged_read, serial_read) = (identity_read(&mut staged), identity_read(&mut serial));
+  if staged_read != serial_read {
+    return Err(format!(
+      "published {staged_read} against the serial twin's {serial_read}"
+    ));
+  }
+  Ok(read)
+}
+
+/// Gives up the stage of `works`' last work after `turns` steps on the unfolded twin of a green given the others, a
+/// reader folding between its steps: whether it finished within its turns, refused where the identity a reader reads
+/// after the refusal is not the serial twin's at the head.
+fn identity_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let (mut serial, mut staged) = twins_unfolded(before);
+  let at_head = identity_read(&mut serial);
+  let inc = work_in_every_dimension(&staged, last, u64::MAX);
+  let Judgment::Accepted(held) = staged.judge(&inc) else {
+    return Ok(true);
+  };
+  let mut staging = staged.begin_staging(held);
+  for _ in 0..turns {
+    if let StagingStep::Staged = staged.staging_step(&mut staging, &mut || true) {
+      return Ok(true);
+    }
+  }
+  staged.abandon_staging(staging);
+  let read = identity_read(&mut staged);
+  if read != at_head {
+    return Err(format!(
+      "a stage given up after {turns} turns left the identity at {read} against {at_head}"
+    ));
+  }
+  Ok(false)
+}
+
+/// The seven chunk-free current maps as every reader reads them at the head: each one's keys and values, in order.
+fn current_maps_read(green: &Green) -> String {
+  format!(
+    "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
+    green.specials.iter().collect::<Vec<_>>(),
+    green.dirs.iter().collect::<Vec<_>>(),
+    green.modes.iter().collect::<Vec<_>>(),
+    green.symlinks.iter().collect::<Vec<_>>(),
+    green.hardlinks.iter().collect::<Vec<_>>(),
+    green.xattrs.iter().collect::<Vec<_>>(),
+    green.links_to.iter().collect::<Vec<_>>(),
+  )
+}
+
+/// The seven maps' arenas' live nodes: what a stage given up must leave as it found (no copy of a node kept).
+fn current_maps_held(green: &Green) -> [usize; 7] {
+  [
+    green.specials.live_nodes(),
+    green.dirs.live_nodes(),
+    green.modes.live_nodes(),
+    green.symlinks.live_nodes(),
+    green.hardlinks.live_nodes(),
+    green.xattrs.live_nodes(),
+    green.links_to.live_nodes(),
+  ]
+}
+
+/// [`changes_unseen`] with the seven current maps read between the steps ([`current_maps_read`]).
+fn current_maps_unseen(green: &mut Green, inc: &Increment) -> Result<Option<u64>, String> {
+  let Judgment::Accepted(held) = green.judge(inc) else {
+    return Ok(None);
+  };
+  let before = current_maps_read(green);
+  let mut staging = green.begin_staging(held);
+  loop {
+    let stepped = green.staging_step(&mut staging, &mut || true);
+    if current_maps_read(green) != before {
+      return Err(format!(
+        "a reader saw the stage's current maps at unit {}",
+        staging.units()
+      ));
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  Ok(green.publish(staging).map(|(version, _)| version))
+}
+
+/// [`changes_given_up_after`] with the seven current maps and their arenas' live nodes the guard.
+fn current_maps_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let mut green = submitted_in_every_dimension(before);
+  let inc = work_in_every_dimension(&green, last, u64::MAX);
+  let Judgment::Accepted(held) = green.judge(&inc) else {
+    return Ok(true);
+  };
+  let (read, nodes) = (current_maps_read(&green), current_maps_held(&green));
+  let mut staging = green.begin_staging(held);
+  let mut staged = false;
+  for _ in 0..turns {
+    if let StagingStep::Staged = green.staging_step(&mut staging, &mut || true) {
+      staged = true;
+      break;
+    }
+  }
+  green.abandon_staging(staging);
+  if current_maps_read(&green) != read {
+    return Err(format!(
+      "a stage given up after {turns} turns left a current map changed"
+    ));
+  }
+  let left = current_maps_held(&green);
+  if left != nodes {
+    return Err(format!(
+      "a stage given up after {turns} turns left nodes {left:?}, from {nodes:?}"
+    ));
+  }
+  Ok(staged)
+}
+
+/// The content map as every reader reads it at the head: each file's path and content, in order.
+fn content_map_read(green: &Green) -> String {
+  format!("{:?}", green.content.iter().collect::<Vec<_>>())
+}
+
+/// [`changes_unseen`] with the content map read between the steps ([`content_map_read`]).
+fn content_map_unseen(green: &mut Green, inc: &Increment) -> Result<Option<u64>, String> {
+  let Judgment::Accepted(held) = green.judge(inc) else {
+    return Ok(None);
+  };
+  let before = content_map_read(green);
+  let mut staging = green.begin_staging(held);
+  loop {
+    let stepped = green.staging_step(&mut staging, &mut || true);
+    if content_map_read(green) != before {
+      return Err(format!(
+        "a reader saw the stage's content map at unit {}",
+        staging.units()
+      ));
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  Ok(green.publish(staging).map(|(version, _)| version))
+}
+
+/// [`changes_given_up_after`] with the content map and its arena's nodes the guard: a stage that copied content nodes
+/// gave them back. (The blocks' live count waits for U8, below.)
+fn content_map_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let mut green = submitted_in_every_dimension(before);
+  let inc = work_in_every_dimension(&green, last, u64::MAX);
+  let Judgment::Accepted(held) = green.judge(&inc) else {
+    return Ok(true);
+  };
+  let (read, live) = (content_map_read(&green), green.content.live());
+  let mut staging = green.begin_staging(held);
+  let mut staged = false;
+  for _ in 0..turns {
+    if let StagingStep::Staged = green.staging_step(&mut staging, &mut || true) {
+      staged = true;
+      break;
+    }
+  }
+  green.abandon_staging(staging);
+  if content_map_read(&green) != read {
+    return Err(format!(
+      "a stage given up after {turns} turns left the content map changed"
+    ));
+  }
+  // The arena's live nodes; the blocks' live count is U8's red (main 01a20182's ruling (b) of 2026-11-28 03:41): a
+  // stage given up after `set_file`'s re-anchor leaves the content history, written in place until U8, naming the
+  // stage's block (6 against 5).
+  let left = green.content.live().1;
+  if left != live.1 {
+    return Err(format!(
+      "a stage given up after {turns} turns left nodes {left}, from {}",
+      live.1
+    ));
+  }
+  Ok(staged)
+}
+
+/// The content history as it is published: each path's entries in full, every value's pieces and their chunks, and
+/// every value's bytes read through them. A reader between a stage's steps reads it so; a refusal must leave it so.
+pub(super) fn content_history_held(green: &Green) -> String {
+  // Each value's bytes too, read through the chunks: a value's pieces can stay as they were while the chunk they name
+  // is repointed (the layered re-anchor's anchor), which only a read through the chunks shows.
+  let read: Vec<(String, Vec<Option<Vec<u8>>>)> = green
+    .content_history
+    .iter()
+    .map(|(path, history)| {
+      let values = history
+        .iter()
+        .map(|(_, value)| {
+          value
+            .as_ref()
+            .and_then(|value| value.materialize(&green.chunks, green.content.blocks()))
+        })
+        .collect();
+      (path, values)
+    })
+    .collect();
+  format!(
+    "{:?}\n{read:?}",
+    green.content_history.iter().collect::<Vec<_>>()
+  )
+}
+
+/// Every file's bytes at every version up to the head: what the published content history and map answer a reader.
+pub(super) fn content_bytes_read(green: &Green) -> String {
+  let head = green.head();
+  let mut read = String::new();
+  for version in 0..=head {
+    for path in PATHS {
+      read.push_str(&format!(
+        "{version} {path} {:?}\n",
+        green.content_ref_at_bytes(path, version)
+      ));
+    }
+  }
+  read
+}
+
+/// The chunk guard (main 01a20182's rulings of 2026-11-28 01:29 and 03:41): each live chunk's count is the pieces the
+/// green's content history values name it by, so none is released twice and none freed while a value names it. It
+/// holds of a history with no layered anchor (these works make and remove files, never overwrite one in place); a
+/// layer holds its overwritten bytes' chunk outside any value, so `copy_tests`'s staged overwrites hold every chunk's
+/// holds to what they were instead.
+pub(super) fn chunks_held_once(green: &Green) -> Result<(), String> {
+  let mut named: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+  for (_, history) in green.content_history.iter() {
+    for chunk in history
+      .iter()
+      .filter_map(|(_, value)| value.as_ref())
+      .flat_map(crate::history::Value::chunks_named)
+    {
+      let count = named.entry(chunk).or_insert(0);
+      *count = count.saturating_add(1);
+    }
+  }
+  let held = green.chunks.holds();
+  if held == named {
+    return Ok(());
+  }
+  Err(format!(
+    "chunk holds {held:?}, named by the values {named:?}"
+  ))
+}
+
+/// [`changes_unseen`] with the published content history read between the steps ([`content_history_held`]) and the
+/// chunk guard after each.
+pub(super) fn content_history_unseen(
+  green: &mut Green,
+  inc: &Increment,
+) -> Result<Option<u64>, String> {
+  let Judgment::Accepted(held) = green.judge(inc) else {
+    return Ok(None);
+  };
+  let before = content_history_held(green);
+  let mut staging = green.begin_staging(held);
+  loop {
+    let stepped = green.staging_step(&mut staging, &mut || true);
+    if content_history_held(green) != before {
+      return Err(format!(
+        "a reader saw the stage's content history at unit {}",
+        staging.units()
+      ));
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  let version = green.publish(staging).map(|(version, _)| version);
+  chunks_held_once(green)?;
+  Ok(version)
+}
+
+/// [`changes_given_up_after`] with the content history, the content map's live blocks and the chunk guard the guard:
+/// U7's blocks assertion, (6, 4) from (5, 4) before this unit.
+fn content_history_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let mut green = submitted_in_every_dimension(before);
+  let inc = work_in_every_dimension(&green, last, u64::MAX);
+  let Judgment::Accepted(held) = green.judge(&inc) else {
+    return Ok(true);
+  };
+  let (history, live) = (content_history_held(&green), green.content.live());
+  let mut staging = green.begin_staging(held);
+  let mut staged = false;
+  for _ in 0..turns {
+    if let StagingStep::Staged = green.staging_step(&mut staging, &mut || true) {
+      staged = true;
+      break;
+    }
+  }
+  green.abandon_staging(staging);
+  if content_history_held(&green) != history {
+    return Err(format!(
+      "a stage given up after {turns} turns left the content history changed"
+    ));
+  }
+  let left = green.content.live();
+  if left != live {
+    return Err(format!(
+      "a stage given up after {turns} turns left (blocks, nodes) {left:?}, from {live:?}"
+    ));
+  }
+  chunks_held_once(&green)?;
+  Ok(staged)
+}
+
 /// The works [`proptest`] generates: one to eight, each of one to four changes.
 fn works() -> impl Strategy<Value = Vec<Changes>> {
   prop::collection::vec(
@@ -545,6 +938,182 @@ proptest! {
           break;
         }
       }
+    }
+  }
+
+  /// A-752 part 3c U5 (the identity, main 01a20182's ruling of 2026-11-28 02:46). Do: give the serial twin and the
+  /// staged green every path and the generated works but the last whole, the staged one never read, so its identity
+  /// owes the keys those works changed (a key the last work changes again among them); fold the serial twin at its head;
+  /// stage the last work's verdict on the other one unit a step, a reader folding its identity between every two
+  /// steps from the first, the second and so on (on fresh twins each time, so a fold first meets the stage after its
+  /// in-place writes); publish it, and give the serial twin the last work whole. Expect every read between the steps the serial
+  /// twin's at the head before the stage (its sum and its fold's bookkeeping), and after the publish the serial twin's
+  /// at the new head. Red before: the commit marked its keys dirty and took their entries out of the sum in place, so a
+  /// reader's fold took the stage's changes into the sum before the head moved; and, with the marks aside but the
+  /// published backlog not drained first, a reader's first fold after the stage wrote a key that backlog held
+  /// recomputed it from the stage's in-place writes.
+  #[test]
+  fn a_readers_fold_between_a_staged_verdicts_turns_reads_the_identity_at_the_head(steps in works()) {
+    let Some((last, before)) = steps.split_last() else {
+      return Ok(());
+    };
+    for from in 0u64.. {
+      if !identity_unseen_from(before, last, from).map_err(TestCaseError::fail)? {
+        break;
+      }
+    }
+  }
+
+  /// A-752 part 3c U5 (the identity, a refusal at every turn). Do: as above, the stage given up after every turn, a
+  /// reader folding between its steps. Expect the identity a reader reads after the refusal the serial twin's at the
+  /// head. Red before: a refusal left the stage's keys dirty and their entries out of the sum.
+  #[test]
+  fn a_stage_given_up_at_any_turn_leaves_the_identity_as_it_was(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if identity_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+
+  /// A-752 part 3c U6 (the seven chunk-free current maps forked into the stage; main 01a20182's ruling of 2026-11-28
+  /// 03:10). Do: as U2's, the IPC nodes', directories', modes', symbolic and hard links', attributes' and links-to
+  /// maps read between every two steps. Expect them as before the stage, and the same version and maps as the
+  /// twin's after each work. Red before: the commit wrote them in place.
+  #[test]
+  fn a_staged_verdicts_current_maps_move_only_at_its_publish(steps in works()) {
+    let (mut whole, mut staged) = (submitted_in_every_dimension(&[]), submitted_in_every_dimension(&[]));
+    for (id, changes) in (1u64..).zip(&steps) {
+      let inc = work_in_every_dimension(&whole, changes, id);
+      let (outcome, _) = whole.submit_resolved(&inc);
+      let version = current_maps_unseen(&mut staged, &inc).map_err(TestCaseError::fail)?;
+      let accepted = match outcome {
+        super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+        _ => None,
+      };
+      prop_assert_eq!(version, accepted);
+      prop_assert_eq!(current_maps_read(&staged), current_maps_read(&whole));
+    }
+  }
+
+  /// A-752 part 3c U6 (a refusal at every turn, its last too). Expect the seven maps as before, and their arenas'
+  /// live nodes as before: the stage's copies of nodes freed with it. Red before: a refusal left the maps changed.
+  #[test]
+  fn a_stage_given_up_at_any_turn_leaves_the_current_maps_and_their_nodes_as_they_were(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if current_maps_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+
+  /// A-752 part 3c U7 (the content map forked into the stage, its blocks held by the nodes that name them; main
+  /// 01a20182's rulings of 2026-11-28 01:29 and 03:10). Do: as U2's, the content map read between every two steps.
+  /// Expect it as before the stage; after each publish the same version, map and live blocks as the serial twin's, so
+  /// a block the stage copied a node of and the published root let go was released once, never twice.
+  #[test]
+  fn a_staged_verdicts_content_map_moves_only_at_its_publish(steps in works()) {
+    let (mut whole, mut staged) = (submitted_in_every_dimension(&[]), submitted_in_every_dimension(&[]));
+    for (id, changes) in (1u64..).zip(&steps) {
+      let inc = work_in_every_dimension(&whole, changes, id);
+      let (outcome, _) = whole.submit_resolved(&inc);
+      let version = content_map_unseen(&mut staged, &inc).map_err(TestCaseError::fail)?;
+      let accepted = match outcome {
+        super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+        _ => None,
+      };
+      prop_assert_eq!(version, accepted);
+      prop_assert_eq!(content_map_read(&staged), content_map_read(&whole));
+      prop_assert_eq!(staged.content.live().0, whole.content.live().0);
+    }
+  }
+
+  /// A-752 part 3c U7 (a refusal at every turn, its last too). Expect the content map and its arena's live nodes as
+  /// before: the stage's copies of nodes freed with it. Its blocks' live count is U8's red: a stage given up after
+  /// `set_file` leaves the content history, written in place until U8, naming the stage's new block.
+  #[test]
+  fn a_stage_given_up_at_any_turn_leaves_the_content_map_and_its_nodes_as_they_were(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if content_map_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+
+  /// A-752 part 3c U8 (the content history staged with chunk-holding copies; main 01a20182's rulings of 2026-11-28
+  /// 01:29, 03:10 and 03:41). Do: as U2's, works that make and remove files among the rest, the published content
+  /// history read between every two steps. Expect it held exactly as before the stage (its every value, re-anchored
+  /// or superseded by none but the stage's copies), after each publish every version's bytes the serial twin's, and the
+  /// chunk guard after each publish. Red before: the commit appended, superseded and re-anchored the published values
+  /// in place.
+  #[test]
+  fn a_staged_verdicts_content_history_moves_only_at_its_publish(steps in works()) {
+    let (mut whole, mut staged) = (submitted_in_every_dimension(&[]), submitted_in_every_dimension(&[]));
+    for (id, changes) in (1u64..).zip(&steps) {
+      let inc = work_in_every_dimension(&whole, changes, id);
+      let (outcome, _) = whole.submit_resolved(&inc);
+      let version = content_history_unseen(&mut staged, &inc).map_err(TestCaseError::fail)?;
+      let accepted = match outcome {
+        super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+        _ => None,
+      };
+      prop_assert_eq!(version, accepted);
+      prop_assert_eq!(content_bytes_read(&staged), content_bytes_read(&whole));
+    }
+  }
+
+  /// A-752 part 3c U8 (a refusal at every turn, its last too). Expect the content history held exactly as before, the
+  /// content map's live blocks and nodes as before, and the chunk guard. Red before: U7's blocks, a stage given up
+  /// after `set_file`'s re-anchor leaving (6, 4) from (5, 4), its history naming the stage's block.
+  #[test]
+  fn a_stage_given_up_at_any_turn_leaves_the_content_history_and_its_chunks_as_they_were(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if content_history_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+}
+
+/// A-752 part 3c U5's move case (main 01a20182's check of 2026-11-28 02:47: a key's fold may read a partner). Do: on the
+/// serial twin and the staged green, every path made; version 2 renames `a` onto `e`, left unfolded on the staged one;
+/// version 3 makes `a` again, staged one unit a step, a reader folding the identity between every two steps from the
+/// first, the second and so on (on fresh twins each time); then published, and the serial twin given it whole. Expect every read between the steps the serial twin's at version 2,
+/// and after the publish its at version 3.
+#[test]
+fn a_readers_fold_between_turns_reads_a_moved_keys_partner_as_at_the_head() {
+  for from in 0u64.. {
+    let (mut serial, mut staged) = (submitted(&[]), submitted(&[]));
+    for green in [&mut serial, &mut staged] {
+      let inc = Work::default()
+        .naming(OpKind::Rename, "e", "a")
+        .at(green.head(), 7);
+      let _ = green.submit_resolved(&inc);
+    }
+    let at_head = identity_read(&mut serial);
+    let inc = Work::default().create("a", b"again").at(serial.head(), 8);
+    let (version, read) = identity_unseen(&mut staged, &inc, (&at_head, from)).unwrap();
+    let (outcome, _) = serial.submit_resolved(&inc);
+    assert!(
+      matches!(outcome, super::Outcome::Accepted { .. }),
+      "{outcome:?}"
+    );
+    assert_eq!(version, Some(serial.head()));
+    assert_eq!(identity_read(&mut staged), identity_read(&mut serial));
+    if !read {
+      break;
     }
   }
 }

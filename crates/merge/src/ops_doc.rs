@@ -164,6 +164,14 @@ impl Ord for Name {
   }
 }
 
+// The index is looked a name up in by a borrowed `str` ([`PathTable::index_of`]): a `Name` orders as its `String`
+// does, which is how `str` orders, as `Borrow` requires.
+impl core::borrow::Borrow<str> for Name {
+  fn borrow(&self) -> &str {
+    &self.0
+  }
+}
+
 impl PartialOrd for Name {
   fn partial_cmp(&self, other: &Name) -> Option<Ordering> {
     Some(self.cmp(other))
@@ -224,6 +232,11 @@ impl PathTable {
       *index = rank;
     }
     remap
+  }
+
+  /// The index of `path`, without making a name of it (A-920: an entry's index finds a path's ops by it).
+  pub fn index_of(&self, path: &str) -> Option<u64> {
+    self.index.get(path).copied()
   }
 
   /// The path at `index`.
@@ -491,6 +504,23 @@ impl OpsDoc {
     true
   }
 
+  /// The length of [`OpsDoc::encode_piece`]'s `piece`, without writing it (A-920: an increment's encoding measured a
+  /// piece a unit, so its buffer is reserved once at its exact length and never grows); `None` past the last piece.
+  pub fn piece_len(&self, piece: usize) -> Option<usize> {
+    let (paths, nodes, ops) = (self.paths.paths(), self.nodes.nodes(), &self.ops);
+    let Some(index) = piece.checked_sub(1) else {
+      return Some(HEADER_BYTES);
+    };
+    if let Some(path) = paths.get(index) {
+      return Some(PATH_MIN_BYTES.saturating_add(path.len()));
+    }
+    let index = index.saturating_sub(paths.len());
+    if nodes.get(index).is_some() {
+      return Some(NODE_BYTES);
+    }
+    ops.get(index.saturating_sub(nodes.len())).map(|_| OP_BYTES)
+  }
+
   /// The increment identity's ops-document half: the BLAKE3 of the canonical encoding. The same
   /// declared work yields the same hash on every platform (the determinism gate).
   pub fn identity(&self) -> [u8; 32] {
@@ -585,6 +615,8 @@ fn take_nodes(
   Ok(nodes)
 }
 
+/// Format: the encoding's header: its magic and version (`u32` each), then its path, node and op counts (`u64` each).
+const HEADER_BYTES: usize = 2 * size_of::<u32>() + 3 * size_of::<u64>();
 /// The smallest a path entry can be in the encoding: its length prefix (a `u32`), for an empty path.
 const PATH_MIN_BYTES: usize = size_of::<u32>();
 /// Format: a node record's size (A-646, version 3): its origin, a byte, and its path's index, a `u64`.

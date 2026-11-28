@@ -170,7 +170,9 @@
 > increment over 1 MiB, the smaller carried in its entry.
 
 > **Open (w-shared, 2026-11-22; main 01a20182 03:17, 04:24 PST): a landed git push keeps 772-787 MiB resident for a
-> 56 MB pack** (git_interop `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history`,
+> 56 MB pack** (2026-11-28, w-git: the intake's per-object buffers removed, "A pack's intake reads its objects through
+> buffers it reuses": 20,192,853 bytes allocated reading 16,384,000 of objects before, 516,949 now; main's RSS round
+> owed) (git_interop `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history`,
 > git/git v2.0.0, release, the MacBook; bound 178.2 MiB). Attributed by the memory status's gauges (`mem.gauge.*`,
 > `crate::memory_gauges`, landed with this entry), in MB after the push: the system allocator's live blocks 55.9 (of
 > them the index tables 23.5); the repository's windows 61.3 in shard 0's arena and the pushed pack 53.9 on shard 1;
@@ -1347,9 +1349,62 @@
 > `a_retired_members_content_history_frees_no_key_or_tree_node_to_the_heap`). Page return, one debug run each of the server's wide tests (a point, not a judged figure): the copy's landing
 > step most off its CPU 3.9 µs, 20,054,184 bytes returned over 23 steps, none in a step whose footprint fell; the
 > move's 3.13 ms, in a step whose footprint fell 114,557,048 bytes (185,811,088 returned over 126 steps), so the
-> move's remains still return pages inside a step. Next, unit
-> 1b: the entry lists as runs of a lineage store (about 9,000 fewer), then 1c: the values' pieces (about 9,000 fewer);
-> the 1 ms assert returns with the piece after which the remains' drop frees nothing large.
+> move's pages were not the remains': see the buffer entry below. The remains' 9.8 MB took about a fifth of a 50 MB
+> return, and the whole content history 3.5 MB of it (debug, byte table at 9,000 paths). So 1c (the values' pieces as
+> runs, which makes a value `Copy`) and then 1b (the entry lists as plain runs) come after the pile's cuts (main's
+> ruling of 2026-11-28 01:31).
+
+> **A-920 a landing's increment buffer BUILT (w-svn, 2026-11-28; main's rulings of 01:38 and 01:46): the buffer is the
+> shard's, reserved once at the increment's exact length.** A test-only probe of the wide move's slowest landing step
+> (landing.prepare, 1,173,333 ns off its CPU, the footprint falling 25,427,992 bytes) saw the shard free one block,
+> 262,144 bytes, and the reaper 144 blocks, 8,999 bytes, in it. The pages came from earlier frees; one large free paid
+> for all of them. Its large frees were `IncrementEncoding`'s output doubling through 64 KiB to 1 MiB, then the 2 MiB
+> buffer dropped after its hold, for a 1,250,037-byte increment. Now `Increment::encode_step` measures first, a doc piece
+> a unit (`OpsDoc::piece_len`), and reserves its buffer once (`an_increments_stepped_encoding_reserves_exactly_its_length`
+> holds the room equal to the length). The buffer is the shard's (`staging::IncrementBuffer`): a landing takes it and
+> gives it back emptied, the larger kept within the green-chain byte cap and charged to the shard's budget as
+> retention while kept. A buffer too small, or not kept, is replaced by one of exact length and the old one goes to the
+> reaper (`repository.svn_commit.increment_buffer_reused`, `_made`, `_let_go`). Red: the wide move's prepare steps made
+> 10 frees of 64 KiB or more, 0 after (`staging::returned`'s `prepare_large_frees`, by the server's test-only counting
+> allocator). One debug run each after, a point: the copy's landing step most off its CPU 22.5 µs, 3,096,576 bytes
+> returned; the move's 26.1 µs, 2,654,208 bytes, none in a step whose footprint fell (it had been 1.17-3.13 ms with a
+> 25-115 MB fall). The 1 ms bar is not asserted in the wide tests (main's ruling of 02:42): debug in a loaded lib suite
+> preempts a step past it with no page return (1.70 ms with returned_steps 0 at load 39; 34.7 ms in the server set's
+> run), so main's bare-metal release rounds hold it, and the count holds the fix. On main's head after 86a8f9885 the old
+> encoder's runs showed no footprint fall at all (three debug runs, returned_bytes 0), where 1b7ea3a12's had 20-185 MB:
+> a change of regime main attributes by its own three-arm run (C = 1b7ea3a12, A = 86a8f9885, B = A less 0bf1837a7).
+> Left: the chain entry's measure (19,499 frees, 2.4 MB, in one prepare unit; built below), then the pile the
+> shard frees before a return: 838,930 blocks and 179,702,034 bytes before the move's first, against the reaper's
+> 64,933 and 5,353,567. By phase, stage.recording first (374 MB freed in one copy import), probe first.
+
+> **A-920 an entry's declared index BUILT (w-svn, 2026-11-28; main's order of 03:41): no allocation a path.** A chain
+> entry's index of what its increment declares (each path's content ops, each copy by destination and source; A-632)
+> was an ordered map of each path's name to a list of its ops, and a stepped entry kept the names as strings: a 9,000-file
+> entry's encoding freed 19,499 heap blocks and 2,373,794 bytes in the step it ended in (debug, the probe's count and
+> the red's, `a_wide_entrys_stepped_encoding_frees_nothing_a_path`). Now `chain_entry::DeclaredIndex` is one buffer of
+> words threaded through the ops by the path table's indices (a word a path, its list's first op; a word an op, the
+> next on its path), the paths read off the increment (`PathTable::index_of`): at most two frees for the same entry
+> from an empty room, none from a room of its size (`a_wide_entry_indexed_in_a_room_with_its_size_frees_nothing`). The
+> shard keeps that room beside the increment buffer (`staging::IncrementBuffer`'s index, its own counters
+> `repository.svn_commit.entry_index_reused`, `_made`, `_let_go`, charged and bounded as the buffer is), taken by a
+> landing's entry and an import batch's measure in turn; the wide move's test holds both rooms reused. The whole
+> (unstepped) encoder, `encoded_len`, the decoder and the computed verdict's wire read the same index, built fresh.
+
+> **A-920 the pile by phase, and an import batch's commit state to the reaper BUILT (w-svn, 2026-11-28; main's rulings
+> of 04:18 and 04:24).** A test-only probe of the shard thread's frees by import phase (one debug run of each wide test
+> at c29c18c7c, patch 162 alone) ranked them: between the history's polls (other tasks) 53-91 MB; landing.apply 26-37
+> MB; stage.recording 24-30 MB (not the 374 MB of 2026-11-27's table, before the holds and arena fixes);
+> landing.identity 4-28 MB; stage.measuring 15-18 MB in 12-17 frees; the rest under 18 MB each. stage.measuring's
+> were large blocks, the stall's shape: `ImportBatch::measure_pending` dropped the version's `Committing` on the shard
+> (8 blocks of 64 KiB or more, 15,250,904 bytes for 9,000 files, its post-state 9,216,000). It now goes to the reaper
+> whole (`let_go_committing`, `repository.import.committing_reaped`); at the reaper's bound `reaper::reap`'s rule
+> holds, dropped in place and counted (`repository.import.committing_dropped_inline`). Red by count: the measures'
+> frees of 64 KiB or more on the shard (`staging::returned`'s `measure_large_frees`) 8 (copy) and 12 (move) to 0, both
+> wide tests (88 % of memory free, patch 164's count hooks alone for the red). Main's three-arm run (2026-11-28 04:21)
+> found the page return a run's condition, not a commit's: 1b7ea3a12 returned pages in 1 of 6 runs there, where w-svn's
+> probe-patched runs of it had every time; so page-return figures carry their patches and free memory, and the gates
+> are counts. Next by main's order: the tasks behind "between polls", by task and size (probe first); then
+> landing.apply and stage.recording, small blocks.
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
@@ -4332,10 +4387,12 @@
 > last-turn units and quanta counted again. Part 3c (the engine's commit staged and published whole, main's rulings of
 > 2026-11-28 00:42 to 01:42): U0 BUILT, every read names its version; U1 BUILT, the head bump and `accepted` at the
 > publish, last, and the mode history appended in place and taken back at a refusal; U2 BUILT, every value history
-> alike; U3 BUILT, the change index; U4 BUILT, `file_removed` and the `*_changed` maps written aside (design's part
-> 3c); owed: the
-> identity, the current-state Dims (w-svn: deltas, the identity's sets, `latest_change`, `last_changed` and the change index as arena conversions, keeping U0's bounded reads), and the
-> content history after A-920 arena unit 1. Found by reading (2026-11-28, not worked): `file_removed` keeps only a
+> alike; U3 BUILT, the change index; U4 BUILT, `file_removed` and the `*_changed` maps written aside; U5 BUILT, the
+> identity's marks aside; U6 BUILT, the seven chunk-free current maps forked into the stage; U7 BUILT, the content map
+> forked and U5's drain-first rule deleted; U8 BUILT, the content history forked with chunk-holding copies and a
+> stage's re-anchor in full, closing U7's gap (design's part 3c). Owed, in main's order of 03:10: the commit's scalars
+> written back at the publish, then the staged commit wired into `repository::push`'s landing (t_a752's 14 ms the
+> bar). Found by reading (2026-11-28, not worked): `file_removed` keeps only a
 > path's latest removal, so `stack::levels`'s `== version` read (`levels.rs`:293) and its span read (:326) miss an
 > earlier removal that a later one overwrote.
 >
@@ -5366,10 +5423,11 @@
 > each at what the one before measured, and keeps the last round's (a walk of the whole history in one go missed the
 > walks' restart a step pays). Held by `a_shards_first_gathering_steps_are_held_to_their_slice_at_the_probes_first_cost`
 > (hg), `t_first_cost_a_fresh_daemons_first_stream_is_held_to_its_slice` (a fresh daemon's first stream, its median
-> gathering step) and `the_boot_profile_measures_a_gathered_rows_cost_with_its_inputs`. OPEN: one release run before
-> main's 01:19 ruling (the measurement is main's) read the probe at 739 ns a row against about 84 learned online, so a
-> shard's first stream is held to its slices but about a row a step until it learns; main's release run is requested
-> (run-requests.md) to read the probe against the learned cost.
+> gathering step) and `the_boot_profile_measures_a_gathered_rows_cost_with_its_inputs`. Main's release runs at
+> 86a8f9885 (2026-11-28 03:46, load 24 to 38): the test passed 3 of 3, its first cost 428, 280 and 308 ns a row,
+> against about 84 learned online, so 3.3 to 5.1 times high, the safe side: a shard's first stream is held to its
+> slices (p50 1,750, 2,209 and 2,125 ns against slices of 2,198, 2,147 and 2,460) and takes smaller steps than it needs
+> until the online cost takes over. OPEN, the probe's excess (main's guess, inferred: its small history's tables).
 > OPEN (main's hg round 3 at 47e37df66, 2026-11-28 01:47; the read charge in, the row cost not; record
 > `~/.local/state/main-01a20182/rounds/hg-stream-3/`): the stream clone 4.717 s best against stock's 1.482 (3.18x;
 > stock's own fell 3.046, 2.274, 1.482 s run to run), clone even, push 1.98x, incremental push 12.2x. The count stage is
@@ -5378,6 +5436,21 @@
 > after a push drives the stage (the run merge's timing, below); and the server's own span (0.94 to 1.99 s, store waits
 > 0.49 to 0.63 s) is well under the client's 4.7 to 6.4 s, hg reporting 13 to 18 MB/s from slates against 37 to 77 from
 > stock: the stream's write path (the socket, the write slices, the chunks' sizes sent) is where the wall's time is.
+> The incremental push's 11.3x, a first cut BUILT (2026-11-28, w-interop; main's rulings of 03:44 and 03:47). Main's
+> run at 86a8f9885 (03:05 to 03:38, hg_scale's counters around the push, 1360fd527): slates 9.527 s against stock's
+> 0.841, its largest counters waits: `merge.green.materialize_wait_ns_most` 6.46 s and `vcs_store.hg_stream_store_wait_ns`
+> 5.96 s over 4,780 store asks. The whole-history push left its line owing its tree (A-647, built when first reached),
+> and the one-changeset push was the first to reach it: its build read the line's 2,384 let-go file texts back
+> (`merge.green.materialize_texts_asked`), each a `TextAsk` of two wants (its row, then its text), about 1.25 ms of
+> waiting an ask: per ask, not per byte. Now the build asks its let-go texts a batch at a time
+> (`slates_hg::push::held::FilesAsk`, `push::tree::Layout::waited_batch`): the revision it waits for and the line's
+> other let-go revisions as many as the step's bytes hold (`hg_view::text_bytes_a_step`), every row in one want and
+> every text in one, counted `merge.green.materialize_text_asks`. Held by
+> `t_goal93_an_owed_lines_let_go_texts_are_asked_a_batch_an_ask`: 201 texts in 1 ask and 6 store asks (2 of them the
+> layout's changeset and manifest), from 201 asks and 406 store asks. Owed: main's next hg round reads whether
+> `materialize_wait_ns_most` is still the largest. Not taken (main's ruling of 03:47): beginning the owed build at the
+> landing, which A-647 leaves to the first reach. A sibling, not taken: a holder's replica build asks the same texts one
+> at a time (`replica_build`, `Layout::waited`).
 > OPEN, on the index's run merge: an index of many unmerged runs makes every restart costly. On the tests' 4 KiB layout
 > (55 runs, each one table holding a slice of every log) at a 94,797-byte step, 999 index steps and 31,888 reads for
 > 1,200 revisions: a restart opens about 32 tables, about 4.2 KB each, more than a step, so a step moves one row. The

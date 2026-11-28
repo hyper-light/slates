@@ -4165,3 +4165,102 @@ fn a_holders_replica_of_an_owed_line_is_made_and_reads_as_the_owners_line() {
   );
   assert_eq!(replica, owner, "the replica's tree is the owner's");
 }
+
+/// Every file revision repository `id` holds: its bytes' identity (what a landing lets go, A-767 C1) and its text's
+/// length.
+fn file_texts_of(state: &ShardState, id: RepositoryId) -> Vec<([u8; 32], u64)> {
+  let (content, store) = state.vcs_stores.mercurial_ref(id).expect("the store");
+  let index = &store.index;
+  let paths: Vec<Vec<u8>> = index.file_logs(content).map(<[u8]>::to_vec).collect();
+  paths
+    .iter()
+    .flat_map(|path| {
+      let log = Log::File(path);
+      (0..index.len(content, log))
+        .filter_map(move |rev| index.revision(content, log, rev))
+        .map(|row| (row.bytes.0, row.len))
+    })
+    .collect()
+}
+
+/// The shard's counts of a line's owed build's file texts read back, its asks of them, the stream store's asks, and the
+/// changeset and manifest texts its layout read (`hg_push::OWED_LOG_TEXTS_READ`, two wants each).
+fn text_asks_counted(state: &ShardState) -> [u64; 4] {
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  [
+    count(crate::green_ready::MATERIALIZE_TEXTS_ASKED),
+    count(crate::green_ready::MATERIALIZE_TEXT_ASKS),
+    count(crate::vcs_store::hg_view::STORE_ASKS),
+    count(crate::repository::hg_push::OWED_LOG_TEXTS_READ),
+  ]
+}
+
+/// Goal 93, the incremental push's 12.2x (main 01a20182's rulings of 2026-11-28 03:44 and 03:47: a line's owed build
+/// read 2,384 let-go texts back an ask each, a row's want and a text's, 4,780 store asks at about 1.25 ms of waiting
+/// each). Do: push a history of [`WIDE_TREE`] changesets, each adding a file, and one new line on it, owing its push;
+/// let every file revision's text go (`name_holds::let_go_landed_texts`; the landing lets them go already, so it frees
+/// what is left, none here); read the line through the door. Expect: the
+/// line made; its texts read back, many (non-vacuity: at least the tree's files); its asks of them at most the batches
+/// the step's bytes allow (`hg_view::text_bytes_a_step`) over the texts' bytes, one more for the first, whatever its
+/// length; and the changeset store asked at most two asks (a rows' want and a texts') for each, and two for each
+/// changeset or manifest text its layout read. Red before: two asks a text, 406 store asks for 201 texts.
+#[test]
+fn t_goal93_an_owed_lines_let_go_texts_are_asked_a_batch_an_ask() {
+  let (made, all) = wide_history(WIDE_TREE, 2);
+  let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &all);
+  let seen = crate::test_store::run_on_stored_shard(move || async move {
+    let hg = Hg::made("batched-texts").await;
+    let pushed = pushed_bytes_to(hg.repository, &bundle).await;
+    let (owing, texts, freed, before) = crate::repository::svn_commit::tests::on(|state| {
+      let owing = owing_lines(state, hg.repository);
+      let texts = file_texts_of(state, hg.repository);
+      let identities: Vec<[u8; 32]> = texts.iter().map(|(identity, _)| *identity).collect();
+      let freed = crate::vcs_store::name_holds::let_go_landed_texts(state, &identities);
+      (owing, texts, freed, text_asks_counted(state))
+    });
+    let mut pinned = crate::green_ready::Pinned::default();
+    let made = match owing.first() {
+      Some(green) => crate::green_ready::made_for(*green, &mut pinned).await,
+      None => None,
+    };
+    let (after, batch) = crate::repository::svn_commit::tests::on(|state| {
+      (
+        text_asks_counted(state),
+        crate::vcs_store::hg_view::text_bytes_a_step(state),
+      )
+    });
+    drop(pinned);
+    (
+      pushed,
+      owing.len(),
+      (texts, freed),
+      made,
+      (before, after),
+      batch,
+    )
+  });
+  let (pushed, owing, (texts, freed), made, (before, after), batch) = seen;
+  let [read, asks, store_asks, layout_texts] = [0, 1, 2, 3].map(|at| after[at] - before[at]);
+  let bytes: u64 = texts.iter().map(|(_, len)| len).sum();
+  let batches = bytes.div_ceil(batch.max(1)) + 1;
+  eprintln!(
+    "batched texts: {owing} owing, {} file revisions ({bytes} B, {freed} B let go), {read} read back in {asks} asks, \
+     {store_asks} store asks ({layout_texts} layout texts); a batch {batch} B, {batches} batches at most",
+    texts.len()
+  );
+  assert!(matches!(pushed, Outcome::Accepted(_)), "{pushed:?}");
+  assert_eq!(made, Some(true), "the line read was made");
+  assert!(
+    read >= u64::try_from(WIDE_TREE).unwrap(),
+    "the line's texts read back: {read}"
+  );
+  assert!(
+    asks <= batches,
+    "{asks} asks of {read} texts, at most {batches} batches"
+  );
+  assert!(
+    store_asks <= 2 * (batches + layout_texts),
+    "{store_asks} store asks for {read} texts and {layout_texts} layout texts, at most {} for {batches} batches",
+    2 * (batches + layout_texts)
+  );
+}

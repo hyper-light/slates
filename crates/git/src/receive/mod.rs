@@ -89,7 +89,7 @@ use crate::pack;
 use crate::pktline;
 use std::borrow::Cow;
 
-use crate::unpack::{self, Contents, Held, Keep, Kept, NoIndex, Object, Outside, Placed};
+use crate::unpack::{self, Contents, Held, Keep, Kept, NoIndex, ObjectRef, Outside, Placed};
 use crate::{Admission, PastAdmission, to_u64};
 
 /// What the repository a push is made to holds (A-614's object store implements it, A-638).
@@ -375,7 +375,7 @@ impl<R: ?Sized> Keep for InMemory<'_, R> {
   fn keep(
     &mut self,
     at: usize,
-    object: Object,
+    object: ObjectRef<'_>,
     hold: crate::Hold,
     admission: &mut Admission,
   ) -> Result<(), unpack::Refusal> {
@@ -415,7 +415,7 @@ impl<S: Keep + ?Sized> Keep for Thin<'_, S> {
   fn keep(
     &mut self,
     at: usize,
-    object: Object,
+    object: ObjectRef<'_>,
     hold: crate::Hold,
     admission: &mut Admission,
   ) -> Result<(), unpack::Refusal> {

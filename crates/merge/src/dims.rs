@@ -93,12 +93,6 @@ impl<V: Clone> Dim<V> {
     self.root.contains_key(&self.nodes, key.as_ref())
   }
 
-  /// The value under `key`, to change in place: the nodes on its path made this map's own first, so no other map that
-  /// shares them sees the change ([`crate::ptrie::Ptrie::get_mut`]).
-  pub(crate) fn get_mut(&mut self, key: impl AsRef<[u8]>) -> Option<&mut V> {
-    self.root.get_mut(&mut self.nodes, key.as_ref(), &mut Plain)
-  }
-
   /// Sets `key` to `value`; the value it replaced.
   pub(crate) fn insert(&mut self, key: impl AsRef<[u8]>, value: V) -> Option<V> {
     self
@@ -109,6 +103,48 @@ impl<V: Clone> Dim<V> {
   /// Takes `key` out; its value.
   pub(crate) fn remove(&mut self, key: impl AsRef<[u8]>) -> Option<V> {
     self.root.remove(&mut self.nodes, key.as_ref(), &mut Plain)
+  }
+
+  /// The value under `key`, to change in place: the nodes on its path made this map's own first, so no other map that
+  /// shares them sees the change ([`crate::ptrie::Ptrie::get_mut`]), the values of the nodes it copies told `holders`
+  /// they gained a holder: a map whose values name a resource outside the arena, forked (A-752 part 3c U8, the
+  /// content history's chunks).
+  pub(crate) fn get_mut_held(
+    &mut self,
+    key: impl AsRef<[u8]>,
+    holders: &mut impl crate::ptrie::Holders<V>,
+  ) -> Option<&mut V> {
+    self.root.get_mut(&mut self.nodes, key.as_ref(), holders)
+  }
+
+  /// [`Dim::insert`], its copied nodes' values told `holders` ([`Dim::get_mut_held`]).
+  pub(crate) fn insert_held(
+    &mut self,
+    key: impl AsRef<[u8]>,
+    value: V,
+    holders: &mut impl crate::ptrie::Holders<V>,
+  ) -> Option<V> {
+    self
+      .root
+      .insert(&mut self.nodes, key.as_ref(), value, holders)
+  }
+
+  /// [`Dim::remove`], its copied nodes' values told `holders` ([`Dim::get_mut_held`]).
+  pub(crate) fn remove_held(
+    &mut self,
+    key: impl AsRef<[u8]>,
+    holders: &mut impl crate::ptrie::Holders<V>,
+  ) -> Option<V> {
+    self.root.remove(&mut self.nodes, key.as_ref(), holders)
+  }
+
+  /// [`Dim::release_fork`], each value whose last node is freed told `holders` ([`Dim::get_mut_held`]).
+  pub(crate) fn release_fork_held(
+    &mut self,
+    mut fork: Dim<V>,
+    holders: &mut impl crate::ptrie::Holders<V>,
+  ) {
+    fork.root.release(&mut self.nodes, holders);
   }
 
   /// Every key and value, in key order.
@@ -183,6 +219,25 @@ impl<V: Clone> Dim<V> {
   /// empty after, and no node is freed until the steps run.
   pub(crate) fn releasing(&mut self) -> Releasing {
     self.root.releasing()
+  }
+
+  /// Exchanges this map with `fork`, a fork of it holding no arena, the arena staying in this field (A-752 part 3c
+  /// U6): the fork's root here, with the arena, and this one's in `fork`. Twice is none.
+  pub(crate) fn swap_with_fork(&mut self, fork: &mut Dim<V>) {
+    std::mem::swap(self, fork);
+    self.lend(fork);
+  }
+
+  /// Gives `fork`'s hold on its nodes back in this map's arena, `fork` holding none: what a stage's copies of nodes
+  /// cost, freed; the nodes this map shares with it stay (A-752 part 3c U6).
+  pub(crate) fn release_fork(&mut self, mut fork: Dim<V>) {
+    fork.root.release(&mut self.nodes, &mut Plain);
+  }
+
+  /// The nodes this map's arena holds live: what a test holds a stage's release to (A-752 part 3c U6).
+  #[cfg(test)]
+  pub(crate) fn live_nodes(&self) -> usize {
+    self.nodes.live()
   }
 
   /// The nodes walks of this map's arena visited, while it holds its arena ([`Nodes::visited`]).
@@ -817,6 +872,24 @@ impl Files {
     std::mem::swap(&mut self.blocks, &mut other.blocks);
   }
 
+  /// [`Dim::swap_with_fork`]: the arena and the blocks staying in this field (A-752 part 3c U7).
+  pub(crate) fn swap_with_fork(&mut self, fork: &mut Files) {
+    std::mem::swap(self, fork);
+    self.lend(fork);
+  }
+
+  /// [`Dim::release_fork`]: the blocks the freed nodes held let go with them, so a block the stage copied a node of is
+  /// released once, by the last node holding it (A-752 part 3c U7).
+  pub(crate) fn release_fork(&mut self, mut fork: Files) {
+    fork.map.root.release(&mut self.map.nodes, &mut self.blocks);
+  }
+
+  /// The blocks live and the nodes the map's arena holds live: what a test holds a stage's release to (A-752 part 3c U7).
+  #[cfg(test)]
+  pub(crate) fn live(&self) -> (usize, usize) {
+    (self.blocks.live(), self.map.live_nodes())
+  }
+
   /// [`Dim::releasing`]: the blocks are let go as their nodes are freed.
   pub(crate) fn releasing(&mut self) -> Releasing {
     self.map.releasing()
@@ -955,6 +1028,22 @@ impl Xattrs {
   /// [`Dim::lend`].
   pub(crate) fn lend(&mut self, other: &mut Xattrs) {
     self.map.lend(&mut other.map);
+  }
+
+  /// [`Dim::swap_with_fork`].
+  pub(crate) fn swap_with_fork(&mut self, fork: &mut Xattrs) {
+    self.map.swap_with_fork(&mut fork.map);
+  }
+
+  /// [`Dim::release_fork`].
+  pub(crate) fn release_fork(&mut self, fork: Xattrs) {
+    self.map.release_fork(fork.map);
+  }
+
+  /// [`Dim::live_nodes`].
+  #[cfg(test)]
+  pub(crate) fn live_nodes(&self) -> usize {
+    self.map.live_nodes()
   }
 
   /// [`Dim::releasing`].
