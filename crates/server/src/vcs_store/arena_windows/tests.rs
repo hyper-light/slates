@@ -534,3 +534,70 @@ fn a_slab_sealed_after_the_cut_began_counts_its_held_free_as_fresh() {
   let _left = windows.end_cut();
   assert!(windows.hand_back(&mut chunks));
 }
+
+/// A window of [`TRIMMED_WINDOW`] (a chunk of its own, its block trimmed, A-118) put in `chunks` lent to `windows`, the
+/// store handed back, its blocks then named by a committed arena capture (A-64) so that its free is deferred.
+fn trimmed_and_named(
+  windows: &mut ChunkWindows,
+  chunks: &mut ChunkStore,
+) -> slates_vcs::StoredWindow {
+  use slates_vcs::WindowStorage;
+  assert!(windows.lend_in(chunks));
+  let window = windows.put(&window_bytes(0, TRIMMED_WINDOW)).unwrap();
+  assert!(windows.hand_back(chunks));
+  chunks.arena_mut().capture();
+  chunks.arena_mut().commit_capture();
+  window
+}
+
+/// The arena's deferred bytes, read through `windows` while it is lent the shard's chunk store.
+fn lent_deferred(windows: &ChunkWindows) -> u64 {
+  u64::try_from(windows.lent_chunks().arena().deferred_bytes()).unwrap()
+}
+
+/// The held gauge across a lend (main's 57k of 2026-11-28: one borrow's held grew 1,016,979,456 bytes, 3.68 GB to 4.70
+/// GB, with no allocation, as the lend freed the owed chunks). Do: a trimmed window named by a committed capture,
+/// released outside a lend (owed a free), then the shard's chunk store lent again. Expect: the bytes held outside the
+/// arena while owed equal the arena's deferred bytes once the lend frees the chunk (every piece of its block, three
+/// granules), none left outside it, so the gauge does not jump at the lend. Failing first: 32,768 counted while owed
+/// (the head's block alone), 49,152 deferred.
+#[test]
+fn a_trimmed_chunk_owed_a_free_is_counted_at_the_bytes_its_free_holds() {
+  use slates_vcs::WindowStorage;
+  let mut chunks = shard_chunks(64);
+  let mut windows = ChunkWindows::new(PAGE);
+  let window = trimmed_and_named(&mut windows, &mut chunks);
+  windows.release(window);
+  let owed = windows.held_outside_the_arena();
+  assert!(windows.lend_in(&mut chunks));
+  assert_eq!(windows.held_outside_the_arena(), 0, "the lend freed it");
+  assert_eq!(
+    owed,
+    lent_deferred(&windows),
+    "counted while owed what its free holds"
+  );
+  assert!(windows.hand_back(&mut chunks));
+}
+
+/// [`a_trimmed_chunk_owed_a_free_is_counted_at_the_bytes_its_free_holds`] for a free held for a cut. Do: a trimmed
+/// window named by a committed capture; lent, a cut begun, the window released, then the cut ended. Expect: the bytes
+/// held outside the arena for the cut equal the arena's deferred bytes once its end frees the chunk. Failing first:
+/// 32,768 counted for the cut, 49,152 deferred.
+#[test]
+fn a_trimmed_chunk_held_for_a_cut_is_counted_at_the_bytes_its_free_holds() {
+  use slates_vcs::WindowStorage;
+  let mut chunks = shard_chunks(64);
+  let mut windows = ChunkWindows::new(PAGE);
+  let window = trimmed_and_named(&mut windows, &mut chunks);
+  assert!(windows.lend_in(&mut chunks));
+  windows.begin_cut();
+  windows.release(window);
+  let held = windows.held_outside_the_arena();
+  let _left = windows.end_cut();
+  assert_eq!(
+    held,
+    lent_deferred(&windows),
+    "counted for the cut what its free holds"
+  );
+  assert!(windows.hand_back(&mut chunks));
+}

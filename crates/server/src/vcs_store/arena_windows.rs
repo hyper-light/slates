@@ -123,6 +123,10 @@ struct Slab {
   asked: usize,
   /// Windows let go from it while it is held, and their bytes.
   freed: (u64, u64),
+  /// The arena bytes its chunk holds, which its free holds where a committed image or a cut names it: its block, or a
+  /// trimmed chunk's length rounded up to a granule, every piece of its block (A-118, `ChunkStore::stored_bytes`).
+  /// Read when it was sealed or restored, since a free may be owed outside a lend.
+  holds: u64,
   /// The cuts begun before it was sealed ([`ChunkWindows::cuts_begun`]), none for a slab a restart restored: while no
   /// cut has begun since, no image names its block ((ii)'s naming proof: a cut's pages all freeze as it begins).
   sealed_after: Option<u64>,
@@ -191,6 +195,13 @@ impl Kept {
   fn bytes(&self) -> usize {
     usize::try_from(self.len).unwrap_or(usize::MAX)
   }
+}
+
+/// The arena bytes `chunk` of `chunks` holds ([`Slab::holds`]), `block` where `chunks` has no record of it.
+fn holds_of(chunks: &ChunkStore, chunk: Handle<Chunk>, block: u64) -> u64 {
+  chunks.chunk(chunk).map_or(block, |record| {
+    u64::try_from(chunks.stored_bytes(record)).unwrap_or(u64::MAX)
+  })
 }
 
 /// The windows kept as chunks of the shard's lent chunk store (module docs).
@@ -547,11 +558,13 @@ impl ChunkWindows {
     };
     let (chunk, _) = placed.slot().ok_or(ContentRefused::Storage)?;
     let key = placed.key();
+    let holds = holds_of(&self.chunks, chunk, placed.block);
     self.slabs.insert(
       key,
       Slab {
         chunk,
         block: placed.block,
+        holds,
         used: placed.used,
         born: placed.born,
         live: 1,
@@ -671,19 +684,20 @@ impl ChunkWindows {
     }
   }
 
-  /// Frees a chunk now when the store is lent, at the next lend otherwise; `fresh` where its slab was sealed since the
+  /// Frees a chunk now when the store is lent, at the next lend otherwise; `holds` the arena bytes its free holds
+  /// ([`Slab::holds`]), counted where the free is held outside the arena; `fresh` where its slab was sealed since the
   /// latest cut began, its bytes counted where they are held all the same ([`ChunkWindows::fresh_held`]).
-  fn free_or_owe(&mut self, (chunk, block, fresh): (Handle<Chunk>, u64, bool)) {
+  fn free_or_owe(&mut self, (chunk, holds, fresh): (Handle<Chunk>, u64, bool)) {
     if self.cutting || !self.lent {
       if fresh {
-        self.fresh_held = self.fresh_held.saturating_add(block);
+        self.fresh_held = self.fresh_held.saturating_add(holds);
       }
       if self.cutting {
         self.held_for_cut.push(chunk);
-        self.held_bytes.0 = self.held_bytes.0.saturating_add(block);
+        self.held_bytes.0 = self.held_bytes.0.saturating_add(holds);
       } else {
         self.owed.push(chunk);
-        self.held_bytes.1 = self.held_bytes.1.saturating_add(block);
+        self.held_bytes.1 = self.held_bytes.1.saturating_add(holds);
       }
       return;
     }
@@ -872,6 +886,7 @@ impl ChunkWindows {
         return Err(PieceRefused::Unclaimable);
       }
     };
+    let holds = holds_of(chunks, chunk, first.block);
     let asked = slots
       .iter()
       .map(|slot| slot.2)
@@ -904,6 +919,7 @@ impl ChunkWindows {
       Slab {
         chunk,
         block: first.block,
+        holds,
         used: first.used,
         born: first.born,
         live,
@@ -1049,7 +1065,7 @@ impl WindowStorage for ChunkWindows {
       return;
     }
     let chunk = slab.chunk;
-    let block = slab.block;
+    let holds = slab.holds;
     let freed = slab.freed;
     let fresh = slab.sealed_after == Some(self.cuts_begun);
     self.slabs.remove(&key);
@@ -1061,7 +1077,7 @@ impl WindowStorage for ChunkWindows {
     if self.filling.is_some_and(|(filling, _, _)| filling == key) {
       self.filling = None;
     }
-    self.free_or_owe((chunk, block, fresh));
+    self.free_or_owe((chunk, holds, fresh));
   }
 
   fn lend_in(&mut self, lent: &mut dyn Any) -> bool {
