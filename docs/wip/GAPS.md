@@ -1376,6 +1376,22 @@
 > landing's entry and an import batch's measure in turn; the wide move's test holds both rooms reused. The whole
 > (unstepped) encoder, `encoded_len`, the decoder and the computed verdict's wire read the same index, built fresh.
 
+> **A-920 the pile by phase, and an import batch's commit state to the reaper BUILT (w-svn, 2026-11-28; main's rulings
+> of 04:18 and 04:24).** A test-only probe of the shard thread's frees by import phase (one debug run of each wide test
+> at c29c18c7c, patch 162 alone) ranked them: between the history's polls (other tasks) 53-91 MB; landing.apply 26-37
+> MB; stage.recording 24-30 MB (not the 374 MB of 2026-11-27's table, before the holds and arena fixes);
+> landing.identity 4-28 MB; stage.measuring 15-18 MB in 12-17 frees; the rest under 18 MB each. stage.measuring's
+> were large blocks, the stall's shape: `ImportBatch::measure_pending` dropped the version's `Committing` on the shard
+> (8 blocks of 64 KiB or more, 15,250,904 bytes for 9,000 files, its post-state 9,216,000). It now goes to the reaper
+> whole (`let_go_committing`, `repository.import.committing_reaped`); at the reaper's bound `reaper::reap`'s rule
+> holds, dropped in place and counted (`repository.import.committing_dropped_inline`). Red by count: the measures'
+> frees of 64 KiB or more on the shard (`staging::returned`'s `measure_large_frees`) 8 (copy) and 12 (move) to 0, both
+> wide tests (88 % of memory free, patch 164's count hooks alone for the red). Main's three-arm run (2026-11-28 04:21)
+> found the page return a run's condition, not a commit's: 1b7ea3a12 returned pages in 1 of 6 runs there, where w-svn's
+> probe-patched runs of it had every time; so page-return figures carry their patches and free memory, and the gates
+> are counts. Next by main's order: the tasks behind "between polls", by task and size (probe first); then
+> landing.apply and stage.recording, small blocks.
+
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
