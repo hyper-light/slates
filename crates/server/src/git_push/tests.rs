@@ -6567,3 +6567,47 @@ fn t_a927_a_create_on_a_default_green_not_made_here_is_refused_to_retry() {
   );
   assert_refused_naming(&received, &words);
 }
+
+/// DIAG (never for main; agents/w-git-p2-diag): one push of the receive-pack request `W_GIT_DIAG_REQUEST` names into
+/// an empty repository on a stored daemon, driven as the edge drives it ([`homed_drive`]). Prints its answer's reasons
+/// and the landing step's longest (`repository.push.landing_step_ns_most`); with `DIAG_COMMIT=1` the landing's phases
+/// too (`DIAG-LAND`, cumulative from the step's start: the store commit is its mark less admit's).
+#[cfg(unix)]
+#[test]
+#[ignore = "diagnostic"]
+#[allow(clippy::disallowed_methods)]
+fn diag_landing_step_of_one_push() {
+  let path = std::env::var("W_GIT_DIAG_REQUEST").expect("W_GIT_DIAG_REQUEST names a receive-pack request");
+  let request = std::fs::read(path).expect("the request");
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository = git_repository_on(&daemon, "diag");
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let began = std::time::Instant::now();
+      let answered = homed_drive(repository, &request).await;
+      let took = began.elapsed();
+      let landing = crate::state::with_state(|state| {
+        state
+          .refusals
+          .get(crate::repository::push::LANDING_STEP_NS)
+          .copied()
+          .unwrap_or(0)
+      });
+      let reasons = answered.as_ref().map(|received| {
+        reasons(received)
+          .iter()
+          .map(|reason| String::from_utf8_lossy(reason).into_owned())
+          .collect::<Vec<_>>()
+      });
+      let _ = sent.send(format!(
+        "request {} bytes; answered {reasons:?} in {took:?}; landing step most {landing:?} ns",
+        request.len()
+      ));
+    })
+    .expect("the task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  eprintln!("DIAG {}", got.recv().expect("the report"));
+  daemon.stop();
+}

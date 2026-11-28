@@ -1784,6 +1784,7 @@ fn push_planned(
     stored,
   );
   let took = state.clock.monotonic_ns().saturating_sub(began);
+  if std::env::var("DIAG_COMMIT").is_ok() { eprintln!("DIAG-COMMIT landing step {took} ns"); }
   state.count_max(LANDING_STEP_NS, took);
   landed
 }
@@ -1800,6 +1801,7 @@ fn landed_planned(
   ),
   mut stored: Option<Stored<'_, '_>>,
 ) -> Result<Appended, AppendRefused> {
+  let __t = std::time::Instant::now();
   let mut prepared = prepared;
   let (mut adopted, mut created) =
     creates_made(state, &mut steps, (held, ahead, prepared.as_deref_mut()))?;
@@ -1815,8 +1817,11 @@ fn landed_planned(
     .filter(|(step, adopted)| step.work().is_some() && !**adopted)
     .count();
   state.count_max(LANDING_STEP_WORKS, u64::try_from(works).unwrap_or(u64::MAX));
+  if std::env::var("DIAG_COMMIT").is_ok() { eprintln!("DIAG-LAND creates+updates {:?}", __t.elapsed()); }
   secure(state, (&steps, &adopted), held).map_err(AppendRefused::Changes)?;
+  if std::env::var("DIAG_COMMIT").is_ok() { eprintln!("DIAG-LAND secure {:?}", __t.elapsed()); }
   let mut verdicts = judge(state, (&mut steps, &adopted), held).map_err(AppendRefused::Changes)?;
+  if std::env::var("DIAG_COMMIT").is_ok() { eprintln!("DIAG-LAND judge {:?}", __t.elapsed()); }
   for (verdict, made) in verdicts.iter_mut().zip(created.iter_mut()) {
     if let Some(made) = made.take() {
       *verdict = Some(made);
@@ -1860,7 +1865,9 @@ fn landed_planned(
       && entry.versions.is_empty()
       && entry.names.is_empty()
       && entry.state.is_empty());
+  if std::env::var("DIAG_COMMIT").is_ok() { eprintln!("DIAG-LAND entry+sealed_record {:?}", __t.elapsed()); }
   admit(state, &made, &entry, &steps)?;
+  if std::env::var("DIAG_COMMIT").is_ok() { eprintln!("DIAG-LAND admit {:?}", __t.elapsed()); }
   if !changes_anything {
     // Every work was sent before and nothing else changes: nothing is recorded, and what was secured is given back.
     settle_secured(state, held);
@@ -1899,7 +1906,9 @@ fn landed_planned(
     .iter()
     .map(|version| (version.green, version.version))
     .collect();
+  if std::env::var("DIAG_COMMIT").is_ok() { eprintln!("DIAG-LAND store commit {:?}", __t.elapsed()); }
   let applied = apply_planned(state, (&steps, verdicts), (entry, made), (held, ahead));
+  if std::env::var("DIAG_COMMIT").is_ok() { eprintln!("DIAG-LAND apply {:?}", __t.elapsed()); }
   if applied.is_err() && store_committed {
     // The store is ahead of a log that refused the entry: made again from the log (A-662).
     crate::vcs_store::rebuild(state, record.id);
