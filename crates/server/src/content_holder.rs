@@ -1456,7 +1456,11 @@ fn note_held_at_borrow(state: &mut ShardState, held: u64) {
     .get(IMAGE_HELD_AT_BORROW_PEAK)
     .copied()
     .unwrap_or(0);
-  if held > peak.saturating_mul(2) && held > state.config.copy_slice_bytes() {
+  let floor = state.config.copy_slice_bytes();
+  if state
+    .image_encoder
+    .held_log_due(crate::image_pages::HeldLine::Borrow, held, floor)
+  {
     let (catching_up, owed, since_begun, turns) = state.image_encoder.catch_up_reading();
     let idle_ns = slates_rt::futures::now_ns().saturating_sub(state.image_encoder.turned_ns());
     slates_machine::log_line!(
@@ -1651,7 +1655,10 @@ pub(crate) fn image_drain(state: &mut ShardState) {
   // Each doubling of the held peak said with the cadence's state (main's 57k of 2026-11-27: a 357,847,040-byte peak to
   // explain), a line a doubling, so at most the bits of a byte count.
   let peak = state.refusals.get(IMAGE_HELD_PEAK).copied().unwrap_or(0);
-  if held > peak.saturating_mul(2).max(1 << 20) {
+  if state
+    .image_encoder
+    .held_log_due(crate::image_pages::HeldLine::Drain, held, 1 << 20)
+  {
     let (in_flight, dirty, cost, changed, held_now, due) = state.image_encoder.cadence_reading();
     slates_machine::log_line!(
       "slates-server: partition {}: {held_now} bytes held freed for the committed image (the peak was {peak}): cut in \

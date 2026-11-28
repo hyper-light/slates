@@ -728,6 +728,8 @@ pub(crate) struct Encoder {
   catching_up: bool,
   /// When the encoder last turned, on the host's monotonic clock ([`Encoder::note_turned`]): the catch-up's reading.
   turned_ns: u64,
+  /// The held frees each doubling line last logged ([`HeldLine`], [`Encoder::held_log_due`]).
+  held_logged: HeldLogged,
   /// The tasks whose elective changes wait while paused ([`Encoder::paused`]), each once (`Waker::will_wake`), woken by
   /// the publication that carries the cut ([`Encoder::committed`]). Bound: the let-go tasks live on the shard (a landed
   /// pack's queue, one; a committed hg run's or import's, one each).
@@ -769,6 +771,24 @@ struct Cut {
   /// Test support (F2's oracle): its pages at its moment, which bound its pre-images.
   #[cfg(test)]
   frozen: Vec<(Family, Page)>,
+}
+
+/// A line that logs the held frees at each doubling (`content_holder`): at a drain, or at a borrow's end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeldLine {
+  /// `content_holder::image_drain`'s, with the cadence's state.
+  Drain,
+  /// `content_holder::note_held_at_borrow`'s, with the catch-up's state.
+  Borrow,
+}
+
+/// The held frees each [`HeldLine`] last logged: the drain's and the borrow end's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HeldLogged {
+  /// The drain line's.
+  drain: u64,
+  /// The borrow end's.
+  borrow: u64,
 }
 
 /// What a turn of the encoder did: the bytes it encoded, and whether the cut in flight is wholly encoded after it.
@@ -1009,6 +1029,22 @@ impl Encoder {
   /// Whether a cut is in flight: begun, its publication not yet committed.
   pub(crate) fn cut_is_in_flight(&self) -> bool {
     self.cut.is_some()
+  }
+
+  /// Whether the line `line` logs `held` held frees: past `floor` and past twice what it last logged, its mark then
+  /// moved to `held`. So a slow climb logs once a doubling. A mark moved by every reading, as the status counter's
+  /// most is, never logs a climb of under twice a reading (main's 57k of 2026-11-28: held rose to 4,703,485,952 bytes
+  /// about 2 MB a borrow, and the borrow end's line went silent past 1,126,400).
+  pub(crate) fn held_log_due(&mut self, line: HeldLine, held: u64, floor: u64) -> bool {
+    let mark = match line {
+      HeldLine::Drain => &mut self.held_logged.drain,
+      HeldLine::Borrow => &mut self.held_logged.borrow,
+    };
+    let due = held > floor && held > mark.saturating_mul(2);
+    if due {
+      *mark = held;
+    }
+    due
   }
 
   /// Notes a turn at `now_ns` on the host's monotonic clock (`content_holder::image_turn`).
@@ -2348,6 +2384,40 @@ mod tests {
       looks,
       RISING_HELD.ilog2() + 1,
       "one look a doubling of the held frees"
+    );
+  }
+
+  /// Shape: the held frees' slow climb, a hundredth a step, from a megabyte to past [`CLIMB_DOUBLINGS`] doublings of it.
+  const CLIMB_DOUBLINGS: u32 = 12;
+
+  /// The doubling lines (main's 57k of 2026-11-28: held rose to 4,703,485,952 bytes about 2 MB a borrow, the borrow
+  /// end's line silent past 1,126,400, since it compared against a most moved by every reading). Do: raise the held
+  /// frees a hundredth a step from a megabyte past [`CLIMB_DOUBLINGS`] doublings of it, asking each line whether it
+  /// logs. Expect: each line logs once a doubling, every doubling counted, never once a step. Failing first (a mark
+  /// moved by every reading): one line each.
+  #[test]
+  fn a_slow_climb_of_the_held_frees_logs_once_a_doubling() {
+    let mut encoder = Encoder::default();
+    let start = 1u64 << 20;
+    let end = start << CLIMB_DOUBLINGS;
+    let mut held = start;
+    let mut logged = (0u32, 0u32);
+    while held < end {
+      held += held.div_ceil(100);
+      logged.0 += u32::from(encoder.held_log_due(HeldLine::Drain, held, 0));
+      logged.1 += u32::from(encoder.held_log_due(HeldLine::Borrow, held, 0));
+    }
+    println!("a climb of {CLIMB_DOUBLINGS} doublings logged {logged:?}");
+    let doublings = CLIMB_DOUBLINGS..=CLIMB_DOUBLINGS + 1;
+    assert!(
+      doublings.contains(&logged.0),
+      "the drain's line {} times",
+      logged.0
+    );
+    assert!(
+      doublings.contains(&logged.1),
+      "the borrow end's line {} times",
+      logged.1
     );
   }
 
