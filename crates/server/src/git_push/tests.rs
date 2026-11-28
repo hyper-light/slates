@@ -5386,9 +5386,18 @@ fn fetched_ids(
 /// measured (3,500); fewer in debug, where every unit is slower, to keep the test's time.
 const FLAT_FILES: usize = if cfg!(debug_assertions) { 1_500 } else { 3_500 };
 
-/// What a push driven step by step on a daemon's shard answered, and its longest step in nanoseconds; or why the drive
-/// stopped.
-type Stepped = Result<(Received, u64), String>;
+/// What a push driven step by step on a daemon's shard answered, and how its steps ran; or why the drive stopped.
+type Stepped = Result<(Received, Drive), String>;
+
+/// How a push's steps ran ([`pushed_in_steps`]).
+#[derive(Debug, Default, Clone, Copy)]
+struct Drive {
+  /// Its longest step, nanoseconds: the whole step, its build's turn and whatever else ran in that poll.
+  longest_ns: u64,
+  /// Its steps that ran units of its work's build and also recorded its entry (A-752: none; a step finishing the build
+  /// yields before the verdict and the landing).
+  built_and_landed: u64,
+}
 
 /// `request` pushed to `repository` by its owner by a task on the daemon's shard, a step at a time, yielding the shard
 /// between every two steps as an edge's task does (each step a poll of its own, so the watchdog sees each).
@@ -5410,9 +5419,10 @@ fn pushed_in_steps(daemon: &crate::Daemon, repository: RepositoryId, request: &[
 /// The push of [`pushed_in_steps`], driven.
 async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
   use crate::state::with_state;
-  let mut longest = 0u64;
+  let mut drive = Drive::default();
   let mut timed = |began: std::time::Instant| {
-    longest = longest.max(u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    let took = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    drive.longest_ns = drive.longest_ns.max(took);
   };
   let mut push = with_state(|state| {
     ReceivePack::start(
@@ -5437,12 +5447,16 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
     .ok_or("no state for the end")?
     .map_err(|failed| format!("not ended: {failed:?}"))?;
   let mut answer = Vec::new();
+  let mut mixed = 0u64;
   let received = loop {
+    let seen = with_state(|state| step_seen(state, repository)).ok_or("no state to see")?;
     let began = std::time::Instant::now();
     let step = with_state(|state| push.answer_step(state, &mut answer))
       .ok_or("no state for a step")?
       .map_err(|failed| format!("a step failed: {failed:?}"))?;
     timed(began);
+    let after = with_state(|state| step_seen(state, repository)).ok_or("no state to see")?;
+    mixed = mixed.saturating_add(u64::from(after.0 != seen.0 && after.1 != seen.1));
     match step {
       Answering::Answered(received) => break *received,
       Answering::Turned => {
@@ -5453,7 +5467,15 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
       Answering::Hook(_) => return Err("no hook is configured".to_owned()),
     }
   };
-  Ok((received, longest))
+  drive.built_and_landed = mixed;
+  Ok((received, drive))
+}
+
+/// What a step of [`stepped`] is judged by: the shard's build units so far, and `repository`'s recorded objects (an
+/// entry's landing records them).
+fn step_seen(state: &ShardState, repository: RepositoryId) -> (u64, usize) {
+  let objects = state.db.partition().repositories().object_count(repository);
+  (state.push_turns.units, objects)
 }
 
 /// A-752 (main's order of 2026-11-20, w-git's measure: one command bringing 3,502 objects over a flat 3,500-file tree
@@ -5491,11 +5513,11 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
     fetched_ids(state, repository, &[second])
   });
   daemon.stop();
-  let (created, created_longest) = created.unwrap();
-  let (updated, updated_longest) = updated.unwrap();
+  let (created, created_drive) = created.unwrap();
+  let (updated, updated_drive) = updated.unwrap();
   eprintln!(
-    "A-752 flat {FLAT_FILES}: create's longest step {created_longest} ns, update's {updated_longest} ns; \
-     builds before {before:?} after {after:?}"
+    "A-752 flat {FLAT_FILES}: create's {created_drive:?}, update's {updated_drive:?}; builds before {before:?} after \
+     {after:?}"
   );
   assert_eq!(reasons(&created), [b"ok"]);
   assert_eq!(reasons(&updated), [b"ok"]);
@@ -5521,6 +5543,7 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
     after.longest_ns
   );
   assert_eq!(after.past_budget, 0, "{after:?}");
+  a752_steps_within_their_ceiling(updated_drive, &after);
   let brought: std::collections::BTreeSet<ObjectId> = first_objects
     .into_iter()
     .chain(objects)
@@ -5533,6 +5556,25 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
     (fetched.len(), &set),
     (brought.len(), &brought),
     "the fetch of main's head holds every object both pushes brought, each once"
+  );
+}
+
+/// A-752 part 3 (main's ruling of 2026-11-27 23:21): the whole step, not only its build's turn, within the ceiling by a
+/// unit and its opening; and no step both building the work's units and landing its entry. The last build turn and the
+/// landing ran in one poll before: 80.8 + 42.8 ms, a 124 ms step, while the turn alone kept its bound.
+fn a752_steps_within_their_ceiling(drive: Drive, turns: &super::PushTurns) {
+  assert_eq!(
+    drive.built_and_landed, 0,
+    "a step built the work's last units and landed its entry in one poll: {drive:?}"
+  );
+  let ceiling = crate::daemon::HEARTBEAT_NS;
+  let bound = ceiling
+    .saturating_add(turns.longest_unit_ns)
+    .saturating_add(turns.longest_opening_ns);
+  assert!(
+    drive.longest_ns <= bound,
+    "a step of {} ns past its {ceiling} ns ceiling by more than a unit and its opening",
+    drive.longest_ns
   );
 }
 
