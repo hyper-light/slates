@@ -675,16 +675,25 @@ pub(crate) struct Waited {
 impl Waited {
   /// A wait begun now, having seen `mark`.
   pub(crate) fn new(mark: u64) -> Waited {
+    Waited::begun_at(mark, slates_rt::futures::now_ns())
+  }
+
+  /// [`Waited::new`] at `now`, on the runtime's clock.
+  pub(crate) fn begun_at(mark: u64, now: u64) -> Waited {
     Waited {
       mark,
-      moved_ns: slates_rt::futures::now_ns(),
+      moved_ns: now,
     }
   }
 
   /// Whether a whole `window` has passed with the progress still `mark` (a [`barrier_reading`]); a mark that moved
   /// begins the window again.
   pub(crate) fn expired(&mut self, (mark, window): (u64, u64)) -> bool {
-    let now = slates_rt::futures::now_ns();
+    self.expired_at((mark, window), slates_rt::futures::now_ns())
+  }
+
+  /// [`Waited::expired`] at `now`, on the runtime's clock.
+  pub(crate) fn expired_at(&mut self, (mark, window): (u64, u64), now: u64) -> bool {
     if mark != self.mark {
       self.mark = mark;
       self.moved_ns = now;

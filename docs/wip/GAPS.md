@@ -417,8 +417,9 @@
 >   replica build stalls at the second death.** Reproduced on purpose (a refused first-death push, then the second
 >   death): the logs put it on the holder's configuration lag, not the build or the region (the build's replay 5 ms):
 >   each reship refused `foreign_generation`. Now the holder answers `CatchingUp` and the barrier counts it (design
->   A-936). Still open: one focused run after it showed the holder's build for v2 at no turn, before the build's begin
->   and end were logged; they are now. Not seen in a914 since A-914 (c) (16 of 16 at 02548a267): every stalled red followed a refused first
+>   A-936). The no-turn build (main's ×16 at 69fbc8de0, a914 run 2): the build waited on its store's replay, whose two
+>   region reads each spent a whole share on d, dead and not yet suspected; now the replay's steps count as the build's
+>   work done, so the barrier sees it move (A-936's replay half). OPEN, next: the hedged region read, the read's cost. Not seen in a914 since A-914 (c) (16 of 16 at 02548a267): every stalled red followed a refused first
 >   push, so its red must make the condition on purpose, or the logs show a refused push is its only door (main's ruling
 >   of 19:02). a914 at 604aa12a0 run 10 and at d08595c7e runs 1, 3, 5, 7 and 9 (each after a refused first-death
 >   push): the second death's v2 placed at the owner alone, its other live candidate answering `ReplicaBuilding` at 0
