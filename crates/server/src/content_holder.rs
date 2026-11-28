@@ -1231,8 +1231,27 @@ async fn image_catch_up() {
 /// takes of a step). A turn spends the paged families' page size, which a test sets far below the slice, so the slice,
 /// not the turn, is what a wake spends: the shard's own owed work, a step's share of it a yield, whatever the page size
 /// (main 01a20182's ruling (a) of 2026-11-23 19:16). Whether it ended.
+///
+/// A wake spends more once the frees held for the committed image pass what the cut in flight has left to encode
+/// (A-930's cadence; main's 57k of 2026-11-27: a long cut held its window frees, 4.7 GB, until it committed): the
+/// larger of a copy slice and that excess. So once they pass the cut's cost a wake encodes at least as much as they
+/// passed it by, and once they pass twice the cut's cost the cut ends in that wake. The bound: the frees held while a
+/// cut is in flight are at most twice its cost and one wake's frees, and the next cut is then due at once, its held
+/// frees counted ([`held_now`], `Encoder::due`), so what is held is at most the free rate times a cut's duration and
+/// the commit gap, both kept bounded so.
 pub(crate) fn image_catch_up_slice(state: &mut ShardState) -> bool {
-  let slice = state.config.copy_slice_bytes();
+  let held = held_now(state);
+  let left = state
+    .image_encoder
+    .in_flight_left(u64::try_from(page_bytes(state)).unwrap_or(u64::MAX));
+  let excess = held.saturating_sub(left);
+  #[cfg(test)]
+  let excess = if TEST_FIXED_SLICE.with(std::cell::Cell::get) {
+    0
+  } else {
+    excess
+  };
+  let slice = state.config.copy_slice_bytes().max(excess);
   let mut spent = 0u64;
   loop {
     let (ended, bytes) = image_catch_up_step(state);
@@ -1454,6 +1473,13 @@ fn catch_up_publication(state: &mut ShardState) -> Result<(), slates_vfs::VfsErr
   // The catch-up's own publication asks for no cut: the next begins at its commit only once it is due (A-930's
   // cadence, plan (a)).
   crate::verbs::publish_shard_unasked(state).map(drop)
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Test support: a catch-up wake held to a copy slice whatever is held ([`image_catch_up_slice`]), the rule before
+  /// A-930's held excess: the stretched-cut test's other arm.
+  pub(crate) static TEST_FIXED_SLICE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]

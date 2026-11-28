@@ -914,6 +914,21 @@ impl Encoder {
     self.cut.is_none() && held > 0 && held >= self.look_at
   }
 
+  /// What the cut in flight has left to encode: each page left its committed piece's bytes, a page's `page_bytes` at
+  /// least (a page no cut committed is still encoded, up to a page); none where no cut is in flight. What the
+  /// catch-up's wake weighs the held frees against (`content_holder::image_catch_up_slice`).
+  pub(crate) fn in_flight_left(&self, page_bytes: u64) -> u64 {
+    self.cut.as_ref().map_or(0, |cut| {
+      cut.remaining.iter().fold(0u64, |left, page| {
+        let committed = self
+          .committed
+          .get(page)
+          .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        left.saturating_add(committed.max(page_bytes))
+      })
+    })
+  }
+
   /// The cadence's state for a log line: a cut in flight, the pages dirty, the next cut's cost, the bytes changed and
   /// held, and whether it is due.
   pub(crate) fn cadence_reading(&self) -> (bool, usize, u64, u64, u64, bool) {
@@ -2530,6 +2545,105 @@ mod tests {
     assert!(
       held >= released,
       "the held gauge counts the {released} bytes held for the cut: {held}"
+    );
+  }
+
+  /// [`a_cut_in_flight_keeps_its_held_frees_within_twice_what_it_spends`]'s scene on a shard, its page pinned at
+  /// [`LOADED_PAGE`], the catch-up's wake held to a copy slice where `fixed` (`content_holder::TEST_FIXED_SLICE`, the
+  /// rule before): granule objects put and published, a cut begun over [`ENTRIES`] let-goes' pages, then a wake of its
+  /// catch-up after each batch of four copy slices' worth of the objects released, until that cut commits. The most
+  /// held after a wake, the bytes the cut spent (copied and encoded), one batch's bytes, and the wakes.
+  fn a_stretched_cut(fixed: bool) -> (u64, u64, u64, u64) {
+    crate::daemon::audit_on_shard(move |state| {
+      crate::content_holder::TEST_FIXED_SLICE.with(|cell| cell.set(fixed));
+      let granule = state.store.content.arena().granule();
+      let slice = usize::try_from(state.config.copy_slice_bytes()).unwrap();
+      let batch = (4 * slice).div_ceil(granule).max(1);
+      let objects = batch * STRETCHED_BATCHES;
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let need = u64::try_from(objects * granule).unwrap();
+      let ids: Vec<slates_vcs::ContentId> =
+        crate::vcs_store::within_budget(state, need, |stores| {
+          let content = stores.content_mut().unwrap();
+          (0..objects)
+            .map(|at| {
+              let mut text =
+                format!("a chunk's text freed while its cut stretches, number {at}\n").into_bytes();
+              text.resize(granule, b's');
+              content.put_object(&text).unwrap()
+            })
+            .collect()
+        });
+      crate::verbs::publish_shard(state).unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(LOADED_PAGE));
+      let _ = let_go_and_note(state, (0, ENTRIES));
+      let spent = |state: &crate::state::ShardState| {
+        let of = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        of(crate::content_holder::IMAGE_COPIED_BYTES)
+          + of(crate::content_holder::IMAGE_ENCODED_BYTES)
+      };
+      let spent_before = spent(state);
+      crate::verbs::publish_shard(state).unwrap();
+      let begun = state
+        .image_encoder
+        .cut_in_flight()
+        .map(|(generation, _)| generation);
+      let (mut most, mut wakes) = (0u64, 0u64);
+      for released in ids.chunks(batch) {
+        // This cut's wakes alone: its commit begins the next, which is another's.
+        if state
+          .image_encoder
+          .cut_in_flight()
+          .map(|(generation, _)| generation)
+          != begun
+        {
+          break;
+        }
+        crate::vcs_store::within_budget(state, 0, |stores| {
+          let content = stores.content_mut().unwrap();
+          for id in released {
+            let _ = content.release(id);
+          }
+        });
+        most = most.max(crate::content_holder::held_now(state));
+        let _ = crate::content_holder::image_catch_up_slice(state);
+        wakes += 1;
+      }
+      let cut = spent(state).saturating_sub(spent_before);
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      crate::content_holder::TEST_FIXED_SLICE.with(|cell| cell.set(false));
+      (most, cut, u64::try_from(batch * granule).unwrap(), wakes)
+    })
+  }
+
+  /// Shape: the batches [`a_stretched_cut`] can release, past the wakes its cut lasts at a copy slice each.
+  const STRETCHED_BATCHES: usize = 16;
+
+  /// Goal 93, A-930's cadence on the true held (main's 57k of 2026-11-27 20:41: a long cut held its window frees until
+  /// it committed). Do: run [`a_stretched_cut`] both ways, four copy slices' worth of chunks freed before each wake of
+  /// the cut's catch-up: each wake spending the held frees past what the cut has left, and each held to a copy slice
+  /// as before. Expect, spending the excess, the most held at most twice what the cut spent and a batch, under the
+  /// most held with a copy slice a wake. Red before: a copy slice a wake whatever was held.
+  #[test]
+  fn a_cut_in_flight_keeps_its_held_frees_within_twice_what_it_spends() {
+    let (most, cut, batch, wakes) = a_stretched_cut(false);
+    let (fixed_most, fixed_cut, _, fixed_wakes) = a_stretched_cut(true);
+    println!(
+      "the excess spent: {most} bytes held at most over {wakes} wakes, the cut spending {cut}; a copy slice a wake: \
+       {fixed_most} over {fixed_wakes} wakes, spending {fixed_cut}; a batch {batch} bytes"
+    );
+    assert!(cut > 0, "a cut was in flight and spent");
+    assert!(
+      most <= 2 * cut + batch,
+      "{most} bytes held while the cut was in flight, past twice what it spent ({cut}) and a batch ({batch})"
+    );
+    assert!(
+      most < fixed_most,
+      "the excess spent holds less than a copy slice a wake: {most} against {fixed_most}"
     );
   }
 
