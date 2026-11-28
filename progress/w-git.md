@@ -947,3 +947,7 @@
   placed entry a unit (Stage::Record, Keeping; 152 and 454 entries in one unit before). Run request for main's v2.0.0
   encode under load in run-requests.md. NEXT: the encoding's start (Encoding::fragments reading D(k) whole), then
   deepen's bad pack and 217 s (w-bugs', after a check that it's still open).
+- 11-28 01:09 PST: LANDED ef064149f: an encoding's start reads its version's D(k) (a base pack's reached set) a node a unit
+  (Stage::Read, reach::SetReading; 113 runs in one unit before, at most a leaf's now). Both encode whole units named
+  on 00:50 are sliced; main's v2.0.0 run under load (~02:30) checks the rest. NEXT: deepen's bad pack and its 217 s
+  (w-bugs', read_objects), after a check that it is still open on today's main.
