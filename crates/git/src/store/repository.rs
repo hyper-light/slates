@@ -2891,73 +2891,156 @@ fn fragments_slot(
     .map(|record| &mut record.fragments)
 }
 
-/// A fragment whose bytes are kept as `content` already (A-718: put a window at a time), and what
-/// its entries hold read once (`Kept`); the caller's hold on `content` becomes the fragment's.
-fn keep(((bytes, placed), content): (fragment::Encoded, ContentId)) -> Result<Kept, StoreRefused> {
-  let order = position_order(&placed)?;
-  let positions = Positions::of(placed.iter().map(|entry| entry.position).collect());
-  let references = Positions::of(
-    placed
-      .iter()
-      .filter(|entry| entry.stored == Stored::Reference)
-      .filter_map(|entry| entry.base)
-      .collect(),
-  );
-  let offsets = placed
-    .iter()
-    .filter(|entry| entry.stored == Stored::Offset)
-    .count();
-  let runs = positions.runs().saturating_add(references.runs());
-  Ok(Kept {
-    content,
-    len: to_u64(bytes.len()),
-    placed,
-    positions,
-    references,
-    offsets: to_u64(offsets),
-    order,
-    runs,
-    held: 0,
-  })
+/// A part's record (`Kept`) made from its placed entries a unit at a time (the encode keep's slice, CLAUDE.md §3; main
+/// 01a20182's ruling of 2026-11-28 00:33): each entry taken in a unit (its position into the position order, a
+/// reference delta's base into the references, its kind counted), then the order read out a position a unit, ascending,
+/// into the part's order and its position set. It took every entry in one unit (`keep`, `position_order` and
+/// `count_entries` at the install: 152 of a 300-file version's entries in one unit, 454 of a base pack's).
+#[derive(Debug)]
+pub(super) struct Keeping {
+  /// The part's length; its bytes are in the content store under `content`, so they are let go here.
+  len: u64,
+  placed: Vec<Placed>,
+  content: ContentId,
+  /// The next placed entry to take in.
+  next: usize,
+  /// Each entry taken in, by its object's position: its index in `placed`.
+  by_position: BTreeMap<u64, u32>,
+  /// The reference deltas' bases taken in.
+  bases: BTreeSet<u64>,
+  /// The order read out so far: the entries' indexes by their objects' positions.
+  order: Vec<u32>,
+  positions: super::positions::Ascending,
+  references: super::positions::Ascending,
+  offsets: u64,
+  counted: EntryCounts,
 }
 
-/// The indexes of `placed` in their objects' position order; refused for a part of more entries
-/// than a pack's header counts.
-fn position_order(placed: &[Placed]) -> Result<Vec<u32>, StoreRefused> {
-  let mut order = (0..placed.len())
-    .map(|index| u32::try_from(index).map_err(|_| StoreRefused::PackTooLarge))
-    .collect::<Result<Vec<u32>, StoreRefused>>()?;
-  order.sort_by_key(|index| {
-    usize::try_from(*index)
-      .ok()
-      .and_then(|index| placed.get(index))
-      .map_or(u64::MAX, |entry| entry.position)
-  });
-  Ok(order)
+/// Derived: what a record being made holds for each placed entry beside it: its position and index in the order's map
+/// (a key and a value), or its index in the order and its position in the set once read out.
+const KEEPING_ENTRY_BYTES: usize = size_of::<(u64, u32)>();
+
+/// A part's entries by how each holds its object, counted as they are taken in and added to the store's counters once
+/// the part is installed ([`Repository::count_entries`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct EntryCounts {
+  whole: u64,
+  offsets: u64,
+  references: u64,
 }
 
-/// A version's two fragments, or a base pack's two parts, each kept as content already (its root
-/// held once by the caller), recorded; refused, both roots are given back.
-fn keep_both(
-  store: &mut ContentStore,
-  objects: (fragment::Encoded, ContentId),
-  blobs: (fragment::Encoded, ContentId),
-) -> Result<Fragments, StoreRefused> {
-  let roots = [objects.1, blobs.1];
-  match (keep(objects), keep(blobs)) {
-    (Ok(mut objects), Ok(mut blobs)) => {
-      for kept in [&mut objects, &mut blobs] {
-        kept.held = store.tree_bytes(&kept.content);
-      }
-      Ok(Fragments { objects, blobs })
-    }
-    (Err(refused), _) | (_, Err(refused)) => {
-      for root in roots {
-        store.release(&root)?;
-      }
-      Err(refused)
+impl EntryCounts {
+  /// These and `other`'s, together.
+  pub(super) fn and(self, other: EntryCounts) -> EntryCounts {
+    EntryCounts {
+      whole: self.whole.saturating_add(other.whole),
+      offsets: self.offsets.saturating_add(other.offsets),
+      references: self.references.saturating_add(other.references),
     }
   }
+}
+
+impl Keeping {
+  /// The record of the part `encoded`, its bytes kept as `content` already (A-718: put a window at a time); the
+  /// caller's hold on `content` becomes the part's once it is installed.
+  pub(super) fn new(((bytes, placed), content): (fragment::Encoded, ContentId)) -> Keeping {
+    Keeping {
+      len: to_u64(bytes.len()),
+      placed,
+      content,
+      next: 0,
+      by_position: BTreeMap::new(),
+      bases: BTreeSet::new(),
+      order: Vec::new(),
+      positions: super::positions::Ascending::default(),
+      references: super::positions::Ascending::default(),
+      offsets: 0,
+      counted: EntryCounts::default(),
+    }
+  }
+
+  /// The part's content, held by the caller until it is installed.
+  pub(super) fn content(&self) -> ContentId {
+    self.content
+  }
+
+  /// The bytes its record holds while it is made: its placed entries, and each one's place in the order or the map
+  /// being read out (A-856: what an encoding holds is charged).
+  pub(super) fn held_bytes(&self) -> u64 {
+    let entries = self.placed.len();
+    bytes(
+      entries,
+      size_of::<Placed>().saturating_add(KEEPING_ENTRY_BYTES),
+    )
+  }
+
+  /// One unit of the record: an entry taken in, else a position of the order read out, else a base of the
+  /// references; whether it is made. Refused for a part of more entries than a pack's header counts.
+  pub(super) fn step(&mut self) -> Result<bool, StoreRefused> {
+    if let Some(entry) = self.placed.get(self.next).copied() {
+      let index = u32::try_from(self.next).map_err(|_| StoreRefused::PackTooLarge)?;
+      self.by_position.insert(entry.position, index);
+      match entry.stored {
+        Stored::Whole => self.counted.whole = self.counted.whole.saturating_add(1),
+        Stored::Offset => {
+          self.counted.offsets = self.counted.offsets.saturating_add(1);
+          self.offsets = self.offsets.saturating_add(1);
+        }
+        Stored::Reference => {
+          self.counted.references = self.counted.references.saturating_add(1);
+          if let Some(base) = entry.base {
+            self.bases.insert(base);
+          }
+        }
+      }
+      self.next = self.next.saturating_add(1);
+      return Ok(false);
+    }
+    if let Some((position, index)) = self.by_position.pop_first() {
+      self.order.push(index);
+      self.positions.push(position);
+      return Ok(false);
+    }
+    if let Some(base) = self.bases.pop_first() {
+      self.references.push(base);
+      return Ok(false);
+    }
+    Ok(true)
+  }
+
+  /// The record made ([`Keeping::step`] answered made), held at `held` bytes of the store, and its entries' counts.
+  fn finish(self, held: u64) -> (Kept, EntryCounts) {
+    let runs = self.positions.runs().saturating_add(self.references.runs());
+    let kept = Kept {
+      content: self.content,
+      len: self.len,
+      placed: self.placed,
+      positions: self.positions.finish(),
+      references: self.references.finish(),
+      offsets: self.offsets,
+      order: self.order,
+      runs,
+      held,
+    };
+    (kept, self.counted)
+  }
+}
+
+/// A version's two fragments, or a base pack's two parts, their records made ([`Keeping`]), each kept as content
+/// already (its root held once by the caller): their records, and their entries' counts.
+pub(super) fn kept_both(
+  store: &ContentStore,
+  (objects, blobs): (Keeping, Keeping),
+) -> (Fragments, EntryCounts) {
+  let (objects, by_objects) = {
+    let held = store.tree_bytes(&objects.content);
+    objects.finish(held)
+  };
+  let (blobs, by_blobs) = {
+    let held = store.tree_bytes(&blobs.content);
+    blobs.finish(held)
+  };
+  (Fragments { objects, blobs }, by_objects.and(by_blobs))
 }
 
 /// The fragments' part (A-614 part 2; module docs and `fragment`'s).
@@ -3012,17 +3095,13 @@ impl Repository {
     Ok(entries)
   }
 
-  /// Counts a kept fragment's entries by how each holds its object.
-  fn count_entries(&self, placed: &[Placed]) {
-    for entry in placed {
-      self.count(|counters| match entry.stored {
-        Stored::Whole => counters.whole = counters.whole.saturating_add(1),
-        Stored::Offset => counters.offset_deltas = counters.offset_deltas.saturating_add(1),
-        Stored::Reference => {
-          counters.reference_deltas = counters.reference_deltas.saturating_add(1);
-        }
-      });
-    }
+  /// Counts a kept part's entries by how each holds its object, as its record took them in ([`Keeping`]).
+  fn count_entries(&self, counted: EntryCounts) {
+    self.count(|counters| {
+      counters.whole = counters.whole.saturating_add(counted.whole);
+      counters.offset_deltas = counters.offset_deltas.saturating_add(counted.offsets);
+      counters.reference_deltas = counters.reference_deltas.saturating_add(counted.references);
+    });
   }
 
   /// What `green`'s chain charges the store now ([`Chain::footprint`]); none for a green with no chain.
@@ -3194,18 +3273,16 @@ impl Repository {
     &mut self,
     store: &mut ContentStore,
     (green, version): (u64, usize),
-    (objects, blobs): (
-      (fragment::Encoded, ContentId),
-      (fragment::Encoded, ContentId),
-    ),
+    (fragments, counted): (Fragments, EntryCounts),
   ) -> Result<(), StoreRefused> {
     if self.version_record(green, version)?.fragments.is_some() {
-      store.release(&objects.1)?;
-      store.release(&blobs.1)?;
+      store.release(&fragments.objects.content)?;
+      store.release(&fragments.blobs.content)?;
       return Ok(());
     }
-    let fragments = keep_both(store, objects, blobs)?;
-    self.install(store, (green, version), fragments)
+    self.install(store, (green, version), fragments)?;
+    self.count_entries(counted);
+    Ok(())
   }
 
   /// Records a base pack's two encoded parts, each kept as content already under its root, in place
@@ -3215,14 +3292,12 @@ impl Repository {
     &mut self,
     store: &mut ContentStore,
     (green, version): (u64, usize),
-    (objects, blobs): (
-      (fragment::Encoded, ContentId),
-      (fragment::Encoded, ContentId),
-    ),
+    (parts, counted): (Fragments, EntryCounts),
     ns: u64,
   ) -> Result<(), StoreRefused> {
-    let parts = keep_both(store, objects, blobs)?;
-    self.install_base(store, green, BasePack { version, parts }, ns)
+    self.install_base(store, green, BasePack { version, parts }, ns)?;
+    self.count_entries(counted);
+    Ok(())
   }
 
   /// Records a version's fragments and charges their entries; refused, the fragments' content is
@@ -3234,8 +3309,6 @@ impl Repository {
     fragments: Fragments,
   ) -> Result<(), StoreRefused> {
     let contents = [fragments.objects.content, fragments.blobs.content];
-    self.count_entries(&fragments.objects.placed);
-    self.count_entries(&fragments.blobs.placed);
     let before = self.chain_footprint(green);
     if let Some(kept) = fragments_slot(&mut self.chains, green, version) {
       *kept = Some(fragments);
@@ -3278,10 +3351,6 @@ impl Repository {
     ns: u64,
   ) -> Result<(), StoreRefused> {
     let contents = [base.parts.objects.content, base.parts.blobs.content];
-    let placed: Vec<Placed> = [&base.parts.objects, &base.parts.blobs]
-      .into_iter()
-      .flat_map(|kept| kept.placed.iter().copied())
-      .collect();
     let before = self.chain_footprint(green);
     let old = self
       .chains
@@ -3303,7 +3372,6 @@ impl Repository {
     if let Some(chain) = self.chains.get_mut(&green) {
       chain.rebuild.rebuilt(ns);
     }
-    self.count_entries(&placed);
     self.count(|counters| counters.rebuilds = counters.rebuilds.saturating_add(1));
     Ok(())
   }

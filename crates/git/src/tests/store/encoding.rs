@@ -77,7 +77,7 @@ fn two_versions(format: ObjectFormat, store: &mut ContentStore) -> Repository {
 }
 
 /// One turn at a quantum of nothing did one unit: at most one object encoded, one pair of trees walked, a window's
-/// worth of rows read.
+/// worth of rows read, one placed entry taken into a part's record.
 fn one_unit(before: EncodingCounters, after: EncodingCounters) {
   assert_eq!(after.units - before.units, 1, "{before:?} {after:?}");
   assert!(after.objects - before.objects <= 1, "{before:?} {after:?}");
@@ -89,6 +89,8 @@ fn one_unit(before: EncodingCounters, after: EncodingCounters) {
     after.rows_read - before.rows_read <= handles(),
     "{before:?} {after:?}"
   );
+  // The encode keep's slice (CLAUDE.md §3): the part's record made a placed entry a unit, never all of them at once.
+  assert!(after.most_entries_a_unit <= 1, "{before:?} {after:?}");
 }
 
 /// `encoding` driven to its end a turn at a time, each with a quantum of nothing, each turn checked by [`one_unit`]:
