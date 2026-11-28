@@ -879,3 +879,9 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Owed later: 1c (Value pieces as runs) then 1b (entry lists as runs); deltas, identity_dirty/out, latest_change,
   last_changed, changes as arena units after w-shared's U0 (deltas and changes keep version-bounded reads).
 - Main's: the regime change (no footprint fall on 86a8f9885's head), its three-arm run.
+
+## 2026-11-28 04:07 — A-920 entry index (main at c29c18c7c)
+- c29c18c7c (commit 03e502b19): chain_entry::DeclaredIndex, one u32 buffer threaded by path index; a 9,000-file entry's
+  stepped encoding 19,499 frees to at most 2 (0 in the shard's kept room); the import batch's measure takes the room too;
+  the wide move asserts both kept rooms reused.
+- Next: the pile by phase, stage.recording first, probe first (test-only); main's three-arm regime table owed to me.
