@@ -778,3 +778,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - 310636d1a: the edge logs its listener's bind and close (a Drop guard); a failed test connect logs its port, time and a probe.
 - 5c6f50367: a refused first-death push fails a914 at once, told by slates_server::HOMED_SHORT.
 - Next: the green sibling (GAP-A9-7 record half), red first: a quiet newcomer must hold each green's newest placed version.
+
+## 2026-11-27 17:54 PST: A-935 landed (slates d08595c7e)
+- c1228d298: PendingGreen::release_held keeps each green's newest version pending, so the retarget ships it to a newcomer with no push; a935 red to green; a914 back to (d).
+- Focused: merge_service:: 33/33, fleet 8/8, a914 green once on (d).
+- Next: A-914 (c), red first (the homing window before any death is learned is short under load); then run 10's stalled replica build, logs first.
