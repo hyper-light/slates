@@ -96,6 +96,10 @@ pub trait Store: Repository {
   /// the fetch's room held gigabytes of hg's 57k clone's texts at once).
   fn text_bytes_a_step(&self) -> u64;
 
+  /// The machine's cache line, in bytes (`slates_machine`'s facts): what a stream's step charges a read of the content
+  /// store in (`render::StepCopy`; main 01a20182's ruling of 2026-11-27 22:13).
+  fn cache_line(&self) -> u64;
+
   /// A changeset's text; `None` past the view, or where the store does not hold it whole.
   fn changeset_text(
     &self,
@@ -738,7 +742,10 @@ fn streamed_step(
   out: &mut Vec<u8>,
 ) -> Result<bool, Refusal> {
   let (index, content) = store.revlogs().ok_or(Refusal::Store { what: "a revlog" })?;
-  stream.set_step_bytes(store.text_bytes_a_step());
+  stream.set_step_copy(crate::render::StepCopy {
+    bytes: store.text_bytes_a_step(),
+    line: store.cache_line(),
+  });
   if let Some(written) = head.as_mut() {
     match stream.counted() {
       crate::render::Counted::Counting => {

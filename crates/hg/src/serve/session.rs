@@ -307,7 +307,10 @@ impl Producing {
       Producing::Lookup(looking) => looking.step(store, room, out),
       Producing::Revlogs(streaming) => {
         let (index, content) = store.revlogs().ok_or(Refusal::Store { what: "a revlog" })?;
-        streaming.set_step_bytes(store.text_bytes_a_step());
+        streaming.set_step_copy(crate::render::StepCopy {
+          bytes: store.text_bytes_a_step(),
+          line: store.cache_line(),
+        });
         streaming
           .step(index, content, room, out)
           .map_err(stream::revlog_refused)

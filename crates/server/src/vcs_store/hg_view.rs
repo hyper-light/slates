@@ -728,6 +728,16 @@ pub(crate) fn text_bytes_a_step(state: &ShardState) -> u64 {
   state.config.copy_slice_bytes().max(1)
 }
 
+/// What one step of a fetch or a stream over the shard's view may move ([`slates_hg::render::StepCopy`]; main 01a20182's
+/// ruling of 2026-11-27 22:13): [`text_bytes_a_step`], and the machine's cache line a read of the content store is
+/// charged in (`slates_machine`'s facts, `DaemonConfig::cache_line`).
+pub(crate) fn step_copy(state: &ShardState) -> slates_hg::render::StepCopy {
+  slates_hg::render::StepCopy {
+    bytes: text_bytes_a_step(state),
+    line: u64::try_from(state.config.cache_line).unwrap_or(u64::MAX),
+  }
+}
+
 /// [`held`], for the tests.
 #[cfg(test)]
 pub(crate) fn held_here(state: &ShardState, id: RepositoryId) -> bool {
@@ -838,7 +848,7 @@ pub(crate) fn lend_held_in<R>(
   let made = super::lent_state(state, |state| {
     let (content, _) = state.vcs_stores.mercurial_ref(generation.id)?;
     let read = generation.register.state();
-    let view = Indexed::new(index, content, read, (text_bytes_a_step(state), room)).ok()?;
+    let view = Indexed::new(index, content, read, (step_copy(state), room)).ok()?;
     let stepped = step(&view, room);
     Some((stepped, view.lends()))
   });
@@ -948,13 +958,7 @@ pub(crate) fn with_view<R>(
   let (content, store) = shard.vcs_stores.mercurial_ref(id)?;
   let register = register_of(shard, id, room).ok()?;
   let read = register.state();
-  let view = Indexed::new(
-    &store.index,
-    content,
-    read,
-    (text_bytes_a_step(shard), room),
-  )
-  .ok()?;
+  let view = Indexed::new(&store.index, content, read, (step_copy(shard), room)).ok()?;
   Some(step(&view, IndexHeld::new(&store.index, content), room))
 }
 
@@ -971,13 +975,7 @@ pub(crate) fn with_view_over<R>(
   let (content, store) = shard.vcs_stores.mercurial_ref(id)?;
   let register = register_of(shard, id, room).ok()?;
   let read = register.state();
-  let view = Indexed::new(
-    &store.index,
-    content,
-    read,
-    (text_bytes_a_step(shard), room),
-  )
-  .ok()?;
+  let view = Indexed::new(&store.index, content, read, (step_copy(shard), room)).ok()?;
   let held = IndexHeld::new(over.unwrap_or(&store.index), content);
   Some(step(&view, held, content, room))
 }

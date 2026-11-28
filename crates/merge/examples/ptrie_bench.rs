@@ -53,7 +53,10 @@ fn keys(n: usize) -> Vec<Vec<u8>> {
 fn shuffled(keys: &[Vec<u8>], stride: usize) -> Vec<Vec<u8>> {
   let n = keys.len();
   (0..n)
-    .map(|at| keys[(at * stride + 1) % n].clone())
+    .filter_map(|at| {
+      let index = at.wrapping_mul(stride).wrapping_add(1).checked_rem(n)?;
+      keys.get(index).cloned()
+    })
     .collect()
 }
 
