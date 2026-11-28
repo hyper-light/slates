@@ -768,3 +768,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Focused on the merge: fleet 8/8 (a934 green, a919 x2, a921 missed-part, a918, a927 x2, a933's); units 14/14; a914 2 of 3.
 - a914 run 3 failed at the precondition: the first death's push was refused a connection on a's own HTTP port at 0 ms, so the newcomer never got the green.
 - Asked main whether to push.
+
+## 2026-11-27 17:08 PST: A-934 landed (slates 604aa12a0)
+- Pushed: 9feb04958, 834c9a3dc, bda853c47 and the merge. Main runs the wall and a914 x16.
+- The first-death push assertion was held back: one run tripped A-914 (c) (homing `retry`). Options sent to main; the patch is in ~/.local/state/w-shared/patches/.
+- Next: log the 0 ms connect refusal on a live node's vcs_http_port (bind, close and the test's connect, with times).
