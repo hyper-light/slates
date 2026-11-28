@@ -15255,6 +15255,13 @@ serves no stream (`1\n`, the client clones) until a sliced recount, the count wa
 Status (2026-11-27, the data stage a run a step): a split log's data file is written a run of chunks a step, within the
 step's copy budget or the room, whichever first, its first chunk whatever: on a 1,200-revision stock history one step
 for 300 chunks, where each chunk took a step.
+Status (2026-11-27, the gathering's read charge): a step's gathering charges a read of the content store the cache
+lines it moves (a table lent in place: its frame, its offsets' search, the store's lookups), not a content window, and
+walks the log rows on past each log into the next with no search; a range walk opens a run's table only once its keys
+reach it. At the server's 256 KiB window and a 94,797-byte step, 27 index steps for 1,200 revisions, where a read's
+window charge had made it a step a row. A row is charged the shard's learned cost of one (§4.17.1's rule, the
+gathering's own steps timed on the shard's clock, as bytes at the copy rate), so a step takes about its slice: p50 1.3
+to 2.5 µs against a 2.4 µs slice once learned, from 11.8 µs with a row charged its held form.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
@@ -57060,6 +57067,21 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   made durable, `Unanswered`: Subversion's commit path, which this change does not touch); fmt clean (macOS arm64,
   this Mac, local).
 
+### A-722 part 4k — An atomic push's stage a landing overtook before its append is made again in turns (P2 piece 4, 2026-11-27, w-git; main 01a20182's order of 18:44)
+- **Why.** A-722 part 4e made an overtaken stage again in the judge's turns (`Judge::ready`), and a push without
+  `atomic` appends each command in the step its `ready` answered, so its stage is current at its commit. An atomic
+  push judges its commands a step each and appends in a step of its own (`receive::atomic_step`), which asked nothing
+  first. A landing between its last command's turn and its append overtook its stage, and the append's commit staged
+  the push again whole in its step (`StoreCounters::restaged`): 10 of 12 interleaved atomic creates.
+- **Change.** `Judge::ready_to_append`, asked by the atomic step before its append; not ready, the step ends and the
+  next asks again, as `ready` does. Ready at once by default. The server's judge turns the push's stage made again
+  (`SealedPush::restage_turn`), so the append's commit adopts a current stage.
+- **Tests.** `slates-server` `git_push::tests::an_atomic_pushs_stage_a_landing_overtook_before_its_append_is_made_again_in_turns`
+  (12 atomic creates answered a step of each in turn: every one `ok`, `restaged` 0; red 10), beside A-722 part 4e's
+  test, now sharing its driver (`interleaved_creates`).
+- **Owed.** The moves admitted against the stage before it was made again have their new objects positioned by id in
+  the commit's step (`Repository::members_positions`), O(their objects), its own piece.
+
 ### A-722 part 4j — A landed push's maps by object are freed after its step, a slice a turn (P2 piece 3, 2026-11-27, w-git; main 01a20182's order of 18:44)
 - **Why.** CLAUDE.md §3 (bounded work). A commit's release freed the push's maps by object inside the landing's step:
   its commits, its objects' places in its pack, and the positions its stage gave. A pack push's entries by offset
@@ -57096,6 +57118,9 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   runs in place, the store's charge moved from the sets' bytes to the runs', the room lent for them
   (`settle_room`). A refused charge leaves the landing answered by its sets for the next commit's task, counted
   `vcs_store.landings.settle_refused`.
+- **Fixed the same day.** A turn whose quantum ran out on the last landing's runs answered more, so the server's task
+  held its slot a turn past the mapping. Its test met that at load 44. A turn now answers done exactly when none is
+  left; the git test's driver holds every turn to that (red: turn 4 answered more with none left).
 - **Tests.** `slates-git` `store::tests::commit_walk::a_landing_of_several_moves_maps_none_of_its_positions_in_its_step`
   (599 commits, two greens: 0 positions mapped in the step, red 599; every bringer as the line says before and after
   the turns; all 599 mapped in more than one turn; the store empty once released). The refusal oracle's two-move push
@@ -58261,6 +58286,81 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   (removals noted), the change applied to the map and trees before at its end, its first path in the push's step. The
   update's longest step 94 -> 42 ms. Its map equals the one built from the whole head, roots and all
   (`t_a752_p3_a_pushs_map_step_runs_a_path_a_slice_and_equals_the_whole_build`).
+- **Part 3b, a step that finishes the build never also lands (2026-11-27, w-shared; main's ruling 23:21).** Measured
+  again on main 7f6af7ae4 (t_a752, debug, 1,500 files, the update; two runs): the landing step 42.8 and 38.6 ms, the
+  engine's commit 15.6 and 14.2, its verdict 9.7 and 8.5, `hold_increments` 3.9 and 3.7, retention's secure 3.9 and
+  3.5, the recorded entry 2.7 and 2.4, the paths map's advance 2.5 and 2.3, the git store's record 1.6 and 1.5 and
+  commit 0.2. But the update's longest step was 124 ms: its build's last turn (80.8 ms, the ceiling A-783 grants when
+  no one waits) and the landing ran in one poll, since `ServerJudge::ready` went on from a turn that finished the build
+  to the verdict and the append. Every turn kept its bound; the step did not, past the watchdog's look by the landing,
+  and `push.build.longest_ns` (the turn alone) could not show it. So `ServerJudge::build_turn` answers built only
+  where its step ran none of the build's units: a turn that finishes the build hands the step back, and the verdict and
+  the landing begin the next, one yield a push. Judged of the command's own build (`Preparing::of`): a push's earlier
+  command leaves its build done. A step entered with the build done runs no turn, and is not counted as one (before, such a step, after a room or policy turn, counted the last turn's units again). Red first: in t_a752's
+  scene, no step runs build units and records the entry (`Drive::built_and_landed` 0; it was 1, a 127 ms step), and
+  every whole step within the ceiling by a unit and its opening.
+- **Part 3c, the engine's commit staged and published whole (2026-11-28, w-shared; main 01a20182's rulings of 00:42 to
+  01:42).** The commit is 14.2 to 15.6 ms of the landing (`commit_step` 11.2 to 14.0 ms: `set_file` 9.1 to 9.4, the
+  effects 0.8 to 2.6, the change index 1.0). It is to run in turns into a stage no reader sees, published at its end
+  with the head bump last, a refusal at any turn publishing nothing; never the green held out across turns. Of the
+  state it writes, the versioned (every history, the deltas, the change index, the copies' records) is appended at
+  the new version in place and refused by taking its entries above the head out; the current state (the eight Dims,
+  `file_removed`, the `*_changed` maps, `latest_change`, `last_changed`, the identity's sets) is forked; the entries
+  at or below the head the commit changes in place (`supersede_latest`, `history::reanchor`'s re-anchoring,
+  `change_one`'s `last`, `mark_dirty`'s identity sum) write the stage's held copies or wait for the publish. Units,
+  each red first: U0, every read names its version; U1, the head bump and `accepted` moved to the publish with one
+  history appended in place; then the other histories, the change index, the identity, the current-state Dims, and
+  the content history once it is a lineage Dim (A-920 arena unit 1, w-svn), its stage copies holding their chunks.
+  - **U0, every read names its version.** A reader at the head read a history's last entry, the latest copy record
+    and the change index unbounded as the head's (`content_read`'s "latest", `lands_on_head`'s head value,
+    `last_entry` under `covered_since` and `seed_since`, `copy_above`, `superseded_bytes`, `rename_alone`,
+    `changes_after`, `tree_changed_after`, `copy_fix`), so an entry a commit appended before it published would have
+    been read as the head's. Each now reads the latest at or below its version (`last_entry(history, at)`,
+    `entries_to`, `copy_above(path, at)`, `covered_since`'s and `seed_since`'s `at`): a reader the head, the commit's
+    own reads (`seed_content`, `seed_of`, `copied_in`) the version it commits. The recounts
+    (`history_bytes_recounted`, `special_history_recounted`) count every entry held, bounded by nothing: they audit
+    the running totals, which charge what a commit appends as it appends it. Red first
+    (`engine::head_bound_tests`): a green carrying an entry above its head in every history, a copy record over `a`'s
+    tree and a change-index entry above it reads as its twin at every version up to the head, every dimension, the
+    changed paths, the change walk and a probe verdict of every kind at the head and the version before; before, the
+    walk named the version above the head and the probes conflicted against the copy above it.
+  - **U1, the head moves at the publish, last; the mode history appended in place.** The commit pushed its version's
+    delta, which is what moves the head (`Green::head`), at the end of its emptied phase, before its links and change
+    index were recorded and before its increment was accepted; both now happen at the publish (`Green::publish_run`),
+    last, for every commit (whole, a unit a step, a replay's apply). A staged verdict (`engine::staging`:
+    `Green::{begin_staging, staging_step, publish, abandon_staging}`) runs the commit's steps without the publish;
+    the mode history is appended in place, where each path's history stood before the stage's first touch is marked
+    (`staging::Marks`), and a refusal truncates it there. Red first (`engine::publish_tests`): between every two of a
+    staged verdict's steps the head and every mode read up to it read as before (red: a reader saw the stage at unit
+    12, the head moved), and a stage given up after any turn leaves the mode history, the head and the accepted
+    increments exactly as they were (red: given up after 12 turns, the mode history kept the stage's entries).
+  - **U2, the other value histories alike.** The IPC nodes', directories', symbolic and hard links' and attributes'
+    histories are appended in place and marked at their first touch as the modes' are (`commit_special`,
+    `remove_special`, `apply_effect`'s directories, `set_symlink`, `set_hardlink`, `set_xattr`, `drop_metadata`'s
+    attributes), and a refusal truncates each. Red first (`engine::publish_tests`, works in every dimension but a
+    file's bytes): a stage given up after any turn leaves every value history, the head and the accepted increments as
+    they were (red with the mode history alone taken back: given up after 6 turns, a value history changed); every
+    value read up to the head is unchanged between steps (held by U0 and U1 already).
+  - **U3, the change index.** A commit records its version's change entries at its run's end, above the head (read by
+    no reader, U0), and a refusal of a run that ended takes them out. The earlier entry a path's change makes no
+    longer its last was marked so as the path was recorded, mid-commit, so a reader's walk saw it change before the
+    head did; it is marked at the publish now (`CommitRun::unmarked`, `Green::publish_run`). Red first
+    (`engine::publish_tests`): between every two steps the walk, its last flags and the paths changed since each
+    version read as before (red: a reader saw the stage's changes at unit 15), and a stage given up after any turn,
+    its last included, leaves the change index as it was (red: given up after 15 turns, it was changed).
+    `latest_change` and `changes_bytes`, which the commit still writes as it goes, are the current maps' unit's.
+  - **U4, each key's last change written aside.** The commit wrote `file_removed` and the mode, symbolic link, hard
+    link, attribute and IPC node maps in place as it went, which the verdict reads (`file_removed_since`, the
+    `merge_*` reads, `links_unseen`, `merge_handed`, `stack`'s judge and levels), so a reader between its turns saw
+    its last changes. The commit never reads them, so it writes them aside (`engine::last_changes::Aside`: inserts
+    and no read, so a commit reading its own pending last change does not compile), and its publish moves them in
+    (`Published::publish`, O(the keys it changed), each a move); a refusal drops them. The six maps
+    (`last_changes::Published`) have no insert but the publish's and a checkpoint's restore, so every commit, whole,
+    a unit at a time or a replay's apply, writes them through the one path. Not structural: a commit-path read of a
+    published map's `get` compiles and reads the value before the commit; the module states that none is made. Red
+    first (`engine::publish_tests`): what the verdict reads of each path's last changes reads as before between
+    every two steps (red: a reader saw the stage's last changes at unit 8), and a stage given up after any turn,
+    its last included, leaves the six maps as they were (red: given up after 8 turns, a map was changed).
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
@@ -58269,7 +58369,8 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
 - **Applied in the same change to** `crates/merge` (`pace`, `push::Building`, `increment::compose_paced` and its
   stages, `ops_doc::OpsDoc::{canonicalize_paced, encode_piece}`, `special::Composition`, `Green::{base_entries,
   base_links, base_copied}`), `crates/git` (`receive::works::{Preparing, Verdicts::prepare, Verdicts::prepared}`),
-  `crates/server` (`git_push::{PushTurns, ServerJudge::build_turn}`, status rows), GAPS, BENCHMARKS.md, amendments.tsv.
+  `crates/server` (`git_push::{PushTurns, ServerJudge::build_turn}`, status rows; part 3b
+  `ServerJudge::built_turn`, `receive::works::Preparing::of`), GAPS, BENCHMARKS.md, amendments.tsv.
 
 ### A-756 — A volume made on a node by materialization is found there by its name: it claims its name's alias (bug, 2026-11-20, w-fed-move, kiln goal 91; found by use: kiln's live move of an agent's captured clone, its mount refused `NOENT` on the new owner in four runs of five; §4.8 "Lookup", §4.10 "Ownership follows the writer"; A-236, A-291)
 - **Why.** A clone named for another partition than its origin's lives beside its origin and is found by name only
@@ -61621,6 +61722,38 @@ Applied in the same change to:
     not held by the child (macOS).
   - `a_failing_test_lets_its_hook_view_go_before_its_daemon` (CI only): the guard's order under a deliberate failure.
 
+### The encode keep's slice — a version's parts are recorded a placed entry a unit (2026-11-28, w-git; main 01a20182's ruling of 00:33; GAPS' owed "slicing the encode poll"; A-718, A-856)
+- **Why.** CLAUDE.md §3 (bounded work). The 11-20 spin site is gone (`settle_encodings`, deleted in 262d21ff5; today's
+  turn is paced, A-783, and each stage's unit sized within the quantum, A-718), but the encoding's last unit was whole.
+  Once a version's parts were put, `Repository::keep_version` (and `keep_base`) made each part's record in one call
+  (`keep`): every placed entry sorted into position order (`position_order`), the part's position and reference sets
+  made, and every entry counted (`count_entries`, again at the install). That is O(the version's objects) in one unit,
+  and git/git v2.0.0's first version is its whole history. Counted `EncodingCounters::most_entries_a_unit`: 152 of a
+  300-file version's entries in one unit, 454 of a base pack's.
+- **Change.** The Keep stage, its parts put, goes on to `Stage::Record`: each part's `Keeping` takes in a placed entry a
+  unit (its position into a position-ordered map, a reference delta's base into a set, its kind counted), then reads the
+  map out a position a unit into the part's order and its position set, then the bases into its references. The sets are
+  made ascending (`positions::Ascending`), so each is taken in the cheaper of its runs and its list with no pass over
+  it; the bit table is not offered there, and the cheaper of the two never costs more than eight bytes a position. The
+  install then charges by the green's difference (A-722 part 4h) and adds the entries' counts once it succeeds. What a
+  record holds while it is made is charged (`Keeping::held_bytes`, A-856), and a refused record gives both parts'
+  content back.
+- **Tests.** `slates-git` `store::tests::encoding`: every unit of a version's and a base pack's encoding takes one
+  placed entry at most (`one_unit`, red 152 and 454), and their fragments are the one-pass encoding's byte for byte;
+  `slates-git --lib -- store::` 141 passed, 4 ignored.
+- **The encoding's start, sliced the same way (2026-11-28, main's ruling of 00:50).** `Encoding::fragments` read the
+  version's D(k) whole from its value (`Repository::unencoded`, `Sets::read`, both of the value's sets), and a base
+  pack's start its head's reached set (`head_reach`): O(the set's runs) in one call, and a version that brings objects
+  other pushes indexed has a D(k) of as many runs as those objects lie apart. The encoding now begins at `Stage::Read`:
+  the set it sends read from its value's tree a node a unit (`reach::SetReading`: a leaf's runs, or an inner node's
+  children named), the D(k) alone for a version, then the stage it began with. The set is kept as the runs read, with
+  no pass to settle its form, since it is the encoding's own for its turns (`Positions::of_ascending_runs`). Counted
+  `EncodingCounters::most_runs_a_unit`. Test: `an_encodings_start_reads_its_versions_d_k_a_node_a_unit` (a D(k) of 113
+  runs, 150 blobs scattered among another green's 600, against a leaf's 64: 113 runs in one unit before, at most a
+  leaf's now; the fragments the one-pass encoding's, byte for byte). `slates-git --lib -- store::` 142 passed.
+- **Owed.** Main's run: git/git v2.0.0's push encoded under load, the watchdog's spinning lines and
+  `vcs_store.git_encode.units_past_budget` by stage (run-requests.md, 2026-11-28).
+
 ### A-859 — A git object received in a pack is sent on as its entry lies there: git's pack reuse (bug, 2026-11-22, w-git for UI goal 93; main 01a20182's ruling of 03:38 PST; part B; §4.17.2 items 4 and "A fetch", A-639, A-718, A-722)
 Applied in the same change to:
 - `crates/git/src/store/packed.rs`: `raw_entry`, an entry as it lies (its representation, its size, where its data
@@ -61874,6 +62007,19 @@ landing (item 2b) lifted 2026-11-27 (GAPS "LIFTED").
   `a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed` (1,115,127 bytes let go before the
   listing); `an_advertisement_over_a_let_go_pack_is_the_one_over_it_held`; `t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed`;
   `a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+- **A pushed entry's check across turns (2026-11-27, w-git; main 01a20182's ruling of 23:25; GAPS' clone window peak,
+  OPEN since 13:47).** A clone whose answer begins before its repository's encoding is kept reads the let-go pack.
+  Its check of a pushed entry's CRC32 before reusing it (`Upload::reused_as_kept`) read the entry's raw bytes in one
+  call (`packed::raw_crc`), so a 3 MiB blob's check held each window it had brought back until the entry was sent: 12 of
+  13, against the look-ahead's two and the window a turn stopped at. The check now goes on where it stopped
+  (`packed::RawCrc`: the CRC32's state and how far it hashed, kept in the stream with the entry's header), and its
+  cursor is the one the look-ahead and the let-go behind follow (`Upload::reading_next`). The copy follows only on a
+  match, as git's `check_pack_crc` reads an entry before it writes it, so each window the check passed is brought
+  back again for the copy (`vcs_store.git_resident.brought_again`). The let-go behind also lets go what lies past the
+  look-ahead's reach from the cursor (`let_go_behind`), which the copy's return to the entry's start leaves: four held
+  before that. An answer holds at most `LOOK_AHEAD_WINDOWS` and one window at once, whatever its objects' sizes. Test:
+  `a_clone_racing_its_encoding_of_a_let_go_pack_holds_at_most_a_turns_windows` (`git_encode::NO_FETCH_WAIT`, test-only:
+  6 stops, peak 2, 12 brought again, the clone whole; red 12, every run).
 - **The encoding's side** (main 01a20182's note of 2026-11-22: the last whole-pack residency). An encoding unit whose
   pushed entry lies in a let-go window, or a copy reaching one, stops the same way (`Encoding::waiting`, `stopped`), its
   object put back first in line; its driver brings that window back before the next turn. Nothing makes a repository's
@@ -64408,6 +64554,15 @@ GAPS.
   against 1 and 47.3 ms, handed once. `vcs_http::daemon_edge::tests::a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it`:
   red with one count of every derive turn (100 → 117 across the listing); green, a reader's turns 0 → 0 while the task
   behind turned 364, the listing answered in 14.8 ms (its patience scaled by `test_lane::slowdown`).
+- **A turn yielded is the shard's, not the derivation's (2026-11-27, w-git; main 01a20182's diag CI 12, TSan run
+  46099781322: "no more turns than alone, but the hand-over's: 21 against 9").** A reader's turn runs to the step's
+  ceiling unless another task waits on the shard (`paced`), so a slow host, whose other tasks wait longer, ends more
+  of them early. The bound the design holds is on the reader's own turns, those its ceiling ended: handed a
+  derivation, no more than alone but the hand-over's (`PACED_TURNS`, a turn to begin, one to end, one to find
+  nothing due, room for a spurious wake). Counted `vcs_store.git_derive.read_turns_yielded` beside `read_turns`.
+  Red, made deterministic with a task waiting through the read a yield at a time
+  (`a_fetch_handed_a_derivation_while_its_shard_has_other_work_takes_no_more_turns_than_alone`): every turn counted,
+  935 against 3, 934 of them yielded. Green with the reader's own turns, 1 against 1.
 - **Whether any is due, from counts (2026-11-25, main 01a20182's sample).** A 3 s sample of git/git's clone waiting for
   its first pack bytes found the encoding behind the push spending a third of its time in
   `Repository::derivations_due` (309 of its 951 samples), which every derivation and encoding turn asks before it
@@ -66447,6 +66602,29 @@ Applied in the same change to:
   saw it not yet re-keyed, so the test's own looks (one control-shard question a node in turn) add nothing, and its
   bound is the restarted node's detection plus both nodes' measured wake lateness (`detector_granularity_ns`), never a
   bare 1 s. Diag 10's Windows x86_64 lane met node 2 first seen at 1,010 ms: a timer tick of 15.625 ms on each look.
+- **Amended, the re-key window** (2026-11-28, w-shared; main 01a20182's ruling of 00:42; winfleet-5 and -6 on
+  windows-11-arm, 5 and 7 runs in 16 of the answers-peers test). The rule that a peer re-keys a restarted node within
+  one detection did not fit SWIM: until a peer re-keys it, its probes reach the node under its old process's keys,
+  unanswered, the node cannot refute a suspicion it cannot hear, and the detector condemns it two or three periods
+  later. That is not under any floor (`detection_bound` is an upper bound and the detector keeps none), but at 65 to
+  87 ms periods it is 327 to 669 ms, before the slower host's re-key (run 3: the new process listening at 502.914 s,
+  the condemnation pending at 503.140). Now a peer that learns a member's process restarted (`note_reconnected`: a
+  changed process nonce) opens the member's re-key window (`PlaneState::rekeying`), and its detector holds the
+  member's probes unjudged (`MemberPlane::hold_judging`, a local change to vendored hyper-swim, its README's item 4):
+  an unanswered one is counted (`fleet.plane.rekey_unjudged`), never suspecting the member or making its condemnation
+  pending. The window closes at the re-key's install (the installed epoch's process the one last announced,
+  `fleet.plane.rekey_closed.keyed`) or one detection after it opened (`fleet.plane.rekey_closed.expired`), checked
+  on the member loop's own turn, no timer of its own; bounded by the fleet's peer capacity. **Bound:** a process that
+  dies just after its restart is condemned within one detection plus `detection_bound`; that is the window's price,
+  paid only while it is open. The takeover's preconditions are unchanged: it reads condemnations as before, later by
+  at most the window. Red first: at the plane (`crates/cluster/tests/member_plane.rs`
+  `a_restarted_member_held_unjudged_through_its_rekey_is_condemned_only_once_released`), a silent member held by both
+  holders is condemned by neither while held, six of its probes held each (red with the hook a no-op: condemned while
+  held), and by both once released; at the window (`member_task` tests), it opens at a changed process and closes at
+  the re-key, or at one detection when never re-keyed (red with the opening a no-op). Applied to
+  `vendor/hyper-raft/hyper-swim/src/detector.rs` (`Detector::{hold_judging, unjudged}`, `PeerReport::unjudged`),
+  `crates/cluster/src/member_plane.rs`, `crates/server/src/member_task.rs`, the vendor README, GAPS,
+  `docs/bugs/2026-11-28-a-warm-restarted-node-was-condemned-before-its-peers-re-keyed-it.md`.
 
 ### A-932 — A merge record names its green's lineage, and a holder makes a green standing alone at once (2026-11-27, w-interop for main 01a20182, its ruling (a) of 2026-11-27 07:06 and its approval of 07:08; the fleet suite's red; amends A-908 and A-908 part 4; A-636 part 2b-2, A-145, A-255)
 

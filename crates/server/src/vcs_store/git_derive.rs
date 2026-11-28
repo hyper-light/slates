@@ -51,6 +51,9 @@ pub(crate) const REFUSED: &str = "vcs_store.git_derive.refused";
 /// step's ceiling only while nobody waits). Read beside [`TURNS`], what tells turns the work's time took from turns its
 /// shard's other work asked for. Format: a counter name.
 pub(crate) const TURNS_YIELDED: &str = "vcs_store.git_derive.turns_yielded";
+/// Counter: of those, a reader's ([`READ_TURNS`]): what tells a request's turns its own work's ceiling ended from those
+/// it gave the shard's other tasks, which a slow host's tasks ask more of. Format: a counter name.
+pub(crate) const READ_TURNS_YIELDED: &str = "vcs_store.git_derive.read_turns_yielded";
 
 /// The derivations under way, one a repository (the module doc's bounds), and the repositories a task derives behind a
 /// push ([`derive_behind`]).
@@ -148,6 +151,9 @@ fn turn_as(state: &mut ShardState, id: RepositoryId, driver: Driver) -> Turned {
   }
   if YIELDED.with(|yielded| yielded.replace(false)) {
     state.count(TURNS_YIELDED, 1);
+    if driver == Driver::Reader {
+      state.count(READ_TURNS_YIELDED, 1);
+    }
   }
   if derived > 0 {
     state.count(DERIVED, derived);

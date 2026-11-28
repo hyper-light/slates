@@ -3423,10 +3423,11 @@ pub struct RegionalConfiguration {
   /// none of such an object never offers the creator its direct route. [`admit`](RegionalConfiguration::admit) still
   /// drops the completion record (A-309: kept, it would settle the lines of the member the id names now), and moves
   /// this fact here instead. At most [`completed_bound`](RegionalConfiguration::completed_bound) are kept, the oldest
-  /// let go first ([`bound_completed`]): one let go leaves a stranger with no route of its own to offer the creator
-  /// once, which refuses the forward as not its owner (`fleet.forward.refused.not_owner_here`), and the location round
-  /// then finds the adopter, a wasted forward and never a wrong owner. So the bound costs latency, never correctness,
-  /// and needs no guarantee that no such stranger remains.
+  /// let go first ([`bound_completed`](RegionalConfiguration::bound_completed)): one let go leaves a stranger with no
+  /// route of its own to offer the creator once, which refuses the forward as not its owner
+  /// (`fleet.forward.refused.not_owner_here`), and the location round then finds the adopter, a wasted forward and
+  /// never a wrong owner. So the bound costs latency, never correctness, and needs no guarantee that no such stranger
+  /// remains.
   pub superseded: std::collections::BTreeMap<HostId, u64>,
   /// The objects an explicit move took off their creator's line (§4.8 "Authority scope": "moving one volume changes
   /// that object's ownership generation, recorded in the configuration's moved-object exceptions, without fencing

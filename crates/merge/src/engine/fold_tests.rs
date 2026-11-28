@@ -34,7 +34,7 @@ pub(super) fn change(work: Work, path: &str, how: u8, mark: u8) -> Work {
 pub(super) fn folded_state(green: &Green) -> String {
   format!(
     "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{} {} {:?}",
-    green.content_history,
+    green.content_history.iter().collect::<Vec<_>>(),
     green.special_history,
     green.mode_history,
     green.symlink_history,
@@ -96,7 +96,7 @@ fn read_state(green: &Green) -> String {
         .map(move |path| (version, *path, green.content_at_bytes(path, version)))
     })
     .collect();
-  let versions: Vec<(&String, Vec<u64>)> = green
+  let versions: Vec<(String, Vec<u64>)> = green
     .content_history
     .iter()
     .map(|(path, history)| (path, history.iter().map(|(version, _)| *version).collect()))

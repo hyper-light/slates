@@ -244,6 +244,7 @@ pub(crate) fn stage_tallied(tally: Option<slates_hg::render::StageTally>) {
     return;
   };
   let _ = crate::state::with_state(|state| {
+    gathering_noted(state, tally.gathered);
     for (at, stage) in [tally.count, tally.index, tally.data, tally.other]
       .iter()
       .enumerate()
@@ -728,6 +729,41 @@ pub(crate) fn text_bytes_a_step(state: &ShardState) -> u64 {
   state.config.copy_slice_bytes().max(1)
 }
 
+/// What one step of a fetch or a stream over the shard's view may move ([`slates_hg::render::StepCopy`]; main 01a20182's
+/// rulings of 2026-11-27 22:13 and 23:39): [`text_bytes_a_step`]; the machine's cache line a read of the content store
+/// is charged in (`slates_machine`'s facts, `DaemonConfig::cache_line`); a gathered row's cost the shard learned from its
+/// streams' own steps (`VcsStores::hg_row_cost`), the boot probe's before any (`DaemonConfig::hg_gather_row_ns`), at the
+/// measured copy rate the step's budget is derived from
+/// (`DaemonConfig::memcpy_bytes_per_second`); and the shard's clock, which those steps are timed by.
+pub(crate) fn step_copy(state: &ShardState) -> slates_hg::render::StepCopy {
+  let (bytes, line) = (
+    text_bytes_a_step(state),
+    u64::try_from(state.config.cache_line).unwrap_or(u64::MAX),
+  );
+  slates_hg::render::StepCopy {
+    bytes,
+    line,
+    row: state.vcs_stores.hg_row_cost.row_bytes(
+      state.config.hg_gather_row_ns,
+      (state.config.memcpy_bytes_per_second, bytes),
+    ),
+    clock: Some(slates_rt::futures::now_ns),
+  }
+}
+
+/// Counter: the rows a stream's or a recount's gathering steps walked, which the shard's row cost learns from
+/// (`VcsStores::hg_row_cost`). Format: a counter name in the status report.
+pub(crate) const GATHERED_ROWS: &str = "vcs_store.hg_gathered_rows";
+/// Counter: the nanoseconds those steps took on the shard's clock. Format: a counter name.
+pub(crate) const GATHERED_NS: &str = "vcs_store.hg_gathered_ns";
+
+/// Folds a gathering's `rows` and their time `ns` into the shard's learned row cost, counted (non-vacuity).
+pub(crate) fn gathering_noted(state: &mut ShardState, (rows, ns): (u64, u64)) {
+  state.vcs_stores.hg_row_cost.observe((rows, ns));
+  state.count(GATHERED_ROWS, rows);
+  state.count(GATHERED_NS, ns);
+}
+
 /// [`held`], for the tests.
 #[cfg(test)]
 pub(crate) fn held_here(state: &ShardState, id: RepositoryId) -> bool {
@@ -838,7 +874,7 @@ pub(crate) fn lend_held_in<R>(
   let made = super::lent_state(state, |state| {
     let (content, _) = state.vcs_stores.mercurial_ref(generation.id)?;
     let read = generation.register.state();
-    let view = Indexed::new(index, content, read, (text_bytes_a_step(state), room)).ok()?;
+    let view = Indexed::new(index, content, read, (step_copy(state), room)).ok()?;
     let stepped = step(&view, room);
     Some((stepped, view.lends()))
   });
@@ -948,13 +984,7 @@ pub(crate) fn with_view<R>(
   let (content, store) = shard.vcs_stores.mercurial_ref(id)?;
   let register = register_of(shard, id, room).ok()?;
   let read = register.state();
-  let view = Indexed::new(
-    &store.index,
-    content,
-    read,
-    (text_bytes_a_step(shard), room),
-  )
-  .ok()?;
+  let view = Indexed::new(&store.index, content, read, (step_copy(shard), room)).ok()?;
   Some(step(&view, IndexHeld::new(&store.index, content), room))
 }
 
@@ -971,13 +1001,7 @@ pub(crate) fn with_view_over<R>(
   let (content, store) = shard.vcs_stores.mercurial_ref(id)?;
   let register = register_of(shard, id, room).ok()?;
   let read = register.state();
-  let view = Indexed::new(
-    &store.index,
-    content,
-    read,
-    (text_bytes_a_step(shard), room),
-  )
-  .ok()?;
+  let view = Indexed::new(&store.index, content, read, (step_copy(shard), room)).ok()?;
   let held = IndexHeld::new(over.unwrap_or(&store.index), content);
   Some(step(&view, held, content, room))
 }

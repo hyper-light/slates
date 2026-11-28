@@ -183,7 +183,8 @@ fn a_landing_of_several_moves_maps_none_of_its_positions_in_its_step() {
   assert!(store.is_empty());
 }
 
-/// Maps every unsettled landing of `repository` in turns of a unit's quantum: the turns taken.
+/// Maps every unsettled landing of `repository` in turns of a unit's quantum, each turn answering done exactly when none
+/// is left: the turns taken.
 fn settle_all(repository: &mut Repository, store: &mut slates_vcs::ContentStore) -> u64 {
   let mut clock = Ticks(0);
   let mut turns = 0_u64;
@@ -193,7 +194,11 @@ fn settle_all(repository: &mut Repository, store: &mut slates_vcs::ContentStore)
       clock: &mut clock,
       ns: 1,
     };
-    if repository.settle_landings_turn(store, quantum).unwrap() {
+    let done = repository.settle_landings_turn(store, quantum).unwrap();
+    // A turn answers done exactly when none is left, so its task gives its slot back that turn (a quantum spent on the
+    // last landing's runs once answered more, and the server's task held its slot a turn past the landing's mapping).
+    assert_eq!(done, !repository.landings_unsettled(), "turn {turns}");
+    if done {
       return turns;
     }
   }

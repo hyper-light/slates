@@ -331,7 +331,7 @@ impl Green {
       || removed_or_made(self.special_history.get(path), span)
       || touched(self.dir_history.get(path), span)
       || self
-        .copy_above(path)
+        .copy_above(path, self.head())
         .is_some_and(|(_, record)| record.version > from)
   }
 }

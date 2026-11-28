@@ -1344,41 +1344,55 @@ impl HgIndex {
       .get(..prefix_len)
       .map(<[u8]>::to_vec)
       .unwrap_or_default();
-    // The range's end: past every key of the log's rows (its prefix and any four bytes).
-    let end: Vec<u8> = prefix
-      .iter()
-      .copied()
-      .chain([u8::MAX; REV_BYTES + 1])
-      .collect();
+    let end = past_prefix(&prefix);
     self
       .rows
       .iter_range(store, (&start, &end))
       .take_while(move |row| {
         row.key().len() == prefix.len().saturating_add(REV_BYTES) && row.key().starts_with(&prefix)
       })
-      .map(move |row| {
-        let rev = u32::from_be_bytes(row.key().get(prefix_len..)?.try_into().ok()?);
-        if changelog {
-          let found = read_changeset(&row)?;
-          return Some(EntryNumbers {
-            rev,
-            parents: [found.p1, found.p2],
-            link: rev,
-            node: found.node,
-            flags: found.flags,
-            len: found.len,
-          });
-        }
-        let found = read_revision(&row)?;
-        Some(EntryNumbers {
-          rev,
-          parents: [found.p1, found.p2],
-          link: found.link,
-          node: found.node,
-          flags: found.flags,
-          len: found.len,
-        })
-      })
+      .map(move |row| decode_numbers(&row, changelog))
+  }
+
+  /// The log rows from `log`'s revision `rev` on, in key order, each with the log it is a row of ([`EntryNumbers`];
+  /// none for a row that does not decode): past the log's last row into the logs after it in the walk a stream makes
+  /// of them, every file log by its path and then the manifest log (their keys' order, [`FILE_KEY`] before
+  /// [`MANIFEST_KEY`]), so a walk finds the next log without a search (goal 93, main 01a20182's ruling of 2026-11-27
+  /// 22:13: a search a log was most of a stream's index reads on a sealed history). The changelog, last in the stream
+  /// and first in the keys, is walked alone.
+  pub fn numbers_onward<'s>(
+    &'s self,
+    store: &'s ContentStore,
+    log: Log<'_>,
+    rev: u32,
+  ) -> impl Iterator<Item = Option<(Log<'s>, EntryNumbers)>> + use<'s> {
+    let (start, end) = onward_range(log, rev);
+    self.rows.iter_range(store, (&start, &end)).map(|row| {
+      let log = log_of_row_key(row.key())?;
+      Some((log, decode_numbers(&row, log == Log::Changelog)?))
+    })
+  }
+
+  /// How many sealed tables [`HgIndex::numbers_onward`] from `log`'s revision `rev` may open, none opened.
+  #[cfg(test)]
+  pub(crate) fn numbers_onward_tables(&self, log: Log<'_>, rev: u32) -> u64 {
+    let (start, end) = onward_range(log, rev);
+    self.rows.tables_meeting((&start, &end))
+  }
+
+  /// How many sealed tables [`HgIndex::spans_from`] of `log` from `from` may open: its number row's lookup and its
+  /// sized rows' walk, none opened. None for a log never sized.
+  #[cfg(test)]
+  pub(crate) fn spans_tables(&self, store: &ContentStore, log: Log<'_>, from: u32) -> u64 {
+    let key = number_key(log);
+    let looked_up = self.rows.tables_meeting((&key, &past_prefix(&key)));
+    let walked = self.log_number(store, log).map_or(0, |number| {
+      let end = number
+        .checked_add(1)
+        .map_or_else(Vec::new, |next| sized_key(next, 0));
+      self.rows.tables_meeting((&sized_key(number, from), &end))
+    });
+    looked_up.saturating_add(walked)
   }
 
   /// Appends a group of changesets in the order it arrived; each one's number, the number it had already for one the
@@ -1821,6 +1835,77 @@ fn object_key(node: &Node) -> Vec<u8> {
   key.push(OBJECT_ROW);
   key.extend_from_slice(node);
   key
+}
+
+/// The first key past every key that begins with `prefix` and adds at most a revision number and a byte.
+fn past_prefix(prefix: &[u8]) -> Vec<u8> {
+  prefix
+    .iter()
+    .copied()
+    .chain([u8::MAX; REV_BYTES + 1])
+    .collect()
+}
+
+/// The keys [`HgIndex::numbers_onward`] walks from `log`'s revision `rev`: to the changelog's last row for the changelog,
+/// else past every log row.
+fn onward_range(log: Log<'_>, rev: u32) -> (Vec<u8>, Vec<u8>) {
+  let start = log.row_key(rev);
+  let end = match log {
+    Log::Changelog => past_prefix(
+      start
+        .get(..start.len().saturating_sub(REV_BYTES))
+        .unwrap_or_default(),
+    ),
+    Log::Manifest | Log::File(_) => vec![LOG_ROW.saturating_add(1)],
+  };
+  (start, end)
+}
+
+/// The log a log row's `key` names ([`LOG_ROW`], the log's key, the revision): none for a key of no log.
+fn log_of_row_key(key: &[u8]) -> Option<Log<'_>> {
+  let (tag, rest) = key.split_first()?;
+  if *tag != LOG_ROW {
+    return None;
+  }
+  let log_key = rest.get(..rest.len().checked_sub(REV_BYTES)?)?;
+  match log_key {
+    [CHANGELOG_KEY] => Some(Log::Changelog),
+    [MANIFEST_KEY] => Some(Log::Manifest),
+    [FILE_KEY, path @ .., PATH_END] => Some(Log::File(path)),
+    _ => None,
+  }
+}
+
+/// A log row's entry numbers, its revision read from its key's last bytes (a changeset links to itself); none for a row
+/// that does not decode.
+fn decode_numbers(row: &slates_vcs::RowRef<'_>, changelog: bool) -> Option<EntryNumbers> {
+  let key = row.key();
+  let rev = u32::from_be_bytes(
+    key
+      .get(key.len().checked_sub(REV_BYTES)?..)?
+      .try_into()
+      .ok()?,
+  );
+  if changelog {
+    let found = read_changeset(row)?;
+    return Some(EntryNumbers {
+      rev,
+      parents: [found.p1, found.p2],
+      link: rev,
+      node: found.node,
+      flags: found.flags,
+      len: found.len,
+    });
+  }
+  let found = read_revision(row)?;
+  Some(EntryNumbers {
+    rev,
+    parents: [found.p1, found.p2],
+    link: found.link,
+    node: found.node,
+    flags: found.flags,
+    len: found.len,
+  })
 }
 
 /// The key of `log`'s number row ([`NUMBER_ROW`]).

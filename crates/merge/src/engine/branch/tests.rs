@@ -1233,6 +1233,79 @@ fn a_retired_branchs_release_hands_what_it_frees_to_its_reaped() {
   );
 }
 
+/// Shape: the paths of A-920's wide revision (9,000 files), whose retired member's content history this test stands for.
+const WIDE_PATHS: u32 = 9_000;
+
+/// A lineage and an empty member of it that one revision of [`WIDE_PATHS`] new files made: one content change a path.
+fn a_member_a_wide_revision_made() -> (Lineage, LineageGreen) {
+  let (mut lineage, _root) = Lineage::new(Green::with_origin(Origin::default()));
+  let member = lineage.create();
+  let mut work = Work::default();
+  for n in 0..WIDE_PATHS {
+    let path = format!("file{n:04}.c");
+    let bytes = format!("the bytes of file {n}\n");
+    work.op(OpKind::Create, &path, 0, 0, u64::MAX);
+    let src = work.stash(bytes.as_bytes());
+    work.op(OpKind::Insert, &path, 0, bytes.len() as u64, src);
+  }
+  let inc = Increment {
+    id: [7; 32],
+    base: 0,
+    doc: work.doc,
+    post_state: work.post,
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  assert_eq!(
+    lineage.with(member, |green| green.submit(&inc)).unwrap(),
+    Outcome::Accepted { version: 1 }
+  );
+  (lineage, member)
+}
+
+/// The heap frees dropping `thing` makes on this thread.
+fn frees_dropping<T>(thing: T) -> u64 {
+  let before = crate::counting::frees();
+  drop(thing);
+  crate::counting::frees() - before
+}
+
+/// A-920 unit 1 (main's ruling of 2026-11-28 01:04 and order of 01:09: the content history joins the lineage's
+/// arenas). Do: retire a member one revision of [`WIDE_PATHS`] new files made, then step its release to its end,
+/// counting the heap frees of its content history wherever it went: what the remains still hold of it, and the entry
+/// lists the steps moved into the `Reaped`. Expect: at most two frees a path (its entry list and its one value's piece
+/// list) and one a doubling of the `Reaped`'s list (64, a `usize`'s bits): the history's keys and tree nodes are the
+/// arena's, so none of them is a heap block. Red before: the history was an ordered map the remains dropped whole,
+/// 28,499 frees at the server's 9,000-path copy (each key a string, and the map's own nodes besides).
+#[test]
+fn a_retired_members_content_history_frees_no_key_or_tree_node_to_the_heap() {
+  let (mut lineage, member) = a_member_a_wide_revision_made();
+  let recorded = lineage
+    .with(member, |green| green.content_history.len())
+    .unwrap();
+  assert_eq!(
+    recorded, WIDE_PATHS as usize,
+    "every path's change recorded"
+  );
+  let mut release = lineage.retire(member).unwrap();
+  let in_remains = frees_dropping(
+    release
+      .remains
+      .as_mut()
+      .map(|green| std::mem::take(&mut green.content_history)),
+  );
+  let mut reaped = crate::reaped::Reaped::default();
+  while lineage.release_step(&mut release, &mut reaped).unwrap() {}
+  let in_reaped = frees_dropping(reaped.take_histories());
+  let frees = in_remains + in_reaped;
+  println!("CONTENT_HISTORY_FREES remains={in_remains} reaped={in_reaped} paths={recorded}");
+  assert!(
+    frees <= 2 * u64::from(WIDE_PATHS) + u64::from(usize::BITS),
+    "the content history of {recorded} paths freed {frees} heap blocks ({in_remains} in the remains, {in_reaped} \
+     moved to the reaper)"
+  );
+}
+
 /// A-575 (a repository's member made empty, §4.17.1). Do: add an empty member to a lineage and create a file in it.
 /// Expect: it holds nothing at version 0 and its file at version 1, and the lineage's root is untouched.
 #[test]

@@ -971,8 +971,9 @@ async fn streamed_from_the_store(id: RepositoryId) -> (Vec<u8>, slates_hg::rende
   let mut out = Vec::new();
   loop {
     let (more, step) = crate::state::with_state(|state| {
-      let step = crate::vcs_store::hg_view::text_bytes_a_step(state);
-      streaming.set_step_bytes(step);
+      let copy = crate::vcs_store::hg_view::step_copy(state);
+      streaming.set_step_copy(copy);
+      let step = copy.bytes;
       let (content, store) = state.vcs_stores.mercurial(id).expect("the store");
       let more = streaming
         .step(
@@ -1108,4 +1109,102 @@ fn recount_watched(daemon: &crate::Daemon, id: RepositoryId) -> (bool, bool) {
       return (unsized_while_recounting, false);
     }
   }
+}
+
+/// Repository `id`'s stream clone made a step at a time on the shard as [`streamed_from_the_store`] makes it, the shard's
+/// own step copy each step (`hg_view::step_copy`: the boot profile's first cost a row before any is learned, the
+/// shard's clock): each gathering step's rows and time, in order, and the step copy the first was taken within.
+async fn gathering_timed(id: RepositoryId) -> (Vec<(u64, u64)>, slates_hg::render::StepCopy) {
+  let disk = crate::state::with_state(|state| state.vcs_disk.clone())
+    .flatten()
+    .expect("the node's store");
+  let repository = u128::from_be_bytes(id.bytes);
+  let mut streaming = slates_hg::render::Streaming::default();
+  let (mut out, mut gathered) = (Vec::new(), Vec::new());
+  let first = crate::state::with_state(|state| crate::vcs_store::hg_view::step_copy(state))
+    .expect("the shard");
+  loop {
+    let (more, step) = crate::state::with_state(|state| {
+      let copy = crate::vcs_store::hg_view::step_copy(state);
+      streaming.set_step_copy(copy);
+      let (content, store) = state.vcs_stores.mercurial(id).expect("the store");
+      let more = streaming
+        .step(
+          &store.index,
+          content,
+          &mut Admission::new(u64::MAX),
+          &mut out,
+        )
+        .expect("a step");
+      (more, copy.bytes)
+    })
+    .expect("the shard");
+    let (rows, ns) = streaming.take_tally().gathered;
+    if rows > 0 {
+      gathered.push((rows, ns));
+    }
+    if streaming.wants().is_some() {
+      crate::vcs_store::hg_view::answer_wants_over(&disk, repository, &mut streaming, step)
+        .await
+        .expect("the store answered");
+      continue;
+    }
+    if !more {
+      break;
+    }
+  }
+  assert!(out.starts_with(b"0\n"), "the stream served");
+  (gathered, first)
+}
+
+/// Goal 93, the row cost's first value (main 01a20182's rulings of 2026-11-28 00:46 and 01:19: measured at the daemon's
+/// start beside its memcpy rate, logged with its inputs; the red, a fresh daemon's first gathering step held to its
+/// slice plus one row's cost). Do: on a fresh daemon, import the `states` repository and land it, then make its first
+/// stream clone a step at a time on the shard with the shard's own step copy, each step's gathering timed on the shard's
+/// clock. Expect the boot profile's cost a row measured (`hg_gather_row_ns`, nonzero) and the first stream's rows charged
+/// it (nothing of the shard's own learned yet); and its gathering steps to take, at their median, their slice (the
+/// step's bytes at the measured memcpy rate) and one row's cost at most. The median, not the first step alone: the
+/// stream's first step is its cold start (its first tables opened, its first lookups), 15.4 µs on the MacBook in debug
+/// against the median's 2.7 µs. Red before: the first value derived from a row's cache lines, about
+/// ten times low (640 B a row), so the first stream's steps ran past their slices.
+#[test]
+fn t_first_cost_a_fresh_daemons_first_stream_is_held_to_its_slice() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let id = created_on(&daemon, "hg", VcsTool::Mercurial);
+  crate::daemon::observe_first(&daemon, move |state| {
+    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+    let (_, ended) = to_its_end(state, id);
+    assert!(ended.is_ok(), "{ended:?}");
+  });
+  assert_eq!(
+    crate::vcs_store::hg_import::land_imported_on(&daemon, 0, id),
+    Ok(())
+  );
+  let (first_ns, rate) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      state.config.hg_gather_row_ns,
+      state.config.memcpy_bytes_per_second,
+    )
+  });
+  let (gathered, copy) =
+    crate::test_store::run_on_first(&daemon, move || gathering_timed(id), TASK_WAIT);
+  daemon.stop();
+  assert!(first_ns > 0, "the boot profile measured a row's cost");
+  let charged = slates_hg::render::RowCost::default().row_bytes(first_ns, (rate, copy.bytes));
+  assert_eq!(
+    copy.row, charged,
+    "the first stream's rows charged the boot profile's cost"
+  );
+  let mut times: Vec<u64> = gathered.iter().map(|(_, ns)| *ns).collect();
+  times.sort_unstable();
+  let p50 = times[times.len() / 2];
+  let slice_ns = copy.bytes.saturating_mul(1_000_000_000) / rate.max(1);
+  eprintln!(
+    "first stream's gathering: p50 {p50} ns; the slice {slice_ns} ns, a row {first_ns} ns; {gathered:?}"
+  );
+  assert!(
+    p50 <= slice_ns + first_ns,
+    "a fresh daemon's first stream's gathering steps past their slice: p50 {p50} ns against {slice_ns} ns and a row's \
+     {first_ns}"
+  );
 }

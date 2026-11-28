@@ -261,6 +261,13 @@ impl Preparing {
     }
   }
 
+  /// Whether it is `command`'s build (its ref and new value), and whether that build is done (built, or refused): its
+  /// next turn runs no unit (A-752 part 3).
+  pub fn of(&self, command: &Command) -> (bool, bool) {
+    let ours = self.command.0 == command.name && self.command.1 == command.new;
+    (ours, ours && self.done.is_some())
+  }
+
   /// Its build's longest unit so far, nanoseconds on its owner's clock (A-752).
   pub fn longest_unit_ns(&self) -> u64 {
     self.building.pace().longest_unit_ns()
@@ -418,9 +425,9 @@ where
       self.reach_create(command, pushed);
       return true;
     }
-    let ours = preparing.as_ref().is_some_and(|prepared| {
-      prepared.command.0 == command.name && prepared.command.1 == command.new
-    });
+    let ours = preparing
+      .as_ref()
+      .is_some_and(|prepared| prepared.of(command).0);
     if !ours {
       *preparing = None;
     }

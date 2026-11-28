@@ -101,6 +101,7 @@
 //! tag of a tag.
 
 use core::convert::Infallible;
+use slates_vfs::clock::Clock as _;
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{
@@ -2242,6 +2243,13 @@ impl Judge for ServerJudge<'_> {
       && self.policy_ready(command)
   }
 
+  fn ready_to_append(&mut self) -> bool {
+    // A stage a landing overtook since the last command's turn is made again in turns before the atomic append, so the
+    // append's commit adopts it rather than staging the push again whole in its step (P2 piece 4).
+    let ns = self.state.config.step_quantum_ns();
+    self.push.restage_turn(self.state, (self.restaging, ns))
+  }
+
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
     if let Some(declined) = self.hooks.declined(&command.name) {
       return Err(declined);
@@ -2392,6 +2400,7 @@ impl ServerJudge<'_> {
       waits,
       ..
     } = self;
+    let began = state.clock.monotonic_ns();
     let (entry, (examined, one_call)) = with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
         return (
@@ -2418,6 +2427,9 @@ impl ServerJudge<'_> {
     });
     state.count(HOLDING_EXAMINED, examined);
     state.count(ONE_CALL_BUILDS, one_call);
+    let took = state.clock.monotonic_ns().saturating_sub(began);
+    state.count(JUDGE_NS, took);
+    state.count_max(JUDGE_NS_MOST, took);
     entry
   }
 
@@ -2437,10 +2449,32 @@ impl ServerJudge<'_> {
   }
 
   /// A turn of `command`'s work build (A-752), begun at `began` on the shard's clock: units until half the step quantum
-  /// is spent, the build kept for the next turn. Whether it is built (or needs none), so this step judges it. The turn
+  /// is spent, the build kept for the next turn. Whether it is built (or needs none) and this step ran none of its
+  /// units, so this step judges it: a turn that finishes the build hands the step back, and the verdict and the landing
+  /// begin the next (A-752 part 3: the last turn and the landing ran in one poll, 80.8 + 42.8 ms). A turn that ran units
   /// is counted ([`PushTurns`]): one that ran past its budget by more than its longest unit and the scheduler's own
   /// overrun is past budget.
   fn build_turn(&mut self, command: &Command, pushed: &Pushed<'_>, began: u64) -> bool {
+    // Of this command's build only: a push's earlier command leaves its own built.
+    let of = |preparing: Option<&slates_git::receive::works::Preparing>| {
+      preparing.map_or((false, false), |prepared| prepared.of(command))
+    };
+    let was_built = of(self.preparing.as_ref()).1;
+    let built = self.built_turn(command, pushed, began, was_built);
+    // A build that ran a turn here is judged in the next step, never in this one.
+    let ran = !was_built && of(self.preparing.as_ref()).0;
+    built && !ran
+  }
+
+  /// [`Self::build_turn`]'s turn: whether the work is built, the turn counted unless it was built before it began
+  /// (`was_built`: no unit ran).
+  fn built_turn(
+    &mut self,
+    command: &Command,
+    pushed: &Pushed<'_>,
+    began: u64,
+    was_built: bool,
+  ) -> bool {
     let Self {
       state,
       push,
@@ -2490,6 +2524,9 @@ impl ServerJudge<'_> {
       return self.door(green);
     }
     *self.door = None;
+    if was_built {
+      return built;
+    }
     let ended = slates_rt::futures::now_ns();
     // What the turn may pass its budget by: its opening (the admission's turn and the views set up before its first
     // unit, which always runs), one unit, and what it does after its last ask (the views given back). A turn is those
@@ -2808,6 +2845,17 @@ pub(crate) fn uncommitted_report(received: &Received) -> Vec<u8> {
 /// same base), so a build is never made whole in one step nor a let-go read under it declined as missing. Format: a
 /// counter name.
 pub(crate) const ONE_CALL_BUILDS: &str = "git_push.verdict.one_call_builds";
+
+/// Counter: the nanoseconds a push's commands spent judged on their owner's shard (`Verdicts::judge`, its search for the
+/// green holding each commit and each work's verdict), summed on the shard's clock (A-658 3c's measure first, main
+/// 01a20182's ruling of 2026-11-27 22:48): beside [`crate::repository::push::LANDING_STEP_NS`], the share judging takes of
+/// an owner's push work, which says whether judging on a holder (3c) is worth building. Format: a counter name in the
+/// daemon's status report.
+pub(crate) const JUDGE_NS: &str = "git_push.judge_ns";
+
+/// Counted most: the nanoseconds one command's judging took on its owner's shard ([`JUDGE_NS`]). Format: a counter name in
+/// the daemon's status report.
+pub(crate) const JUDGE_NS_MOST: &str = "git_push.judge_ns_most";
 
 /// Format: the status counter of the greens a push's search for the green holding a commit examined
 /// (`ShardGreens::holding`): each one lent or whose versions were read.

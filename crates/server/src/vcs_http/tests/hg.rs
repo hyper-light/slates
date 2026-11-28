@@ -208,6 +208,11 @@ impl Store for Empty {
     u64::MAX
   }
 
+  /// Shape: a stream over this store steps unbounded at Apple M-series' 128-byte line, its rows at their held form.
+  fn step_copy(&self) -> slates_hg::render::StepCopy {
+    slates_hg::render::StepCopy::unlearned(u64::MAX, 128)
+  }
+
   fn changeset_text(
     &self,
     _rev: Rev,
@@ -899,6 +904,11 @@ impl Store for Charging {
 
   fn text_bytes_a_step(&self) -> u64 {
     u64::MAX
+  }
+
+  /// Shape: a stream over this store steps unbounded at Apple M-series' 128-byte line, its rows at their held form.
+  fn step_copy(&self) -> slates_hg::render::StepCopy {
+    slates_hg::render::StepCopy::unlearned(u64::MAX, 128)
   }
 
   fn changeset_text(

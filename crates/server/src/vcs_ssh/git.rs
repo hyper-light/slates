@@ -158,7 +158,7 @@ impl<L: StoreLender> UploadCommand<L> {
       after: After::Next,
       keepalive_ns,
       last_written_ns: slates_rt::futures::now_ns(),
-      resident: Vec::new(),
+      resident: crate::vcs_http::git::upload::Resident::new(),
       request: Vec::new(),
       admitted: 0,
       last_away: None,

@@ -570,6 +570,10 @@ impl Chunks {
   }
 }
 
+/// A path's content history: the value at each version its content changed, `None` marking a removal, oldest first
+/// (the engine's per-path history, A-534; a node's value in the lineage's content history arena since A-920 unit 1).
+pub(crate) type Entries = Vec<(u64, Option<Value>)>;
+
 /// One version of a file in the history: its pieces and its length (module docs).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Value {

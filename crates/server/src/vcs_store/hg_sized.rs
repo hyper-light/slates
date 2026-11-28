@@ -200,8 +200,9 @@ fn slice(state: &mut ShardState, id: RepositoryId, generation: u64, walk: &mut R
   }
   let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
   let began = slates_rt::futures::now_ns();
-  let step_bytes = super::hg_view::text_bytes_a_step(state);
-  walk.set_step_bytes(step_bytes);
+  let copy = super::hg_view::step_copy(state);
+  walk.set_step_copy(copy);
+  let step_bytes = copy.bytes;
   loop {
     let stepped = state
       .vcs_stores
@@ -213,6 +214,7 @@ fn slice(state: &mut ShardState, id: RepositoryId, generation: u64, walk: &mut R
         .mercurial(id)
         .map(|(content, store)| walk.keep_counted(&mut store.index, content))
     });
+    super::hg_view::gathering_noted(state, walk.take_tally().gathered);
     match (stepped, kept) {
       (Some(Ok(true)), Some(Ok(_))) => {}
       (Some(Ok(false)), Some(Ok(_))) => {

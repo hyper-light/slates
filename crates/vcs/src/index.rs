@@ -208,6 +208,19 @@ struct Run {
 }
 
 impl Run {
+  /// The fences of the tables whose keys can meet `[start, end)`: from the first whose last key is not before `start`
+  /// to the last whose first key is before `end` ([`Run::rows_range`]'s tables).
+  fn fences_meeting(&self, (start, end): (&[u8], &[u8])) -> &[Fence] {
+    let from = self
+      .fences
+      .partition_point(|fence| fence.last.as_ref() < start);
+    let to = self
+      .fences
+      .partition_point(|fence| fence.first.as_ref() < end)
+      .max(from);
+    self.fences.get(from..to).unwrap_or_default()
+  }
+
   /// A fork's copy of this run: its fences, charged for them alone, and no key filter (module docs, "A fork").
   fn fork_copy(&self) -> Run {
     Run {
@@ -265,35 +278,19 @@ impl Run {
     first_rows.chain(later)
   }
 
-  /// This run's rows whose keys are in `[start, end)`, in key order, reading only the tables whose keys can meet it: from
-  /// the first whose last key is not before `start` to the last whose first key is before `end` ([`Fence::last`]). The
-  /// first is opened only once a row is asked of it, so a run with no table in range is never read.
+  /// This run's rows whose keys are in `[start, end)` from `start`, in key order, as a [`LazyRun`]: only the tables whose
+  /// keys can meet the range ([`Run::fences_meeting`]), each opened once the walk's keys reach its first key.
   fn rows_range<'s>(
     &'s self,
     store: &'s ContentStore,
     (start, end): (&[u8], &[u8]),
-  ) -> impl Iterator<Item = RowRef<'s>> + use<'s> {
-    let from = self
-      .fences
-      .partition_point(|fence| fence.last.as_ref() < start);
-    let to = self
-      .fences
-      .partition_point(|fence| fence.first.as_ref() < end)
-      .max(from);
-    let tables = self.fences.get(from..to).unwrap_or_default();
-    let start: Box<[u8]> = Box::from(start);
-    let first_rows = tables
-      .first()
-      .into_iter()
-      .filter_map(move |fence| view(store, &fence.table))
-      .flat_map(move |table| table.iter_from(&start));
-    let later = tables
-      .get(1..)
-      .unwrap_or_default()
-      .iter()
-      .filter_map(move |fence| view(store, &fence.table))
-      .flat_map(|table| table.iter());
-    first_rows.chain(later)
+  ) -> LazyRun<'s> {
+    LazyRun {
+      store,
+      tables: self.fences_meeting((start, end)),
+      start: Box::from(start),
+      open: None,
+    }
   }
 }
 
@@ -700,6 +697,103 @@ type Planned = Option<(Vec<u8>, u64)>;
 
 /// One source of rows in key order, boxed so that tails and runs merge alike.
 type Source<'a> = Peekable<Box<dyn Iterator<Item = RowRef<'a>> + 'a>>;
+
+/// A run's rows in a range, its tables opened only as the walk reaches them ([`Run::rows_range`]): a table not yet
+/// opened stands for its rows by its first key, which its fence keeps in memory, so a walk that starts again on an index
+/// of many runs reads only the tables its next rows are in, not the first of every run (goal 93, main 01a20182's ruling
+/// of 2026-11-27 22:13: a restart on 55 runs read 43 tables, more than a step may spend). LevelDB's merging iterator
+/// over its version's tables seeks each level's table only by its file's smallest and largest keys the same way.
+struct LazyRun<'s> {
+  /// The store the tables are read from.
+  store: &'s ContentStore,
+  /// The fences of the tables not yet opened, in key order.
+  tables: &'s [Fence],
+  /// Where the walk begins: each table's rows are read from it.
+  start: Box<[u8]>,
+  /// The rows of the table open, from the walk's start.
+  open: Option<Source<'s>>,
+}
+
+/// The least key a source may yield next: a row's key, or, for a table not yet opened, its first key (a bound: its rows
+/// begin there or later).
+enum Head<'s> {
+  /// A row, its key exact.
+  Row(&'s [u8]),
+  /// A table not yet opened, its first key.
+  Unopened(&'s [u8]),
+}
+
+impl<'s> LazyRun<'s> {
+  /// Its head ([`Head`]); none once its tables are read.
+  fn head(&mut self) -> Option<Head<'s>> {
+    if let Some(open) = self.open.as_mut() {
+      if let Some(row) = open.peek() {
+        return Some(Head::Row(row.key()));
+      }
+      self.open = None;
+    }
+    self
+      .tables
+      .first()
+      .map(|fence| Head::Unopened(fence.first.as_ref()))
+  }
+
+  /// Opens its next table, its rows read from the walk's start (a table that does not open is passed over).
+  fn open_next(&mut self) {
+    let Some((fence, rest)) = self.tables.split_first() else {
+      return;
+    };
+    self.tables = rest;
+    let rows: Box<dyn Iterator<Item = RowRef<'s>> + 's> = match view(self.store, &fence.table) {
+      Some(table) => Box::new(table.iter_from(&self.start)),
+      None => Box::new(core::iter::empty()),
+    };
+    self.open = Some(rows.peekable());
+  }
+
+  /// Its next row.
+  fn next_row(&mut self) -> Option<RowRef<'s>> {
+    self.open.as_mut()?.next()
+  }
+}
+
+/// Rows of the tail and of several runs in key order, each run's tables opened only once the walk reaches them
+/// ([`LazyRun`]): each step takes the least key the heads hold, opening a run's next table first where its first key is
+/// not past that key (it may hold a lesser one, or the same, which the tail and newer runs give first, as [`Merged`]).
+struct RangeMerged<'s> {
+  tail: Source<'s>,
+  runs: Vec<LazyRun<'s>>,
+}
+
+impl<'s> Iterator for RangeMerged<'s> {
+  type Item = RowRef<'s>;
+
+  fn next(&mut self) -> Option<RowRef<'s>> {
+    loop {
+      // The least head: the tail's row first, then each run's in order, a table unopened before a row of the same key.
+      let mut least: Option<(Option<usize>, &'s [u8], bool)> =
+        self.tail.peek().map(|row| (None, row.key(), false));
+      for (at, run) in self.runs.iter_mut().enumerate() {
+        let (key, unopened) = match run.head() {
+          Some(Head::Row(key)) => (key, false),
+          Some(Head::Unopened(key)) => (key, true),
+          None => continue,
+        };
+        let less = least.is_none_or(|(_, least_key, least_unopened)| {
+          key < least_key || (key == least_key && unopened && !least_unopened)
+        });
+        if less {
+          least = Some((Some(at), key, unopened));
+        }
+      }
+      match least? {
+        (None, _, _) => return self.tail.next(),
+        (Some(at), _, true) => self.runs.get_mut(at)?.open_next(),
+        (Some(at), _, false) => return self.runs.get_mut(at)?.next_row(),
+      }
+    }
+  }
+}
 
 /// Rows of several sources in key order: each step takes the least key the sources' heads hold.
 struct Merged<'a> {
@@ -1627,6 +1721,20 @@ impl Index {
     Merged { sources }
   }
 
+  /// How many sealed tables a walk of `[start, end)` ([`Index::iter_range`]) may open, from the fences alone, none
+  /// opened: the most reads of the content store it can make. What a caller's step is held to (goal 93, main 01a20182's
+  /// ruling of 2026-11-27 22:13: a step's reads at most one a table its walks meet).
+  pub fn tables_meeting(&self, (start, end): (&[u8], &[u8])) -> u64 {
+    if start >= end {
+      return 0;
+    }
+    self
+      .runs
+      .iter()
+      .map(|run| u64::try_from(run.fences_meeting((start, end)).len()).unwrap_or(u64::MAX))
+      .fold(0, u64::saturating_add)
+  }
+
   /// Every row whose key is in `[start, end)`, in key order: [`Index::iter_from`] bounded at `end`, which reads a run's
   /// table only where its keys can meet the range (each fence's first and last keys), so a run that holds no key in it
   /// is never opened. LevelDB's version set keeps each table's smallest and largest key for the same end: a seek opens
@@ -1648,14 +1756,17 @@ impl Index {
     } else {
       Box::new(core::iter::empty())
     };
-    let mut sources: Vec<Source<'s>> = vec![tail.peekable()];
-    for run in &self.runs {
-      let rows: Box<dyn Iterator<Item = RowRef<'s>> + 's> =
-        Box::new(run.rows_range(store, (start, end)));
-      sources.push(rows.peekable());
-    }
+    let runs = self
+      .runs
+      .iter()
+      .map(|run| run.rows_range(store, (start, end)))
+      .collect();
     let end: Box<[u8]> = Box::from(end);
-    Merged { sources }.take_while(move |row| row.key() < end.as_ref())
+    RangeMerged {
+      tail: tail.peekable(),
+      runs,
+    }
+    .take_while(move |row| row.key() < end.as_ref())
   }
 
   /// The rows the index holds.

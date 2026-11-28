@@ -2021,7 +2021,7 @@ impl Oracle {
 
   /// A one-byte file at `path` and its attribute: an overwrite where a file stands, refused where a directory does.
   fn put(&mut self, path: &str, byte: u8, census: &mut Census) -> Result<(), TestCaseError> {
-    census.changed_beneath += usize::from(self.green.copy_above(path).is_some());
+    census.changed_beneath += usize::from(self.green.copy_above(path, self.green.head()).is_some());
     let mut next = self.model.current();
     let stands = next.files.contains_key(path) || !next.dirs.contains(path);
     let mut work = Work::default();
@@ -2054,7 +2054,7 @@ impl Oracle {
     if !next.files.contains_key(path) {
       return Ok(());
     }
-    census.changed_beneath += usize::from(self.green.copy_above(path).is_some());
+    census.changed_beneath += usize::from(self.green.copy_above(path, self.green.head()).is_some());
     let mut work = Work::default();
     work.unlink(path);
     if next
@@ -2704,7 +2704,7 @@ fn every_key_by_a_whole_walk(green: &Green, root: &str) -> Vec<super::IdentityKe
   use super::{IdentityKey, union_keys};
   let inside = |path: &String| in_tree(path, root);
   let mut keys = Vec::new();
-  let files = union_keys(green.content.keys(), green.content_history.keys().cloned());
+  let files = union_keys(green.content.keys(), green.content_history.keys());
   keys.extend(files.filter(inside).map(IdentityKey::File));
   let specials = union_keys(green.specials.keys(), green.special_history.keys().cloned());
   keys.extend(specials.filter(inside).map(IdentityKey::Special));

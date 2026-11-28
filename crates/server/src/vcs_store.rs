@@ -383,6 +383,10 @@ pub(crate) struct VcsStores {
   /// Each Mercurial repository's recount of its kept rendered length under way after a rebuild ([`hg_sized`]): one a
   /// repository, so bounded by the partition's repositories.
   pub(crate) hg_recounts: hg_sized::Recounts,
+  /// The shard's learned cost of a gathered Mercurial row (`slates_hg::render::RowCost`; main 01a20182's ruling of
+  /// 2026-11-27 23:39): what each stream's and recount's gathering steps took, which every step's row charge is learned
+  /// from ([`hg_view::step_copy`]).
+  pub(crate) hg_row_cost: slates_hg::render::RowCost,
   /// Each HTTP commit under way (A-681 part C: a transaction a POST made, between its requests), by repository and
   /// transaction name, with the key of the principal that made it and the monotonic instant of its last step: at most
   /// one a repository and principal, a new POST replacing the older ([`VcsStores::begin_dav_commit`]), so bounded by the
