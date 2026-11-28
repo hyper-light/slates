@@ -66,6 +66,10 @@ pub(crate) const MATERIALIZE_UNREAD: &str = "merge.green.materialize_unread";
 /// brought back into the content store before the build took its unit again (P2 for Mercurial, main's ruling (A) of
 /// 2026-11-26). Format: a counter name.
 pub(crate) const MATERIALIZE_TEXTS_ASKED: &str = "merge.green.materialize_texts_asked";
+/// Counter: an ask of the node's changeset store a Mercurial line's owed build made, its texts a batch of the line's
+/// let-go file revisions (`slates_hg::push::held::FilesAsk`; goal 93, main 01a20182's ruling of 2026-11-28 03:47):
+/// fewer than [`MATERIALIZE_TEXTS_ASKED`] where batches hold more than a text. Format: a counter name.
+pub(crate) const MATERIALIZE_TEXT_ASKS: &str = "merge.green.materialize_text_asks";
 /// Counted most: the nanoseconds from a green's materialization's start, its first read's, to its commit, by the
 /// runtime's clock: how long a new line's first read waited for its build (P2's rule), main's release probe's size of it.
 /// Format: a counter name.
@@ -445,9 +449,10 @@ enum Turned {
   /// from git's views): the window to bring back from the node's store before the build takes the unit again.
   Waiting(slates_git::store::packed::Waited),
   /// Stopped at a Mercurial file revision whose text was let go once landed (`NotYet` from the line's trees): the ask of
-  /// the node's changeset store for it, its text brought back into the content store before the build takes the unit
-  /// again, of its repository.
-  Asked(slates_hg::push::held::TextAsk, RepositoryId),
+  /// the node's changeset store for it and the line's other let-go revisions a batch holds
+  /// (`slates_hg::push::tree::Layout::waited_batch`), their texts brought back into the content store before the build
+  /// takes the unit again, of its repository.
+  Asked(slates_hg::push::held::FilesAsk, RepositoryId),
 }
 
 /// Refuses `green`'s build, a window it read not brought back (`refused`): logged and counted
@@ -478,7 +483,7 @@ enum Step {
   BringBack(slates_git::store::packed::Waited),
   /// Asks the node's changeset store for the Mercurial file revision the build stopped at, brings its text back, then
   /// turns again.
-  Ask(slates_hg::push::held::TextAsk, RepositoryId),
+  Ask(slates_hg::push::held::FilesAsk, RepositoryId),
   /// Is done.
   End,
 }
@@ -589,13 +594,9 @@ async fn materialize_bringing_back(
       // the content store, then the unit taken again; refused, the build is, as a window that cannot come back is.
       Some(Step::Ask(mut ask, repository)) => {
         let answered = crate::vcs_store::hg_view::answer_store_wants(&mut ask, repository).await;
-        let brought = crate::state::with_state(|state| {
-          let given = ask.taken().filter(|_| answered)?;
-          crate::repository::hg_push::text_brought_back(state, (repository, None), given)?;
-          state.count(MATERIALIZE_TEXTS_ASKED, 1);
-          Some(())
-        })
-        .flatten();
+        let brought =
+          crate::state::with_state(|state| texts_brought(state, repository, ask, answered))
+            .flatten();
         if brought.is_none() {
           let _ = crate::state::with_state(|state| {
             unread(
@@ -610,6 +611,26 @@ async fn materialize_bringing_back(
       Some(Step::End) | None => return,
     }
   }
+}
+
+/// `ask`'s texts, `answered` by the node's changeset store, brought back into repository `repository`'s content store
+/// (`hg_push::text_brought_back`), each counted [`MATERIALIZE_TEXTS_ASKED`] and the ask [`MATERIALIZE_TEXT_ASKS`]; none
+/// where the store answered no text, or one would not come back.
+fn texts_brought(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  ask: slates_hg::push::held::FilesAsk,
+  answered: bool,
+) -> Option<()> {
+  let given = answered
+    .then(|| ask.taken())
+    .filter(|given| !given.is_empty())?;
+  state.count(MATERIALIZE_TEXT_ASKS, 1);
+  for text in given {
+    crate::repository::hg_push::text_brought_back(state, (repository, None), text)?;
+    state.count(MATERIALIZE_TEXTS_ASKED, 1);
+  }
+  Some(())
 }
 
 /// A turn of `green`'s build's wait for room, past its room (`asked` of `room`; A-857, `crate::vcs_share::wait`): its
@@ -700,11 +721,16 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> Turned {
     });
   // The line's trees kept for the build's next turn, whatever this one came to: a build begun again past its room reads
   // them too, and the materialization's end drops them.
-  let asked = match (&advanced, &layout, repository) {
+  let asked = match (&advanced, layout.as_mut(), repository) {
     (None, Some(layout), Some(repository)) => {
       let most = crate::vcs_share::room(state, repository).bytes;
-      layout
-        .waited(&building, most)
+      let batch = crate::vcs_store::hg_view::text_bytes_a_step(state);
+      state
+        .vcs_stores
+        .mercurial_ref(repository)
+        .and_then(|(content, store)| {
+          layout.waited_batch(&building, (&store.index, content), (batch, most))
+        })
         .map(|ask| Turned::Asked(ask, repository))
     }
     _ => None,

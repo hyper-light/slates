@@ -555,7 +555,14 @@ impl ImportBatch {
     if pending.measured.is_some() {
       #[cfg(test)]
       crate::vcs_store::svn_import::phase::tag("stage.measuring");
-      return self.measure_pending(state, pending, spent);
+      #[cfg(test)]
+      let large = crate::counting::large_frees();
+      let measured = self.measure_pending(state, pending, spent);
+      #[cfg(test)]
+      crate::repository::svn_commit::staging::returned::measured(
+        crate::counting::large_frees().saturating_sub(large),
+      );
+      return measured;
     }
     let Some(preview) = self.preview.as_ref() else {
       return Some(Err(StageRefused::Unavailable));
@@ -620,8 +627,10 @@ impl ImportBatch {
       head,
       verdict,
       measured,
+      committing,
       ..
     } = pending;
+    let_go_committing(state, committing);
     let Measured {
       outcome,
       applied,
@@ -986,6 +995,32 @@ fn judge_end(
   });
   Judging::Judged((outcome, applied, identity, reserved, entry))
 }
+
+/// `committing`, a version's commit state once its chain entry is measured, handed to the daemon's reaper whole, never
+/// dropped on the shard (A-920, main's order of 2026-11-28 04:24): it holds the revision's post-state and the commit's
+/// own lists, 8 blocks of 64 KiB or more and 15,250,904 bytes for a 9,000-file revision (its post-state 9,216,000, 9,000
+/// texts of 1 KiB; debug), and its drop was the measure's last step, one large free after another on the shard. Counted
+/// as [`COMMITTING_REAPED`]. At the reaper's bound, or on a thread with no reaper, `crate::reaper::reap`'s rule for a
+/// retired member's remains holds: it never waits and nothing queues past the bound, so the state is dropped in place,
+/// counted as [`COMMITTING_DROPPED_INLINE`] so a run sees each time it happens.
+fn let_go_committing(state: &mut ShardState, committing: slates_merge::engine::Committing) {
+  let mut reaped = slates_merge::reaped::Reaped::default();
+  reaped.whole(Box::new(committing));
+  let counter = if crate::reaper::reap(reaped) {
+    COMMITTING_REAPED
+  } else {
+    COMMITTING_DROPPED_INLINE
+  };
+  state.count(counter, 1);
+}
+
+/// Counter: a version's commit state handed to the daemon's reaper whole at its measure's end ([`let_go_committing`]).
+/// Format: a counter name in the daemon's status report.
+pub(crate) const COMMITTING_REAPED: &str = "repository.import.committing_reaped";
+
+/// Counter: a version's commit state dropped on the shard at its measure's end, the reaper's queue at its bound or the
+/// thread without one ([`let_go_committing`]). Format: a counter name in the daemon's status report.
+pub(crate) const COMMITTING_DROPPED_INLINE: &str = "repository.import.committing_dropped_inline";
 
 /// A pending verdict committed into the scratch member `engine` as `version`, `applied` what it applied: its outcome, the
 /// head's identity where its record goes to holders, its copies' versions moved back into the green's numbering, and

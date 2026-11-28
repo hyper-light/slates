@@ -333,12 +333,31 @@ pub(crate) mod returned {
     /// The frees of `crate::counting::LARGE_BYTES` or more the landings' prepare steps made on the thread (A-920: none,
     /// since the increment buffer is kept and reserved once).
     pub(crate) prepare_large_frees: u64,
+    /// The frees of `crate::counting::LARGE_BYTES` or more an import batch's measure steps made on the thread (A-920:
+    /// none, since the commit's state goes to the reaper whole).
+    pub(crate) measure_large_frees: u64,
   }
 
   std::thread_local! {
     static RETURNED: Cell<Returned> = const {
-      Cell::new(Returned { steps: 0, off_ns: 0, bytes: 0, slowest: (0, 0), prepare_large_frees: 0 })
+      Cell::new(Returned {
+        steps: 0,
+        off_ns: 0,
+        bytes: 0,
+        slowest: (0, 0),
+        prepare_large_frees: 0,
+        measure_large_frees: 0,
+      })
     };
+  }
+
+  /// An import batch's measure step that made `large` frees of `crate::counting::LARGE_BYTES` or more.
+  pub(crate) fn measured(large: u64) {
+    RETURNED.with(|kept| {
+      let mut now = kept.get();
+      now.measure_large_frees = now.measure_large_frees.saturating_add(large);
+      kept.set(now);
+    });
   }
 
   /// A prepare step that made `large` frees of `crate::counting::LARGE_BYTES` or more.
