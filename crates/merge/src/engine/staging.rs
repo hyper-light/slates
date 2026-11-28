@@ -15,6 +15,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{ApplyStep, Committing, Green, Judged};
+use crate::dims::{Dim, Xattrs};
+use crate::special::SpecialNode;
+
+/// The stage's forks of the green's seven chunk-free current maps (A-752 part 3c U6; main 01a20182's ruling of
+/// 2026-11-28 03:10): made at the stage's begin, one count each, holding no arena of their own; the commit's steps
+/// read and write them ([`Green::swap_forks`] puts them in place for a step and back), every reader between steps
+/// the published maps. A publish swaps them in for good and releases the published roots; a refusal releases them.
+/// What a release frees is the nodes the stage copied: O(the paths it changed × their depth).
+struct Forks {
+  specials: Dim<SpecialNode>,
+  dirs: Dim<()>,
+  modes: Dim<u32>,
+  symlinks: Dim<String>,
+  hardlinks: Dim<String>,
+  xattrs: Xattrs,
+  links_to: Dim<BTreeSet<String>>,
+}
 
 /// Where each history a stage appends in place stood before its first touch (A-752 part 3c U1 and U2): a key's
 /// entries then, or none for a key with no history. Bounded by the keys the verdict's commit touches.
@@ -66,6 +83,8 @@ fn take_back<K: Ord, E>(marks: BTreeMap<K, Option<usize>>, histories: &mut BTree
 /// A held verdict being staged ([`Green::begin_staging`]): its commit under way, and whether it is staged whole.
 pub struct Staging {
   committing: Committing,
+  /// The stage's forks of the current maps; `None` once given back.
+  forks: Option<Forks>,
   staged: bool,
   /// Whether the identity's published backlog is folded ([`Green::staging_step`]'s first steps).
   drained: bool,
@@ -116,8 +135,10 @@ impl Green {
   /// Begins staging `judged`, a verdict held at this green's head ([`Green::staging_step`]): one stage at a time.
   pub fn begin_staging(&mut self, judged: Judged) -> Staging {
     self.stage_marks = Some(Box::default());
+    let forks = self.fork_maps();
     Staging {
       committing: self.begin_committing(judged),
+      forks: Some(forks),
       staged: false,
       drained: false,
       units: 0,
@@ -140,23 +161,78 @@ impl Green {
         return StagingStep::More;
       }
     }
+    let Some(forks) = staging.forks.as_mut() else {
+      return StagingStep::Staged;
+    };
+    // The commit reads and writes the stage's forks, never the published maps (A-752 part 3c U6).
+    self.swap_forks(forks);
+    let stepped = self.commit_unit(&mut staging.committing, spent);
+    self.swap_forks(forks);
+    if let StagingStep::Staged = stepped {
+      staging.staged = true;
+    }
+    stepped
+  }
+
+  /// One unit of `committing`'s prepare or commit steps, the publish left to [`Green::publish`].
+  fn commit_unit(
+    &mut self,
+    committing: &mut Committing,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> StagingStep {
     let Committing {
       run,
       post_state,
       runs,
       ..
-    } = &mut staging.committing;
+    } = committing;
     let Some(commit) = run.commit.as_mut() else {
       return match self.prepare_step(run, (post_state, runs), spent) {
         ApplyStep::Lend(unlent) => StagingStep::Lend(unlent),
         _ => StagingStep::More,
       };
     };
-    if !self.commit_step(commit, spent) {
-      return StagingStep::More;
+    if self.commit_step(commit, spent) {
+      StagingStep::Staged
+    } else {
+      StagingStep::More
     }
-    staging.staged = true;
-    StagingStep::Staged
+  }
+
+  /// The stage's forks of the seven chunk-free current maps, one count each ([`Forks`]).
+  fn fork_maps(&mut self) -> Forks {
+    Forks {
+      specials: self.specials.fork(),
+      dirs: self.dirs.fork(),
+      modes: self.modes.fork(),
+      symlinks: self.symlinks.fork(),
+      hardlinks: self.hardlinks.fork(),
+      xattrs: self.xattrs.fork(),
+      links_to: self.links_to.fork(),
+    }
+  }
+
+  /// Exchanges the green's seven chunk-free current maps with `forks`, the arenas staying in the green: the stage's
+  /// in place for a step, and the published back after it. Twice is none.
+  fn swap_forks(&mut self, forks: &mut Forks) {
+    self.specials.swap_with_fork(&mut forks.specials);
+    self.dirs.swap_with_fork(&mut forks.dirs);
+    self.modes.swap_with_fork(&mut forks.modes);
+    self.symlinks.swap_with_fork(&mut forks.symlinks);
+    self.hardlinks.swap_with_fork(&mut forks.hardlinks);
+    self.xattrs.swap_with_fork(&mut forks.xattrs);
+    self.links_to.swap_with_fork(&mut forks.links_to);
+  }
+
+  /// Gives `forks`' holds back in the green's arenas: the nodes no published map shares freed.
+  fn release_forks(&mut self, forks: Forks) {
+    self.specials.release_fork(forks.specials);
+    self.dirs.release_fork(forks.dirs);
+    self.modes.release_fork(forks.modes);
+    self.symlinks.release_fork(forks.symlinks);
+    self.hardlinks.release_fork(forks.hardlinks);
+    self.xattrs.release_fork(forks.xattrs);
+    self.links_to.release_fork(forks.links_to);
   }
 
   /// Publishes a staged `staging`, moving the head to its version last: its version and what the chain records of it;
@@ -167,6 +243,11 @@ impl Green {
       return None;
     }
     let mut staging = staging;
+    // The stage's forks become the green's maps; the published roots they replace are given back (A-752 part 3c U6).
+    if let Some(mut forks) = staging.forks.take() {
+      self.swap_forks(&mut forks);
+      self.release_forks(forks);
+    }
     let Committing { run, applied, .. } = &mut staging.committing;
     let commit = run.commit.as_mut()?;
     self.stage_marks = None;
@@ -179,6 +260,10 @@ impl Green {
   pub fn abandon_staging(&mut self, staging: Staging) {
     // A run that ended recorded its version's change entries, above the head (A-752 part 3c U3): taken out. The earlier
     // entries it would have marked no longer last are marked only at a publish.
+    let mut staging = staging;
+    if let Some(forks) = staging.forks.take() {
+      self.release_forks(forks);
+    }
     let ended = staging
       .committing
       .run
