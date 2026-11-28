@@ -587,6 +587,74 @@ fn current_maps_given_up_after(works: &[Changes], turns: u64) -> Result<bool, St
   Ok(staged)
 }
 
+/// The content map as every reader reads it at the head: each file's path and content, in order.
+fn content_map_read(green: &Green) -> String {
+  format!("{:?}", green.content.iter().collect::<Vec<_>>())
+}
+
+/// [`changes_unseen`] with the content map read between the steps ([`content_map_read`]).
+fn content_map_unseen(green: &mut Green, inc: &Increment) -> Result<Option<u64>, String> {
+  let Judgment::Accepted(held) = green.judge(inc) else {
+    return Ok(None);
+  };
+  let before = content_map_read(green);
+  let mut staging = green.begin_staging(held);
+  loop {
+    let stepped = green.staging_step(&mut staging, &mut || true);
+    if content_map_read(green) != before {
+      return Err(format!(
+        "a reader saw the stage's content map at unit {}",
+        staging.units()
+      ));
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  Ok(green.publish(staging).map(|(version, _)| version))
+}
+
+/// [`changes_given_up_after`] with the content map and its arena's nodes the guard: a stage that copied content nodes
+/// gave them back. (The blocks' live count waits for U8, below.)
+fn content_map_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let mut green = submitted_in_every_dimension(before);
+  let inc = work_in_every_dimension(&green, last, u64::MAX);
+  let Judgment::Accepted(held) = green.judge(&inc) else {
+    return Ok(true);
+  };
+  let (read, live) = (content_map_read(&green), green.content.live());
+  let mut staging = green.begin_staging(held);
+  let mut staged = false;
+  for _ in 0..turns {
+    if let StagingStep::Staged = green.staging_step(&mut staging, &mut || true) {
+      staged = true;
+      break;
+    }
+  }
+  green.abandon_staging(staging);
+  if content_map_read(&green) != read {
+    return Err(format!(
+      "a stage given up after {turns} turns left the content map changed"
+    ));
+  }
+  // The arena's live nodes; the blocks' live count is U8's red (main 01a20182's ruling (b) of 2026-11-28 03:41): a
+  // stage given up after `set_file`'s re-anchor leaves the content history, written in place until U8, naming the
+  // stage's block (6 against 5).
+  let left = green.content.live().1;
+  if left != live.1 {
+    return Err(format!(
+      "a stage given up after {turns} turns left nodes {left}, from {}",
+      live.1
+    ));
+  }
+  Ok(staged)
+}
+
 /// The works [`proptest`] generates: one to eight, each of one to four changes.
 fn works() -> impl Strategy<Value = Vec<Changes>> {
   prop::collection::vec(
@@ -806,6 +874,42 @@ proptest! {
       let prefix = steps.get(..end).unwrap_or_default();
       for turns in 0u64.. {
         if current_maps_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+
+  /// A-752 part 3c U7 (the content map forked into the stage, its blocks held by the nodes that name them; main
+  /// 01a20182's rulings of 2026-11-28 01:29 and 03:10). Do: as U2's, the content map read between every two steps.
+  /// Expect it as before the stage; after each publish the same version, map and live blocks as the serial twin's, so
+  /// a block the stage copied a node of and the published root let go was released once, never twice.
+  #[test]
+  fn a_staged_verdicts_content_map_moves_only_at_its_publish(steps in works()) {
+    let (mut whole, mut staged) = (submitted_in_every_dimension(&[]), submitted_in_every_dimension(&[]));
+    for (id, changes) in (1u64..).zip(&steps) {
+      let inc = work_in_every_dimension(&whole, changes, id);
+      let (outcome, _) = whole.submit_resolved(&inc);
+      let version = content_map_unseen(&mut staged, &inc).map_err(TestCaseError::fail)?;
+      let accepted = match outcome {
+        super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+        _ => None,
+      };
+      prop_assert_eq!(version, accepted);
+      prop_assert_eq!(content_map_read(&staged), content_map_read(&whole));
+      prop_assert_eq!(staged.content.live().0, whole.content.live().0);
+    }
+  }
+
+  /// A-752 part 3c U7 (a refusal at every turn, its last too). Expect the content map and its arena's live nodes as
+  /// before: the stage's copies of nodes freed with it. Its blocks' live count is U8's red: a stage given up after
+  /// `set_file` leaves the content history, written in place until U8, naming the stage's new block.
+  #[test]
+  fn a_stage_given_up_at_any_turn_leaves_the_content_map_and_its_nodes_as_they_were(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if content_map_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
           break;
         }
       }

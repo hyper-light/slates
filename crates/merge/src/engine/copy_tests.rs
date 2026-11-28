@@ -2909,3 +2909,58 @@ fn a_resolutions_end_with_a_copy_is_taken_an_entry_a_unit() {
     "{entries} entries in {units} units"
   );
 }
+
+/// The identity a reader reads of `green` at its head, folding what is owed, with the fold's bookkeeping after it.
+fn identity_read(green: &mut Green) -> String {
+  let identity = green.head_identity();
+  format!("{} {identity:?} {:?}", green.head(), green.identity_folded)
+}
+
+/// A-752 part 3c U7 (the fold's copy reads bounded by the head; main 01a20182's ruling of 2026-11-28 03:33). Do: on a
+/// serial twin and a staged green, make `src/a` and `dst/a` (left unfolded on the staged one); at version 2 replace
+/// `dst` with `src`, staged one unit a step, a reader folding the identity between every two steps from the first, the
+/// second and so on (fresh twins each time); then published, the serial twin given it whole. Expect every read between
+/// the steps the serial twin's at version 1, and after the publish its at version 2. Red with the head bound taken off:
+/// the fold of `dst/a`, which the copy brings `src/a`'s value, read the stage's copy record above the head
+/// (`copies_above_after`, `copy_entries_after`).
+#[test]
+fn a_readers_fold_between_a_staged_copys_turns_reads_no_copy_above_the_head() {
+  for from in 0u64.. {
+    let (mut serial, mut staged) = (Green::new(), Green::new());
+    let mut made = Work::default();
+    made.create("src/a", b"source").create("dst/a", b"replaced");
+    for green in [&mut serial, &mut staged] {
+      accept(green, &made, 1);
+    }
+    let at_head = identity_read(&mut serial);
+    let mut replace = Work::exclusive();
+    replace.replace("src", "dst", 1);
+    let inc = replace.at(2, staged.head());
+    let Judgment::Accepted(held) = staged.judge(&inc) else {
+      panic!("the replace was not accepted");
+    };
+    let mut staging = staged.begin_staging(held);
+    let mut read = false;
+    loop {
+      let stepped = staged.staging_step(&mut staging, &mut || true);
+      if staging.units() > from {
+        read = true;
+        assert_eq!(
+          identity_read(&mut staged),
+          at_head,
+          "a reader's fold saw the stage at unit {}",
+          staging.units()
+        );
+      }
+      if let super::StagingStep::Staged = stepped {
+        break;
+      }
+    }
+    assert!(staged.publish(staging).is_some(), "published");
+    accept(&mut serial, &replace, 2);
+    assert_eq!(identity_read(&mut staged), identity_read(&mut serial));
+    if !read {
+      break;
+    }
+  }
+}

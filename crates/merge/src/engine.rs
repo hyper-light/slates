@@ -3677,11 +3677,12 @@ impl Green {
   /// Every other key is only marked, its move made whole by the fold.
   ///
   /// Written aside until the commit's publish (A-752 part 3c U5, [`last_changes::IdentityAside`]). A key a published
-  /// commit left dirty is folded with it already; a staged commit drains every such key first
-  /// ([`Green::staging_step`]), so no reader's fold between its turns reads a key it changes in place. That rule ends
-  /// with the current maps forked into the stage (w-svn's), and is deleted in that change.
+  /// commit left dirty, unfolded, is marked too, its entry left as it is: a reader's fold between a staged commit's turns
+  /// may fold it at the head from the published maps, which the stage's forks leave as they were (U7), and the stage's
+  /// mark makes the fold after the publish move it again, from there; with no fold between, the publish's mark is the
+  /// key's own. Only a key first changed since the identity was read has its entry taken out here.
   fn mark_dirty(&mut self, key: IdentityKey) {
-    if self.identity_dirty.contains(&key) || !self.identity_aside.dirty(key.clone()) {
+    if !self.identity_aside.dirty(key.clone()) || self.identity_dirty.contains(&key) {
       return;
     }
     if let IdentityKey::File(path) = &key
