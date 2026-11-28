@@ -566,6 +566,9 @@ fn cut<'a>(
 /// A table cut from rows: its cut, and its first key (none: no row was left).
 type OneTable = (Option<Cut>, Option<Box<[u8]>>);
 
+/// A table's first and last keys as its rows were pushed (none: no row pushed yet).
+type KeySpan = (Option<Box<[u8]>>, Option<Box<[u8]>>);
+
 /// The first table of `rows` (in key order) cut as [`cut`] cuts each, at most `window` bytes, and its last key; none when
 /// no row is left.
 fn one_table<'a>(
@@ -593,10 +596,7 @@ fn one_table<'a>(
 }
 
 /// A finished table's cut, its first and last keys.
-fn finish(
-  builder: TableBuilder,
-  (first, last): (Option<Box<[u8]>>, Option<Box<[u8]>>),
-) -> Result<Cut, IndexRefused> {
+fn finish(builder: TableBuilder, (first, last): KeySpan) -> Result<Cut, IndexRefused> {
   let rows = builder.rows();
   Ok(Cut {
     bytes: builder.finish()?,
@@ -999,7 +999,7 @@ impl Index {
   /// in tables, and the first key past them; none for an empty tail.
   fn first_table(&self, window: usize) -> Result<Option<FirstTable>, IndexRefused> {
     let mut builder = TableBuilder::new();
-    let (mut first, mut last): (Option<Box<[u8]>>, Option<Box<[u8]>>) = (None, None);
+    let (mut first, mut last): KeySpan = (None, None);
     let (mut discharged, mut bytes) = (0_u64, 0_usize);
     let mut kept_from = None;
     for row in tail_rows(&self.tail) {
