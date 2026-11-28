@@ -468,7 +468,13 @@
 >   abandoned by its exchange and its session given back
 >   (`docs/bugs/2026-11-27-a-region-read-waited-out-a-dead-first-home.md`). Red first, two fleet tests: a dead first
 >   home and a slow one, each read 1,998,960,833 ns against a 1,998,000,000 ns budget before.
-> - **OPEN, a risk of that fix (main 01a20182's ruling of 2026-11-27 15:48; to be worked if measured): a live home slow
+> - **Addressed by A-936's hedged read (w-shared, 2026-11-27; main 01a20182's ruling of 20:11):** a read asks its first
+>   home only until that home's path tail, then the next its share, then the first again with the rest
+>   (`homes::hedged_asks`). A dead first home not yet suspected costs its path tail, not a share (red first: 1.000 s of
+>   a 1.998 s budget before; 2.2 ms hedged), and a slow live first home is asked again with what is left, as much as
+>   its share was before. What stays: a live home slower than about half the budget, with every other home dead, is
+>   still cut, as below.
+> - **Was OPEN, a risk of that fix (main 01a20182's ruling of 2026-11-27 15:48; to be worked if measured): a live home slow
 >   past its share is cut, and the read moves on to a dead one.** The budget is shared over the homes asked, so with two
 >   homes the first gets half of it. Before the fix only the first home was ever asked: the read's outer bound
 >   (`xshard::task_in_shard_time`) ended at the same budget, so a live home slow under load answered within the whole of
