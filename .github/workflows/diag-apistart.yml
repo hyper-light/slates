@@ -1,0 +1,43 @@
+name: diag api start (a host's wait on a looping anchor, Linux)
+# Diag only (main 01a20182, 2026-11-27): slates-api's start tests alone on both Linux runners, to see A-366's wait on a
+# looping anchor keep its deadline. CI's Ubuntu gates job waited out its six hours in
+# an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves (diag 10, run 46033104507: 3,449 failed starts of
+# the looping anchor's daemon, the test never answering). Branch -red carries the bounded test alone (expected red,
+# fast); -fix carries the test and the fix (expected green). Never merged to main.
+on:
+  push:
+    branches: ["diag-measurer-apistart-*"]
+jobs:
+  linux:
+    name: api start tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the api start tests
+        run: cargo test --locked -p slates-api --test start --no-run
+      - name: The api start tests, three runs, each bounded by the job's own timeout
+        run: |
+          set -o pipefail
+          rc=0
+          for run in 1 2 3; do
+            echo "== run $run $(date -u +%T)"
+            cargo test --locked -p slates-api --test start 2>&1 | tee start-$run.log || rc=1
+          done
+          echo "== summary"
+          grep -h -E "^test |answered within|stopped after|panicked|FAILED|failed starts in a row" start-*.log | grep -v -E "failed starts in a row" | head -200
+          echo "crash-loop lines: $(cat start-*.log | grep -c 'failed starts in a row')"
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: apistart-${{ matrix.os }}
+          path: start-*.log
