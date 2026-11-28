@@ -874,3 +874,7 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - 24edc3158 U6: seven chunk-free current maps forked into the stage (staging::Forks, swap/release). Server sets 170 on rerun (git_push mid-derivation timing test flaked once under load; alone 3/3).
 - 2f68bd7ac (12e9057fc) U7: content map forked (Files, blocks as holders), fold's copy reads bounded by head, drain-first deleted, mark_dirty marks every key aside. Gap until U8: refused stage leaves content history naming stage block (6 vs 5); rule: no wiring into repository::push before U8.
 - Next: U8 content history staged with chunk-holding copies (red: refusal blocks (6,4) from (5,4) + chunk guard). Reanchor's layered route repoints a shared anchor slot -> must make a new slot in the stage.
+
+## 2026-11-28 04:38 PST: A-752 3c U8 landed
+- 52714b48b (d830133b1): content history forked with chunk-holding copies (HistoryHolders), staged re-anchor in full (layered false while staging); closes U7's block gap. Server sets 170, merge 348.
+- Next (main's 03:10 order): scalars written back at publish, then wiring into repository::push landing (t_a752 14 ms bar). Asked main whether to fold or keep the uncommitted six-guard staging red.
