@@ -286,6 +286,8 @@ pub struct RouteView {
   pub retired: bool,
   /// Whether the configuration keeps the first owner's completed takeover.
   pub completed: bool,
+  /// Whether the configuration keeps the first owner superseded: admitted again after a completed takeover of it.
+  pub superseded: bool,
   /// The owner this node's own routing names, from the records it accepted.
   pub routed: Option<slates_db::HostId>,
 }
@@ -3055,8 +3057,8 @@ impl Daemon {
 
   /// Test support (main 01a20182's order of 2026-11-27 20:35, diag 12's a921 red): what this node's routing of `object`
   /// reads when it holds no copy of it (`owner_location`'s `known_owner`): its configuration's version, the object's first
-  /// owner (moved, else its creator), whether the configuration keeps that owner's retirement and its completed
-  /// takeover, and the owner this node's own routing names. A one-shot control-shard question.
+  /// owner (moved, else its creator), whether the configuration keeps that owner's retirement, its completed takeover
+  /// and its being superseded, and the owner this node's own routing names. A one-shot control-shard question.
   pub fn route_view(
     &self,
     object: slates_db::register::ObjectId,
@@ -3072,6 +3074,7 @@ impl Daemon {
         first,
         retired: configuration.retired.contains_key(&first),
         completed: configuration.completed.contains_key(&first),
+        superseded: configuration.superseded.contains_key(&first),
         routed: s.fleet.object_owner(object),
       }
     })
