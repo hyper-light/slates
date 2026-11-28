@@ -20095,12 +20095,17 @@ it is real capacity on git/git: fewer roots inflated and steps rebuilt, more hit
 The round main ran once piece 2 of the stream's cuts (the index rows a run a step, c5862b6a0) was in, before cut 2 (the
 kept rendered length, A-937) landed: what cut 2 is measured against.
 
-- **Command.** `crates/cli/bench/hg_scale.sh`, three runs, stock then slates each run, over hg-src (Mercurial's own
-  history: 57,036 changesets, 4,283 files, 73.8 MB). Slates' release binary 157a34b36a5a at 343703bd7 against stock
-  `hg serve` 7.2.4. Main's harness line and logs are in main's record of the round (owed here: the exact invocation).
-- **Machine and load.** Main's Mac, shared: load 25 to 49 with main's other rounds beside it; run 1 overlapped a
-  release build at nice 15. Loaded points: the counts are the stable signal, the times moved two to three times with
-  load.
+- **Build.** `cargo build --release --locked -p slates-cli --bin slates` at 343703bd7, binary sha1 157a34b36a5a.
+- **Command**, from the worktree root: `SERVERS="stock slates" SLATES=<that binary>
+  KEEP_LOGS=~/.local/state/main-01a20182/rounds/hg-stream/logs bash crates/cli/bench/hg_scale.sh hg
+  ~/.local/state/main-01a20182/data/hg-src ~/.local/state/main-01a20182/rounds/hg-stream/work 3 3600`: three runs,
+  stock then slates each run, over hg-src (Mercurial's own history: 57,036 changesets, 4,283 files, 73.8 MB), stock
+  Mercurial 7.2.4 (Homebrew) as `hg` and its `hg serve`. Run by `~/slates-work/main-ship/hg-stream-round.sh`.
+- **Machine and load.** adas-macbook-pro-2, 2026-11-27 19:18 to 20:29:07 PST, shared: load 12 to 49 with main's other
+  rounds beside it; run 1 overlapped a release build at nice 15. Loaded points: the counts are the stable signal, the
+  times moved two to three times with load.
+- **The record.** `~/.local/state/main-01a20182/rounds/hg-stream/run.log` (every step's line) and `summary.txt` (each
+  stream's counters moved, from the status files in `logs/`).
 
 **Seconds a step** (each run, and the best of three against stock's):
 
