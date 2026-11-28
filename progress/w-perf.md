@@ -924,3 +924,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     what its cut has left). Test switch dropped per main's 21:45 ruling; red run on the reverted rule (2,887,680 B
     held over 15 wakes) against green (389,120 over 5). Focused 117.
   - Waiting on main: the 57k on 864cb01c4 (true held gauge), table about 22:30; then whether step 2 lands.
+- 2026-11-27 22:34 PST (written then):
+  - Main's 57k on 864cb01c4 (true held gauge): peak 224-418 MB, cuts up 3-35x, copied up to 969.5 MB; every line over
+    100 MB "cut in flight true". So step 2 is needed. BUILT, not on main: agents/w-perf-cadence at d475c91fd (step 2
+    7762cf2a8 + the delta fixture 0f81d5f93, merged with main). Focused 144.
+  - Site 2's held-bound scene dropped (red-check failed by a hang, not at the bound); the delta fixture kept with a lean
+    functional test. let_go_landed test-only.
+  - Next: the intake-slice reading by stage (separate branch), then (ii) the naming proof. due() narrowing waits for
+    main's table on d475c91fd.
