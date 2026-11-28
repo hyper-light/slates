@@ -902,3 +902,12 @@
   (vcs_store.changeset_unread; ending the rebuild there broke a908/new-branch fleet tests); git_replay refuses a let-go
   pack nothing fills Unlanded, not Truncated. NEXT: the flip (LANDED_LET_GO true, C5's 2N + O×R + W, (e) kept, (d)'s
   checked rule + holder let-go counter), plan to main first; then C4, P1, P2.
+- 11-27 18:42 PST: LANDED B9 68e6fe9e3..3b889f115 (a hook's view stops at a let-go window, its seal kept, the push's driver brings
+  it back); B10 fdb4a9ddf..06ae5b712 (an unlanded push pins its pack's windows against another push's let-go of the same
+  bytes; pinned_unlanded gauge; main's A/Bs cleared it, 2 of 32 burner runs against 0 of 24, p ~0.5); THE FLIP
+  79c6e75fd..a0d39a8c1 (LANDED_LET_GO on; C5's held bound 2N + O x R + W, R 246 B from the index's layout; (d)'s
+  holder rule in fleet; harness classed by kind, ten kind (3) keep_landed sites each naming its let-go cover; kind (2)
+  fixed in it: a made commit over another repository's let-go bytes, with w-svn's put draft taken whole, and a warm
+  restart's renumbering, ContentStore::let_go_landed_again at the image's number, a pin only delaying it). OPEN, mine:
+  the clone's window peak under load (GAPS). NEXT: C4, P1, P2, as main orders; main runs the wall, suites, a914 and
+  C5's git/git rounds.
