@@ -170,7 +170,9 @@
 > increment over 1 MiB, the smaller carried in its entry.
 
 > **Open (w-shared, 2026-11-22; main 01a20182 03:17, 04:24 PST): a landed git push keeps 772-787 MiB resident for a
-> 56 MB pack** (git_interop `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history`,
+> 56 MB pack** (2026-11-28, w-git: the intake's per-object buffers removed, "A pack's intake reads its objects through
+> buffers it reuses": 20,192,853 bytes allocated reading 16,384,000 of objects before, 516,949 now; main's RSS round
+> owed) (git_interop `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history`,
 > git/git v2.0.0, release, the MacBook; bound 178.2 MiB). Attributed by the memory status's gauges (`mem.gauge.*`,
 > `crate::memory_gauges`, landed with this entry), in MB after the push: the system allocator's live blocks 55.9 (of
 > them the index tables 23.5); the repository's windows 61.3 in shard 0's arena and the pushed pack 53.9 on shard 1;

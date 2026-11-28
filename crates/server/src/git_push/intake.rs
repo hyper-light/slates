@@ -18,14 +18,13 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::BTreeMap;
 
 use slates_git::away::Waits;
 use slates_git::object_name::{Kind, ObjectId};
 use slates_git::receive::Repository;
 use slates_git::store::views::IndexedObjects;
 use slates_git::store::{IndexBases, Push, Repository as GitRepository, packed};
-use slates_git::unpack::{self, Contents, Keep, Object};
+use slates_git::unpack::{self, Contents, Keep, ObjectRef, Queued};
 use slates_git::{Admission, Hold};
 use slates_vcs::ContentStore;
 
@@ -38,8 +37,10 @@ pub(super) struct Intake<'s> {
   pub(super) indexed: IndexedObjects<'s>,
   /// The quarantine as it stood when the call began.
   pub(super) quarantined: Quarantined<'s>,
-  /// The objects resolved by this call, by position, with their holds, for the driver to admit.
-  pub(super) queue: BTreeMap<usize, (Object, Hold)>,
+  /// The objects resolved by this call, by position, with their holds, for the driver to admit: their bytes copied into
+  /// one buffer the push keeps from call to call, never a buffer an object (main 01a20182's ruling of 2026-11-28
+  /// 01:23).
+  pub(super) queue: Queued,
 }
 
 impl Repository for Intake<'_> {
@@ -58,8 +59,8 @@ impl Repository for Intake<'_> {
 
 impl Contents for Intake<'_> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
-    if let Some((object, _)) = self.queue.get(&at) {
-      return (object.id == *id).then_some(Cow::Borrowed(object.content.as_slice()));
+    if let Some(content) = self.queue.content(at, id) {
+      return Some(Cow::Borrowed(content));
     }
     self.quarantined.content(at, id)
   }
@@ -73,12 +74,17 @@ impl Keep for Intake<'_> {
   fn keep(
     &mut self,
     at: usize,
-    object: Object,
+    object: ObjectRef<'_>,
     hold: Hold,
-    _admission: &mut Admission,
+    admission: &mut Admission,
   ) -> Result<(), unpack::Refusal> {
-    self.queue.insert(at, (object, hold));
-    Ok(())
+    self
+      .queue
+      .keep(at, object, hold)
+      .map_err(|(refused, hold)| {
+        admission.release(hold);
+        refused
+      })
   }
 
   fn release(&mut self, hold: Hold, admission: &mut Admission) {
@@ -167,20 +173,30 @@ impl Contents for Quarantined<'_> {
 }
 
 /// Admits `queue`, the objects a session call resolved, to `quarantine` on the shard's state, each held where it lies in
-/// the push's pack ([`GitPush::admit_placed_all`]), then gives each one's hold back to `admission` (the module docs).
-/// Refused at the first object the store does not admit; every hold is given back whatever the outcome.
+/// the push's pack ([`GitPush::admit_placed_all`]), then gives each one's hold back to `admission` (the module docs):
+/// what it came to, and the queue's buffer, for the push's next call. Refused at the first object the store does not
+/// admit; every hold is given back whatever the outcome.
 pub(super) fn admit_queued(
   state: &mut ShardState,
   quarantine: &mut GitPush,
-  queue: BTreeMap<usize, (Object, Hold)>,
+  queue: Queued,
   admission: &mut Admission,
-) -> Result<(), GitRefused> {
-  let (objects, holds): (Vec<Object>, Vec<Hold>) = queue.into_values().unzip();
-  let admitted = quarantine.admit_placed_all(state, objects);
-  for hold in holds {
+) -> (Result<(), GitRefused>, Vec<u8>) {
+  let (objects, bytes) = queue.into_parts();
+  let admitted = quarantine.admit_placed_all(state, (&objects, &bytes));
+  for (_, hold) in objects {
     admission.release(hold);
   }
   // What the push's reads keep lately widened for the chains it carries now, within what the shard grants.
   quarantine.widen_reading(state);
-  admitted
+  (admitted, bytes)
+}
+
+/// Gives back every hold `queue` keeps, its objects not admitted: its buffer, for the push's next call.
+pub(super) fn released(queue: Queued, admission: &mut Admission) -> Vec<u8> {
+  let (objects, bytes) = queue.into_parts();
+  for (_, hold) in objects {
+    admission.release(hold);
+  }
+  bytes
 }

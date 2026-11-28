@@ -61754,6 +61754,32 @@ Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent::let_go
 - **Tests.** `slates-server` `vcs_store::git_encode::tests::t_a860_a_repository_gone_idle_lets_go_of_the_objects_its_reads_keep`
   (the encoding's reads kept 417 bytes here; once the fetch ended, back to the 32 before; red before: 417 held).
 
+### A pack's intake reads its objects through buffers it reuses, never one an object (2026-11-28, w-git; main 01a20182's ruling of 01:23; GAPS' 772-787 MiB; A-719, A-861)
+- **Why.** GAPS' 772-787 MiB a landed git/git v2.0.0 push kept for its 56 MB pack: the largest share was memory the
+  system allocator kept free after the push's peak. Read against today's code (main 01a20182's order of 2026-11-28
+  01:21), the push's live inflated bytes are bounded (the entry being read and a delta's object; its objects read
+  lately, a chain's worth, A-861; the deltas waiting for a base, held on the admission), but its intake made a buffer of
+  each entry's size for every entry, another for every delta's object, and a SHA-1 detection state for every object
+  named, each made and freed in turn: about 164,488 of each at v2.0.0, 2.3 GB of buffers, the pattern an allocator
+  answers by keeping memory. Ada's rule is no allocation where the design avoids one (main's ruling of 01:23).
+- **Change.** The pack reader (`unpack::Reader`) keeps two buffers, one an entry's data is inflated into and one a
+  delta's object is made into (`delta::apply_into`), each reused entry after entry and grown only for a longer one;
+  while in use each holds its entry's bytes on the admission (the entry's hold, as before), and between entries it keeps
+  at most the room of the pack's longest entry so far. A delta that waits for a later base takes its buffer with it, its
+  bytes outliving the entry, and gives it back once applied. Its keeper is lent each object (`ObjectRef`, `Keep::keep`),
+  not given it: a keeper that keeps the bytes copies them. The objects a push's intake and a replay's site queue for
+  their owners to admit after the reader's call are copied into one buffer each owner keeps from call to call
+  (`unpack::Queued`, the push's `queue_bytes`), at most one call's objects, which their holds charge while queued; the
+  push keeps each as read lately by a copy into its chunk (`Push::keep_read_lent`). Every object is named with the
+  reader's one hasher, made fresh in place (`Hasher::name`), never a new SHA-1 detection state an object.
+- **Tests.** `slates-git` `tests/intake_buffers.rs` (its own binary, the slates allocator global): 4,000 whole objects
+  of 4 KiB read a client's piece at a time into a keeper that keeps nothing; the reader allocates 516,949 bytes reading
+  16,384,000 (red 20,192,853 with an object a buffer, 3,812,949 with the buffers reused but a hasher an object); the
+  objects handed over whole. The pushes', replays' and checks' suites unchanged, byte for byte.
+- **Owed.** Main's RSS round over git/git v2.0.0 (git_interop's resident memory test, the peak and the after-push
+  reading against the bound 178.2 MiB). The reader's per-entry records (`Reader::entries`, a record an entry, the rest
+  of the 516,949) grow with the pack, by doubling.
+
 ### A-861 — Objects read lately lie in chunks given back whole, never on the system heap (2026-11-22, w-shared; main 01a20182's rulings of 04:24 and 04:56 PST, goal 93; A-742, A-860)
 Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent`: chunks, a hash index, one order queue;
 `let_go` gives back every chunk; `true_up`, `release`), `crates/git/src/store/push.rs`, `repository.rs` and

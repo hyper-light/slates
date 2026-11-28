@@ -400,6 +400,28 @@ pub fn apply(source: &[u8], delta: &[u8], admission: &mut Admission) -> Result<V
   Ok(target)
 }
 
+/// [`apply`] into `target`, a buffer its caller reuses delta after delta (a push's intake, main 01a20182's ruling of
+/// 2026-11-28 01:23: one buffer an object was 2.3 GB made and freed for git/git v2.0.0): emptied, grown only where the
+/// target is longer than any before, then made. Refused as [`apply`] is, `target` then empty.
+pub fn apply_into(
+  source: &[u8],
+  delta: &[u8],
+  admission: &mut Admission,
+  target: &mut Vec<u8>,
+) -> Result<(), Refusal> {
+  let (sizes, start) = check(source, delta)?;
+  let refused = Refusal::AllocationRefused {
+    target: sizes.target,
+  };
+  let len = usize::try_from(sizes.target).map_err(|_| refused)?;
+  admission
+    .charge(sizes.target)
+    .map_err(Refusal::PastAdmission)?;
+  target.clear();
+  target.try_reserve_exact(len).map_err(|_| refused)?;
+  make(source, delta, start, target)
+}
+
 /// Makes the target into `out` by the instructions from `start`, which [`check`] has passed whole.
 fn make(source: &[u8], delta: &[u8], start: usize, out: &mut impl Out) -> Result<(), Refusal> {
   for item in Instructions::new(delta, start) {
