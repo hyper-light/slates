@@ -3332,7 +3332,7 @@ async fn segment_landed(
     let source = crate::vcs_store::homes::HomeSource::Held(identity, len);
     let (homed, _) = super::hg_run::homed_for(run, source).await?;
     if let Err(refused) = homed {
-      crate::state::with_state(|state| held.given_back(state, (false, &[])))?;
+      crate::state::with_state(|state| held.given_back(state, false))?;
       return Some(Err(PushOutcome::refused(&abort(
         unhomed_words(&refused).to_vec(),
       ))));
@@ -3340,8 +3340,7 @@ async fn segment_landed(
   }
   let ok = held.landed().await.is_ok();
   crate::state::with_state(|state| {
-    let shards = state.shards.clone();
-    held.given_back(state, (ok, &shards));
+    held.given_back(state, ok);
     if ok {
       super::hg_run::count_landed(state, held.section_bytes());
     }

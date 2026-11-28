@@ -1794,7 +1794,7 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
     if state.consensus_failure.is_some() {
       return Err(StateAccess::Fenced);
     }
-    let held_before = state.store.content.arena().deferred_bytes();
+    let held_before = crate::content_holder::BorrowArena::read(state);
     let result = f(state);
     crate::content_holder::note_borrow_held(state, held_before, site);
     // A deadline the borrow set before the one the shard's keeper sleeps for wakes it, whichever path set it (A-536).

@@ -684,15 +684,33 @@ impl HeldSegment {
     open.commit().await
   }
 
-  /// Gives back the origin's holds of its sections (`vcs_store::put_names`'). Landed (`landed`), each is
-  /// let go first where it lies on the node's store ([`crate::vcs_store::let_go_landed_pack_among`]): its home among
-  /// `shards`, told, records where its windows lie and lets its copy go, brought back by `disk.piece` on a read, as a
-  /// landed git pack is; its region hold stays, the attempt's until the entry commits.
-  pub(crate) fn given_back(&self, state: &mut ShardState, (landed, shards): (bool, &[u16])) {
-    for (_, (identity, _)) in self.sections() {
-      if landed {
-        crate::vcs_store::let_go_landed_pack_among(state, &identity, shards);
-      }
+  /// Gives back the origin's holds of its sections (`vcs_store::put_names`'), a slice a turn where they `landed`
+  /// ([`give_back_sections`]): each let go where it lies on the node's store, its home told to record where its windows
+  /// lie and let its copy go, brought back by `disk.piece` on a read, as a landed git pack is; its region hold stays,
+  /// the attempt's until the entry commits.
+  pub(crate) fn given_back(&self, state: &mut ShardState, landed: bool) {
+    give_back_sections(
+      state,
+      self.sections().map(|(_, (identity, _))| identity),
+      landed,
+    );
+  }
+}
+
+/// Gives back a push segment's held `sections` (A-767 C1): where it `landed`, each is let go a slice a turn and its
+/// names released at its end (`vcs_store::let_go_sliced_then_release`), each slice freeing at most a copy slice into
+/// the frees held for the committed image; else each released now. Before (main's 57k of 2026-11-27 19:00) a landed
+/// segment's sections were let go whole in the borrow that gave them back: 264.5 MB into the held frees in one borrow,
+/// the run's whole held peak.
+pub(crate) fn give_back_sections(
+  state: &mut ShardState,
+  sections: impl IntoIterator<Item = slates_vcs::ContentId>,
+  landed: bool,
+) {
+  for identity in sections {
+    if landed {
+      crate::vcs_store::let_go_sliced_then_release(state, identity);
+    } else {
       crate::vcs_store::release_names(state, &identity);
     }
   }

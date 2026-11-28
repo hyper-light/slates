@@ -1296,11 +1296,11 @@ pub(crate) const IMAGE_HELD_BORROW_MOST: &str = "vcs_store.image.held_borrow_mos
 /// so the borrow that frees without bound is named. One subtraction a borrow, none past it where nothing was freed.
 pub(crate) fn note_borrow_held(
   state: &mut ShardState,
-  before: usize,
+  before: BorrowArena,
   site: &'static std::panic::Location<'static>,
 ) {
   let after = state.store.content.arena().deferred_bytes();
-  let freed = u64::try_from(after.saturating_sub(before)).unwrap_or(u64::MAX);
+  let freed = u64::try_from(after.saturating_sub(before.deferred)).unwrap_or(u64::MAX);
   if freed == 0 {
     return;
   }
@@ -1310,13 +1310,53 @@ pub(crate) fn note_borrow_held(
     .copied()
     .unwrap_or(0);
   if freed > most.saturating_mul(2) && freed > state.config.copy_slice_bytes() {
+    // What the arena was at the borrow's two ends, and the process's memory, read only for a line: so a count past
+    // what the arena could hold (main's 57k, 4,715,147,264 bytes in one borrow with 843 MB resident) shows whether
+    // the arena held it, or the borrow began over another store (a lent chunk store's placeholder holds none).
+    let now = BorrowArena::read(state);
     slates_machine::log_line!(
       "slates-server: partition {}: one borrow at {site} freed {freed} bytes into the frees held for the committed \
-       image ({after} held now; the most one borrow freed before, {most})",
-      state.partition
+       image ({after} held now; the most one borrow freed before, {most}); the arena before and after: capacity \
+       {} and {}, mapped {} and {}, allocations {} and {}; the process's footprint {:?}, resident {:?}",
+      state.partition,
+      before.capacity,
+      now.capacity,
+      before.mapped,
+      now.mapped,
+      before.allocations,
+      now.allocations,
+      slates_machine::facts::Facts::footprint_now(),
+      slates_machine::facts::Facts::resident_now(),
     );
   }
   state.count_max(IMAGE_HELD_BORROW_MOST, freed);
+}
+
+/// The shard's content arena as a borrow of its state begins ([`note_borrow_held`]): its held frees, and what tells
+/// whether it is the arena itself (its capacity, mapped bytes and allocations).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BorrowArena {
+  /// The frees held for the committed image.
+  deferred: usize,
+  /// The arena's capacity.
+  capacity: usize,
+  /// Its mapped bytes.
+  mapped: usize,
+  /// Its allocations so far.
+  allocations: u64,
+}
+
+impl BorrowArena {
+  /// The shard's content arena now.
+  pub(crate) fn read(state: &ShardState) -> Self {
+    let arena = state.store.content.arena();
+    Self {
+      deferred: arena.deferred_bytes(),
+      capacity: arena.capacity(),
+      mapped: arena.mapped_bytes(),
+      allocations: arena.allocations(),
+    }
+  }
 }
 
 /// Format: the status counter of cuts begun because the shard went idle with changes waiting for a cut not yet due.

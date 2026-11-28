@@ -2294,6 +2294,86 @@ mod tests {
     );
   }
 
+  /// [`a_landed_segments_give_back_frees_at_most_a_copy_slice_a_borrow`]'s scene on a shard: one object of
+  /// [`GIVEN_BACK_SLICES`] copy slices put and published, so the committed image names its windows, then given back as
+  /// a landed push segment's section (`hg_run::give_back_sections`) and its let-go turned to its end
+  /// (`vcs_store::let_go_turn`). The frees the give-back's own borrow held, the most one turn held, the bytes let go in
+  /// all, the copy slice and a window's bytes, and whether the object is still held.
+  fn given_back_sliced() -> (u64, u64, u64, (u64, u64), bool) {
+    crate::daemon::audit_on_shard(move |state| {
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let slice = state.config.copy_slice_bytes();
+      let len = usize::try_from(slice.saturating_mul(GIVEN_BACK_SLICES))
+        .unwrap()
+        .max(window * 4);
+      let bytes: Vec<u8> = (0..len).map(|at| u8::try_from(at % 251).unwrap()).collect();
+      let id = crate::vcs_store::within_budget(state, u64::try_from(len).unwrap(), |stores| {
+        stores.content_mut().unwrap().put_object(&bytes).unwrap()
+      });
+      crate::verbs::publish_shard(state).unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      let held = |state: &crate::state::ShardState| {
+        u64::try_from(state.store.content.arena().deferred_bytes()).unwrap()
+      };
+      let before = held(state);
+      crate::repository::hg_run::give_back_sections(state, [id], true);
+      let in_its_borrow = held(state).saturating_sub(before);
+      let (mut most, mut turned) = (0u64, before.saturating_add(in_its_borrow));
+      while crate::vcs_store::let_go_turn(state) {
+        let now = held(state);
+        most = most.max(now.saturating_sub(turned));
+        turned = now;
+      }
+      let now = held(state);
+      most = most.max(now.saturating_sub(turned));
+      let let_go = now.saturating_sub(before);
+      let still = state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| content.contains(&id));
+      (
+        in_its_borrow,
+        most,
+        let_go,
+        (slice, u64::try_from(window).unwrap()),
+        still,
+      )
+    })
+  }
+
+  /// Shape: the copy slices [`given_back_sliced`]'s object holds, so its let-go takes several turns.
+  const GIVEN_BACK_SLICES: u64 = 8;
+
+  /// Goal 93, A-930's held bound (main's 57k of 2026-11-27 19:00 on 4a281d25b: in every run the held peak was one
+  /// borrow's, `hg_push`'s give-back of its landed segment's held set, 264.5 MB in one borrow). Do: run
+  /// [`given_back_sliced`]. Expect the give-back's own borrow to hold no frees, each turn of its let-go at most a copy
+  /// slice and one window, the object let go whole in all and its names released. Red before: the give-back let the
+  /// sections go whole in its own borrow.
+  #[test]
+  fn a_landed_segments_give_back_frees_at_most_a_copy_slice_a_borrow() {
+    let (in_its_borrow, most, let_go, (slice, window), still) = given_back_sliced();
+    println!(
+      "the give-back's borrow held {in_its_borrow} bytes; a turn at most {most} (a copy slice {slice}, a window \
+       {window}); {let_go} let go in all"
+    );
+    assert!(
+      in_its_borrow <= slice,
+      "the give-back's own borrow held {in_its_borrow} bytes, past a copy slice of {slice}"
+    );
+    assert!(
+      most <= slice + window,
+      "a turn held {most} bytes, past a copy slice of {slice} and a window of {window}"
+    );
+    assert!(
+      let_go >= slice,
+      "the object was let go: {let_go} bytes held in all"
+    );
+    assert!(!still, "the section's names released once its let-go ended");
+  }
+
   /// Goal 93, the Aways append rule's encoding. Do: append generated entries to a page piece of generated entries, and
   /// to bytes no page wrote. Expect the appended piece byte for byte the whole encoding of both, only the appended
   /// entries' bytes counted encoded ([`encoded_bytes`]), and the foreign bytes refused.
