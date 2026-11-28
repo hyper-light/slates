@@ -66817,6 +66817,17 @@ Applied in the same change to:
   `replica_build::tests::a_waiting_builds_replay_seen_rises_with_its_steps_and_never_falls`,
   `vcs_store::tests::a_rebuilds_steps_are_its_records_replayed_and_names_fetched`; main's ×16's run 2 is the field
   evidence.
+- **The hedged region read (main 01a20182's ruling of 2026-11-27 20:11, its (b); Dean and Barroso, "The Tail at Scale",
+  CACM 2013, hedged requests).** A region read with two homes or more asks its first home only until that home's
+  measured path tail (`homes::hedge_delay_ns`, the `PathRtt` tail RFC 9002's probe timeout gives), then each next
+  home its share of what is left, then the first again with the rest (`homes::hedged_asks`); one home, or a first home
+  with no measured path, is asked as before. Fan-out stays within the identity's homes, one at a time, so no read is
+  sent to two homes at once; the first home's late answer is its exchange's straggler, settled there with its session
+  given back, and the hedge counted `vcs_store.homes.reads_hedged`. Not a concurrent hedge: an exchange waits its
+  stragglers out to its own budget, and one cut short to race another would need its stragglers settled off the read's
+  path, which no task here owns. A dead first home not yet suspected costs a read its path tail and the next home's
+  round trips. Fleet red first: `a_region_read_whose_first_home_died_unseen_is_hedged_to_the_next_within_its_path_tail`
+  (1.000 s of a 1.998 s budget before, the stopped home's whole share; 2.2 ms hedged).
 
 ### A-937 — A Mercurial revision's chunk length is kept where it lands, so a stream clone walks nothing before its head (2026-11-27, w-interop for main 01a20182, its order of 2026-11-27 16:23 (cut 2) and its rulings of 18:56, 18:58 and 20:19; goal 93's hg whole-history gap; §4.17.3 "Stream clones: the revlog view")
 
