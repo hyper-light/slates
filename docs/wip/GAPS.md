@@ -3510,14 +3510,16 @@
 > refusal), held at every point by the store's oracle. Piece 2 BUILT (A-722 part 4i): a landing of several moves
 > maps none of its positions in its step (599 before), its moves' brought sets recorded and mapped by the shard's task a
 > slice a turn. Piece 3 BUILT (A-722 part 4j): a landed push's maps by object are freed by the shard's task after its
-> step (1,202 entries freed in the step before for a push of 600 commits). OWED, each its own piece: a stale stage
-> restaged whole (with a stale stage's members positioned by id); a replayed store's landings of several moves mapped
-> before its next live commit; an abandoned or replayed push's maps freed in its own step.
+> step (1,202 entries freed in the step before for a push of 600 commits). Piece 4 BUILT (A-722 part 4k): an atomic
+> push's stage a landing overtook before its append is made again in turns (10 of 12 restaged whole before). OWED,
+> each its own piece: a stale stage's admitted moves positioned by id in the commit's step; a replayed store's
+> landings of several moves mapped before its next live commit; an abandoned or replayed push's maps freed in its own
+> step.
 >
 > **A-722 part 4e (2026-11-20, w-git).** BUILT: an overtaken stage made again in the judge's turns; a stage giving no
-> position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live). Owed: the
-> store commit's whole passes (part 4h above began them: the chains' and the head map's); the check's propagation in
-> one unit (57.9 ms at 100 pushes).
+> position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live), and an
+> atomic push's append asks its own turns (part 4k). Owed: the store commit's whole passes (parts 4h to 4k above:
+> what is left is listed there); the check's propagation in one unit (57.9 ms at 100 pushes).
 >
 > **A-753 (2026-11-20, w-git).** BUILT: a create at a commit another branch holds is made from it (empty work); a
 > resent object is read from the index; at the chains' cap a push checkpoints the repository's other members too.

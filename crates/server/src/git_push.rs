@@ -2242,6 +2242,13 @@ impl Judge for ServerJudge<'_> {
       && self.policy_ready(command)
   }
 
+  fn ready_to_append(&mut self) -> bool {
+    // A stage a landing overtook since the last command's turn is made again in turns before the atomic append, so the
+    // append's commit adopts it rather than staging the push again whole in its step (P2 piece 4).
+    let ns = self.state.config.step_quantum_ns();
+    self.push.restage_turn(self.state, (self.restaging, ns))
+  }
+
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
     if let Some(declined) = self.hooks.declined(&command.name) {
       return Err(declined);

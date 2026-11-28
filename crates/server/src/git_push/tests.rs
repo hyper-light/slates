@@ -3495,14 +3495,45 @@ const INTERLEAVED: usize = 12;
 #[cfg(unix)]
 #[test]
 fn t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append() {
-  let (outcomes, restaged) = on_stored_shard_awaited(["overtaken"], |[repository]| async move {
+  let (outcomes, restaged) = interleaved_creates("overtaken", CAPABILITIES);
+  assert!(
+    outcomes.iter().all(|reasons| reasons == &[b"ok".to_vec()]),
+    "{outcomes:?}"
+  );
+  assert_eq!(restaged, Some(0));
+}
+
+/// P2 piece 4 (CLAUDE.md §3; A-722 part 4e's owed "a stale restage"): an atomic push judges its commands a step each
+/// and appends in a step of its own, so a landing between its last command's turn and its append overtook its stage,
+/// and the append's commit staged it again whole. Do: as A-722 part 4e's test above ([`interleaved_creates`]), each
+/// push `atomic`. Expect: every push `ok`, and no commit staged a push again whole (`restaged` none): the append waits
+/// for the stage made again in its push's turns. Red before: commits staged pushes again whole.
+#[cfg(unix)]
+#[test]
+fn an_atomic_pushs_stage_a_landing_overtook_before_its_append_is_made_again_in_turns() {
+  let (outcomes, restaged) = interleaved_creates("overtaken-atomic", ATOMIC);
+  assert!(
+    outcomes.iter().all(|reasons| reasons == &[b"ok".to_vec()]),
+    "{outcomes:?}"
+  );
+  assert_eq!(restaged, Some(0));
+}
+
+/// [`INTERLEAVED`] pushes to repository `name`, each creating its own branch at the fixtures' first commit with its
+/// whole pack under `capabilities`, answered a step of each in turn: each push's reasons, and the store's `restaged`.
+#[cfg(unix)]
+fn interleaved_creates(
+  name: &'static str,
+  capabilities: &'static [u8],
+) -> (Vec<Vec<Vec<u8>>>, Option<u64>) {
+  on_stored_shard_awaited([name], move |[repository]| async move {
     let pack = pack_of(scenario!("create").request);
     let mut pushes: Vec<Option<ReceivePack>> = on_state(|state| {
       (0..INTERLEAVED)
         .map(|k| {
           let name = format!("refs/heads/p{k}");
           let created = [("", FIRST, name.as_bytes())];
-          let body = request(&created, CAPABILITIES, pack);
+          let body = request(&created, capabilities, pack);
           let (_, mut push) = started(state, repository);
           for piece in body.chunks(PIECE) {
             push.input(state, piece).expect("taken");
@@ -3538,12 +3569,7 @@ fn t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_appen
         .map(|(_, git)| git.repository.counters().restaged)
     });
     (outcomes, restaged)
-  });
-  assert!(
-    outcomes.iter().all(|reasons| reasons == &[b"ok".to_vec()]),
-    "{outcomes:?}"
-  );
-  assert_eq!(restaged, Some(0));
+  })
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

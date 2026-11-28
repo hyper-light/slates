@@ -57060,6 +57060,21 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   made durable, `Unanswered`: Subversion's commit path, which this change does not touch); fmt clean (macOS arm64,
   this Mac, local).
 
+### A-722 part 4k — An atomic push's stage a landing overtook before its append is made again in turns (P2 piece 4, 2026-11-27, w-git; main 01a20182's order of 18:44)
+- **Why.** A-722 part 4e made an overtaken stage again in the judge's turns (`Judge::ready`), and a push without
+  `atomic` appends each command in the step its `ready` answered, so its stage is current at its commit. An atomic
+  push judges its commands a step each and appends in a step of its own (`receive::atomic_step`), which asked nothing
+  first. A landing between its last command's turn and its append overtook its stage, and the append's commit staged
+  the push again whole in its step (`StoreCounters::restaged`): 10 of 12 interleaved atomic creates.
+- **Change.** `Judge::ready_to_append`, asked by the atomic step before its append; not ready, the step ends and the
+  next asks again, as `ready` does. Ready at once by default. The server's judge turns the push's stage made again
+  (`SealedPush::restage_turn`), so the append's commit adopts a current stage.
+- **Tests.** `slates-server` `git_push::tests::an_atomic_pushs_stage_a_landing_overtook_before_its_append_is_made_again_in_turns`
+  (12 atomic creates answered a step of each in turn: every one `ok`, `restaged` 0; red 10), beside A-722 part 4e's
+  test, now sharing its driver (`interleaved_creates`).
+- **Owed.** The moves admitted against the stage before it was made again have their new objects positioned by id in
+  the commit's step (`Repository::members_positions`), O(their objects), its own piece.
+
 ### A-722 part 4j — A landed push's maps by object are freed after its step, a slice a turn (P2 piece 3, 2026-11-27, w-git; main 01a20182's order of 18:44)
 - **Why.** CLAUDE.md §3 (bounded work). A commit's release freed the push's maps by object inside the landing's step:
   its commits, its objects' places in its pack, and the positions its stage gave. A pack push's entries by offset
