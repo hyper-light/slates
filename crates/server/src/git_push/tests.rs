@@ -1171,6 +1171,32 @@ fn t_goal93_a_pushs_search_for_the_green_holding_a_commit_is_flat_in_the_reposit
   assert_eq!(few.0, many.0, "the search followed the repository's greens");
 }
 
+/// A-658 3c's measure first (main 01a20182's ruling of 2026-11-27 22:48): a push's judging on its owner's shard is timed,
+/// so a bench can read what share of the owner's push work it is. Do: push one create of `main`. Expect it `ok`, and
+/// `git_push.judge_ns` and `git_push.judge_ns_most` both moved, the most no more than the sum: the counter is not dead.
+#[test]
+fn t_a658_3c_a_pushs_judging_is_timed_on_its_owner_shard() {
+  let ((sum, most), received) = on_stored_shard_awaited(["judged"], |[repository]| async move {
+    let read =
+      |name: &'static str| on_state(move |state| state.refusals.get(name).copied().unwrap_or(0));
+    let before = (read(super::JUDGE_NS), read(super::JUDGE_NS_MOST));
+    let create = pack_of(scenario!("create").request);
+    let created = [("", FIRST, b"refs/heads/main".as_slice())];
+    let received = pushed_awaited(repository, &request(&created, CAPABILITIES, create)).await;
+    let after = (read(super::JUDGE_NS), read(super::JUDGE_NS_MOST));
+    (
+      (after.0 - before.0, after.1.max(before.1)),
+      reasons(&received),
+    )
+  });
+  assert_eq!(received, [b"ok".to_vec()], "the create landed");
+  assert!(sum > 0, "the push's judging was timed: {sum} ns");
+  assert!(
+    most > 0 && most <= sum,
+    "the most within the sum: {most} of {sum} ns"
+  );
+}
+
 /// Shape: the files of each tree [`t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`] pushes:
 /// enough that each create's work is a large part of [`SMALL_CHAIN_BUDGET`].
 const ROOMY_FILES: usize = 64;

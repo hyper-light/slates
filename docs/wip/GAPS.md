@@ -103,7 +103,11 @@
 > watch only). Main's bridge-fuse changes since the branch: A-795 removed the S3 base from `bridge.rs`/`channel.rs`.
 > **Main's, not family three's:** the same 2 fail on origin/main 3b664fb alone (kiln r29, adacachy): the zero-budget
 > round's slices are `[1, 1, ...]` (41) where the test expects the root and one file first, `[2, 1, ...]` (40)
-> (`takeover_round.rs:259`, `:294`). Owner to be assigned by main.
+> (`takeover_round.rs:259`, `:294`). Owner to be assigned by main. **Not reproduced on GitHub's 7.0 kernels at
+> 93b7d6b42, 2 of 2 on each architecture** (diag-measurer-fuse-1, run 46118278438: ubuntu-latest x86_64 and
+> ubuntu-24.04-arm, kernel 7.0.0-1020-azure, the whole slates-bridge-fuse suite twice; family three's `fuse_mount` test 8
+> of 8 on each, no SKIP, which closes family three's Linux run). It may depend on the kernel or have been fixed since;
+> recheck on adacachy (7.2.9) when kiln returns.
 > **CLOSED by A-926 part 1 (w-perf, 2026-11-25; opened by w-shared, 2026-11-21): `content_ranges`
 > `a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length` failed some runs** (macOS arm64;
 > main's full suite at f954135af: (sweeps, idle slices, armed) (0, 3,348,409, true) at its bound, passing alone in
@@ -1245,11 +1249,25 @@
 > off its CPU while the process footprint fell 40.1 MB, the steps pages were returned in held all of a run's off-CPU
 > time (1.7-2.5 ms), and a run with no return during a landing step spent at most 18 µs off its CPU although 1,218 steps
 > met the reaper dropping. So it is the page return, not the reaper's drops, and neither slicing the reaper's drops
-> (measured: 804-2,442 µs, no better) nor dropping on the shard can split one return. The wide copy test holds
-> `LANDING_OFF_CPU_MOST_NS` to 84a's 1 ms bar and fails where a return stalls a step (2 of 4 debug runs; another run's
-> 8 return steps, 71 MB, stalled none, at most 22 µs off its CPU, so the stall is intermittent): the red the arena piece turns
+> (measured: 804-2,442 µs, no better) nor dropping on the shard can split one return. The footprint is the process's,
+> so the page-return reading is process-wide: in a suite, other tests' frees count against a step (w-git's 22:10 run,
+> 273 tests in one process: a prepare step 39.7 ms off its CPU while the footprint fell 376 MB), and an in-suite figure
+> is not this test's. The wide copy test prints `LANDING_OFF_CPU_MOST_NS` (its `OFFCPU` line); its 1 ms assert is out
+> until the fix lands with it (main's ruling of 2026-11-27 22:16 reversed 20:31's: a red lands with its fix), as it
+> failed where a return stalled a step (2 of 4 debug runs; another run's 8 return steps, 71 MB, stalled none): the red the arena piece turns
 > green (the landing's structures in the shard's arena, so a free never hands pages back mid-step). Unexplained, logged,
 > not attributed: one run's 5,025 µs in a step whose footprint did not fall.
+
+> **FIXED 2026-11-27 (w-svn; main's ruling of 21:46): the greens' pending holds were copied whole every step.**
+> `name_holds::apply_some` took the whole owed list, applied a few holds before its step was spent and rebuilt the
+> rest, so a landing's 9,000-text holds were copied and regrown each step: 22.4 GB freed over 16,000 steps of one wide
+> copy import (debug; A-920 7c, 829985455). `Greens` now keeps them as two queues, takes and gives, each in order; a
+> step applies from the front and moves no hold it does not apply (`merge.name_hold.requeued`, 7,998,000 for 4,000
+> owed before, 0 after). The wide copy test runs in 8.5-9.6 s, from 14-17 s; the ~50 MB page return remains (3.2-4.6 ms
+> off the CPU in a step whose footprint fell 41-42 MB, 2 of 3 runs), so the arena piece stands. Siblings of the shape,
+> owed their own look: the import's read buffer drained from its front at every consume (`Importing::consume`,
+> `buffer.drain(..consumed)`, the rest moved each time) and a landing's pending section drained a store piece at a
+> time (`landing::sent_piece`, `pending.drain(..take)`).
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
