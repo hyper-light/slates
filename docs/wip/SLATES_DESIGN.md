@@ -15239,6 +15239,12 @@ arrival. At r400 of hg's history the stream is 99 files and 466 KB against stock
 813 KB). The changelog is written without generaldelta, as 7.2 writes a new one: each delta in it against the
 revision before, its entry's base its chain's start, and a store holding another serves no stream. Still owed: the
 deltas the pinned writer would choose.
+Status (2026-11-27, the stream's index rows a run a step): the gathering reads each log's index numbers (parents,
+link, node, flags, length) in one range walk of the index, which opens only the sealed tables whose first and last
+keys can meet the log's range, and spends at most a step's bytes touched (half the step quantum at the measured copy
+rate) or the room, whichever first. The index stage then writes as many rows a step as one step's copy holds, from
+those numbers, with no lookup a row, and the next log is the count pass's next sized one. Measured on a 1,200-revision
+stock history over 48 sealed runs: 0.37 index reads a revision, from 4.47.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:

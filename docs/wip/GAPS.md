@@ -5009,6 +5009,15 @@
 > superlinear term); then each log's rendered length kept where its revisions land, so the count walk goes, with an
 > oracle over generated landing histories, a recovery story, and a stale length refused typed, never sent. The
 > whole-history push (5.60×) waits until these land.
+> Cut 1, the index rows a run a step, BUILT (2026-11-27, w-interop; main's rulings of 17:28 and 17:57). The index's
+> fences keep their table's last key beside its first (`slates_vcs::Index::iter_range`, which opens only the tables
+> whose keys can meet its range; charged, not persisted). `rows_held` gathers each log's numbers in one range walk
+> (`HgIndex::numbers_from`), within a per-step budget of bytes touched derived from the step quantum and the measured
+> copy rate (`Store::text_bytes_a_step`), or the room, whichever first. The index stage writes a run of rows from the
+> gathered numbers with no lookups, and the send pass takes its next log from the count's sized list, with no index
+> search. Held by `a_streams_index_rows_are_written_a_run_a_step` (1,200 revisions of a stock-hg history imported, 48
+> sealed runs): index reads 5,369 (4.47 a revision) before, 449 (0.37) after; index steps 1,249 before, 57 after. Count
+> stage on the same history: 1,215 steps, 1,298 reads. Cut 2, the kept rendered length, is next.
 > **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
 > command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
 > session failed correct but slow steps (80-100 s of single-shard CPU, git's own index-pack among it). Now each waits

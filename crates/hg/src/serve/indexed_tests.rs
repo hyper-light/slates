@@ -1568,11 +1568,162 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
   assert!(walked > 0, "no view was walked by its links");
 }
 
+/// Shape: the changesets of [`a_streams_index_rows_are_written_a_run_a_step`]'s history, each changing two of
+/// [`LONG_FILES`] files: every log long enough that a row a step and a search a row show against a run a step.
+const LONG_CHANGESETS: usize = 300;
+/// Shape: the files those changesets change.
+const LONG_FILES: usize = 8;
+/// Shape: the bytes a step's gathering may touch, as a daemon derives its copy budget (`copy_slice_bytes`: half the step
+/// quantum at the measured memcpy rate): 1 MiB, half of a 500 µs quantum at about 4 GB/s, the order of a laptop's.
+const STEP_BYTES: u64 = 1 << 20;
+
+/// A history stock `hg` makes in a scratch directory beside the test binary, named with the process: [`LONG_CHANGESETS`]
+/// changesets, each appending a line to two of [`LONG_FILES`] files. Its `.hg` read as an import takes it ([`Dot`]:
+/// `requires` and the store's revlogs, `fncache`, `phaseroots` and `requires`), the directory removed. None where
+/// stock `hg` does not run here.
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory and stock `hg`
+fn stock_history(name: &str) -> Option<Dot> {
+  let dir = std::env::current_exe()
+    .ok()?
+    .parent()?
+    .join(format!("scratch-{name}-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).ok()?;
+  let hg = |args: &[&str]| {
+    std::process::Command::new("hg")
+      .args(args)
+      .current_dir(&dir)
+      .env("HGPLAIN", "1")
+      .env("HGUSER", "slates-test")
+      .env("HGRCPATH", "")
+      .output()
+      .ok()
+      .filter(|out| out.status.success())
+  };
+  hg(&["init"])?;
+  for changeset in 0..LONG_CHANGESETS {
+    for touched in [changeset % LONG_FILES, (changeset * 3 + 1) % LONG_FILES] {
+      let path = dir.join(format!("f{touched}.txt"));
+      let mut text = std::fs::read(&path).unwrap_or_default();
+      text.extend_from_slice(format!("changeset {changeset}\n").as_bytes());
+      std::fs::write(&path, text).ok()?;
+    }
+    let message = format!("changeset {changeset}");
+    hg(&[
+      "commit",
+      "-q",
+      "-A",
+      "-d",
+      "2026-11-27 00:00 +0000",
+      "-m",
+      &message,
+    ])?;
+  }
+  let mut files = BTreeMap::new();
+  files.insert(
+    b"requires".to_vec(),
+    std::fs::read(dir.join(".hg/requires")).ok()?,
+  );
+  let store = dir.join(".hg/store");
+  let mut walk = vec![store.clone()];
+  while let Some(at) = walk.pop() {
+    for entry in std::fs::read_dir(&at).ok()? {
+      let path = entry.ok()?.path();
+      if path.is_dir() {
+        walk.push(path);
+        continue;
+      }
+      let relative = path.strip_prefix(&store).ok()?.to_str()?.to_owned();
+      let kept = relative.ends_with(".i")
+        || relative.ends_with(".d")
+        || ["fncache", "phaseroots", "requires"].contains(&relative.as_str());
+      if kept {
+        files.insert(
+          format!("store/{relative}").into_bytes(),
+          std::fs::read(&path).ok()?,
+        );
+      }
+    }
+  }
+  let _ = std::fs::remove_dir_all(&dir);
+  Some(Dot(files))
+}
+
+/// Goal 93, hg's whole-history gap, the cut after the stage counts (main 01a20182's ruling of 2026-11-27 16:23, its
+/// order's second): a stream's index rows written a run a step, one search of the index a run, not a step and two
+/// searches a row. Do: import a history stock `hg` makes ([`stock_history`]: 300 changesets over 8 files), seal its index
+/// into runs (so its rows are read from the content store, as a landed repository's are), and stream it a step at a
+/// time to its end in one room, each step's gathering held to a copy budget's bytes ([`STEP_BYTES`]). Expect the index
+/// rows' steps under half the revisions, and their content store reads at most one a revision, on the import's own
+/// layout of 48 runs of one table each. Red before: a row a step (the index steps the revisions) and two searches a row (`numbers`, then
+/// `entry_of`'s own); on a 600-changeset history through the server, 4.2 reads a revision. Skips, saying so, where stock
+/// `hg` does not run.
+#[test]
+fn a_streams_index_rows_are_written_a_run_a_step() {
+  let Some(mut dot) = stock_history("index-runs") else {
+    eprintln!("SKIPPED a_streams_index_rows_are_written_a_run_a_step: no `hg` here");
+    return;
+  };
+  let mut store = store();
+  let mut imported = import(&mut dot, &mut store, Admission::new(1 << 26)).unwrap();
+  // Recorded, not asserted (main's question of 17:57): whether the size-tiered rule would merge the import's runs.
+  eprintln!(
+    "index runs: before seal_all {} runs, tiered due {:?}, compaction due {:?}",
+    imported.index.rows().run_tables().len(),
+    imported.index.rows().tiered_due(),
+    imported.index.rows().compaction_due(&store)
+  );
+  imported.index.rows().seal_all(&mut store).unwrap();
+  let revisions = u64::try_from(
+    [Log::Changelog, Log::Manifest]
+      .iter()
+      .map(|log| imported.index.len(&store, *log))
+      .chain(
+        imported
+          .index
+          .file_logs(&store)
+          .map(|path| imported.index.len(&store, Log::File(path))),
+      )
+      .map(u64::from)
+      .sum::<u64>(),
+  )
+  .unwrap();
+  let mut streaming = crate::render::Streaming::default();
+  streaming.set_step_bytes(STEP_BYTES);
+  let mut source = whole_texts(&imported.index, &store);
+  let mut out = Vec::new();
+  loop {
+    crate::render::answer_want(&mut streaming, &mut source).unwrap();
+    if !streaming
+      .step(&imported.index, &store, &mut room(), &mut out)
+      .unwrap()
+    {
+      break;
+    }
+  }
+  let tally = streaming.take_tally();
+  eprintln!(
+    "index runs: {revisions} revisions over {} runs; {tally:?}",
+    imported.index.rows().run_tables().len()
+  );
+  assert!(revisions > 600, "a long history: {revisions} revisions");
+  assert!(
+    tally.index.steps * 2 < revisions,
+    "index rows a run a step: {} steps for {revisions} revisions",
+    tally.index.steps
+  );
+  assert!(
+    tally.index.reads <= revisions,
+    "at most a read a revision: {} reads for {revisions} revisions",
+    tally.index.reads
+  );
+}
+
 /// Goal 93, hg's whole-history gap (main 01a20182's ruling of 2026-11-27 16:23): a stream's steps and the content
 /// store's reads, counted by stage (`render::StageTally`). Do: with each of `fixtures/state`'s repositories imported and
 /// its secret roots dropped, stream it a step at a time to its end in one room, then take the tally. Expect every step
-/// counted once in some stage; the count walk and the index rows a step a revision each, so as many count steps as index
-/// steps, both some; and every content store read made inside a step counted in its stage (`ContentStore::reads`, which
+/// counted once in some stage; the count walk a step a revision, and the index rows no more steps (a run a step since
+/// the cut after these counts); and every content store read made inside a step counted in its stage (`ContentStore::reads`, which
 /// counts contents and windows, not an index's rows; here the chunks come from the test's texts, so none). What the
 /// tally is for: the per-revision cost of each walk, which the cuts after it bound.
 #[test]
@@ -1600,9 +1751,9 @@ fn a_streams_steps_and_reads_are_counted_by_stage() {
     eprintln!("{name}: {steps} steps; {tally:?}");
     assert_eq!(counted, steps, "{name}: every step counted once");
     assert!(tally.count.steps > 0, "{name}: the count walk counted");
-    assert_eq!(
-      tally.count.steps, tally.index.steps,
-      "{name}: a count step and an index step a revision"
+    assert!(
+      tally.index.steps > 0 && tally.index.steps <= tally.count.steps,
+      "{name}: the index rows a run a step, never more steps than the count: {tally:?}"
     );
     assert_eq!(
       tally.count.reads + tally.index.reads + tally.data.reads + tally.other.reads,
