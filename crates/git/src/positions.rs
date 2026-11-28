@@ -22,6 +22,49 @@
 
 use std::borrow::Cow;
 
+/// A set made a position at a time, the positions given ascending, each once (a part's record made a placed entry a
+/// unit, the encode keep's slice; CLAUDE.md §3): its runs and its list kept as they grow, each push O(1), so the set is
+/// taken in whichever of the two costs less with no pass over its positions ([`Ascending::finish`]). The bit table is
+/// not offered: choosing it is a pass over the span, and the cheaper of runs and list never costs more than eight bytes
+/// a position (module docs).
+#[derive(Clone, Debug, Default)]
+pub struct Ascending {
+  runs: Vec<(u64, u64)>,
+  list: Vec<u64>,
+}
+
+impl Ascending {
+  /// Adds `position`, past every position added before; one at or before the last is passed over, so the set stays
+  /// ascending and each position once.
+  pub fn push(&mut self, position: u64) {
+    if self.list.last().is_some_and(|last| position <= *last) {
+      return;
+    }
+    self.list.push(position);
+    match self.runs.last_mut() {
+      Some((_, end)) if *end == position => *end = position.saturating_add(1),
+      _ => self.runs.push((position, position.saturating_add(1))),
+    }
+  }
+
+  /// The runs the positions make.
+  pub fn runs(&self) -> usize {
+    self.runs.len()
+  }
+
+  /// The set, in the cheaper of its runs and its list (runs where they tie, as [`Positions::of`] settles them).
+  pub fn finish(self) -> Positions {
+    let runs = RUN_BYTES.saturating_mul(crate::to_u64(self.runs.len()));
+    let list = WORD_BYTES.saturating_mul(crate::to_u64(self.list.len()));
+    let form = if runs <= list {
+      Form::Runs(self.runs)
+    } else {
+      Form::List(self.list)
+    };
+    Positions { form }
+  }
+}
+
 /// A set of positions in its cheapest form (module docs).
 #[derive(Clone, Debug, Default)]
 pub struct Positions {

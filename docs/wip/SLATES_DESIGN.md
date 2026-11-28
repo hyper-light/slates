@@ -15259,7 +15259,9 @@ Status (2026-11-27, the gathering's read charge): a step's gathering charges a r
 lines it moves (a table lent in place: its frame, its offsets' search, the store's lookups), not a content window, and
 walks the log rows on past each log into the next with no search; a range walk opens a run's table only once its keys
 reach it. At the server's 256 KiB window and a 94,797-byte step, 27 index steps for 1,200 revisions, where a read's
-window charge had made it a step a row. Owed: a row's measured cost (84.5 ns, against 180 B charged).
+window charge had made it a step a row. A row is charged the shard's learned cost of one (§4.17.1's rule, the
+gathering's own steps timed on the shard's clock, as bytes at the copy rate), so a step takes about its slice: p50 1.3
+to 2.5 µs against a 2.4 µs slice once learned, from 11.8 µs with a row charged its held form.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
@@ -61657,6 +61659,29 @@ Applied in the same change to:
   - `confined_spawn`'s `a_child_holds_only_the_streams_its_spawn_names`: a descriptor with close-on-exec cleared is
     not held by the child (macOS).
   - `a_failing_test_lets_its_hook_view_go_before_its_daemon` (CI only): the guard's order under a deliberate failure.
+
+### The encode keep's slice — a version's parts are recorded a placed entry a unit (2026-11-28, w-git; main 01a20182's ruling of 00:33; GAPS' owed "slicing the encode poll"; A-718, A-856)
+- **Why.** CLAUDE.md §3 (bounded work). The 11-20 spin site is gone (`settle_encodings`, deleted in 262d21ff5; today's
+  turn is paced, A-783, and each stage's unit sized within the quantum, A-718), but the encoding's last unit was whole.
+  Once a version's parts were put, `Repository::keep_version` (and `keep_base`) made each part's record in one call
+  (`keep`): every placed entry sorted into position order (`position_order`), the part's position and reference sets
+  made, and every entry counted (`count_entries`, again at the install). That is O(the version's objects) in one unit,
+  and git/git v2.0.0's first version is its whole history. Counted `EncodingCounters::most_entries_a_unit`: 152 of a
+  300-file version's entries in one unit, 454 of a base pack's.
+- **Change.** The Keep stage, its parts put, goes on to `Stage::Record`: each part's `Keeping` takes in a placed entry a
+  unit (its position into a position-ordered map, a reference delta's base into a set, its kind counted), then reads the
+  map out a position a unit into the part's order and its position set, then the bases into its references. The sets are
+  made ascending (`positions::Ascending`), so each is taken in the cheaper of its runs and its list with no pass over
+  it; the bit table is not offered there, and the cheaper of the two never costs more than eight bytes a position. The
+  install then charges by the green's difference (A-722 part 4h) and adds the entries' counts once it succeeds. What a
+  record holds while it is made is charged (`Keeping::held_bytes`, A-856), and a refused record gives both parts'
+  content back.
+- **Tests.** `slates-git` `store::tests::encoding`: every unit of a version's and a base pack's encoding takes one
+  placed entry at most (`one_unit`, red 152 and 454), and their fragments are the one-pass encoding's byte for byte;
+  `slates-git --lib -- store::` 141 passed, 4 ignored.
+- **Owed.** The encoding's start: `Encoding::fragments` reads the version's D(k) whole (`Repository::unencoded`), its
+  own piece. Main's run: git/git v2.0.0's push encoded under load, the watchdog's spinning lines and
+  `vcs_store.git_encode.units_past_budget` by stage (run-requests.md, 2026-11-28).
 
 ### A-859 — A git object received in a pack is sent on as its entry lies there: git's pack reuse (bug, 2026-11-22, w-git for UI goal 93; main 01a20182's ruling of 03:38 PST; part B; §4.17.2 items 4 and "A fetch", A-639, A-718, A-722)
 Applied in the same change to:

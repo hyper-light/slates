@@ -5291,10 +5291,16 @@
 > `a_streams_gathering_spends_each_step_and_reads_a_table_once` (no step its budget ends ends early; no table read twice
 > in a step): on the 1,200-revision stock history at the server's layout, 27 index steps and 52 reads, from 1,221 and
 > 3,755; on the tests' 4 KiB, 55-run layout at 1 MiB, 100 reads, from 971.
-> OPEN (w-interop, main's ruling of 23:39: the very next piece): the row's cost. Measured in release on the MacBook
-> (load 22 to 45): gathering steps its budget ended took 17,666 ns at the median and 36,125 at most, 84.5 ns a row,
-> against a slice of 1,660 ns (94,797 B at 57.1 GB/s): about ten times past it, since a row is charged its held form's
-> 180 B (about 3 ns). Next, a per-shard learned cost a row from the stream's own steps (§4.17.1's learned-tunable rule).
+> The row's cost, BUILT (2026-11-28, w-interop; main's ruling of 2026-11-27 23:39). Measured before, in release on the
+> MacBook: gathering steps its budget ended took 17,666 ns at the median, 84.5 ns a row, against a 1,660 ns slice, a row
+> charged its held form's 180 B. Now a row is charged the shard's learned cost (`render::RowCost`, §4.17.1's rule:
+> the gathering steps' time over their rows on the shard's clock, as bytes at the copy rate; bounds the held form and a
+> step; first value the cache lines a row moves), and a step judges each row before it. Held by
+> `a_streams_gathering_steps_are_held_to_their_slice_at_the_learned_row_cost` (red: 16,156 ns against 1,660). Measured
+> after, the cost learned online over 8 streams (release, load 15 to 37, slice 2,428 ns at 39.0 GB/s): p50 1,250 to
+> 2,500 ns and p90 2,000 to 3,791 ns once learned; the first stream, at the derived first value (640 B, about ten
+> times low), p50 11,792 ns. Owed: the first value's derivation undercounts a row's work about ten times, so a shard's
+> first stream runs past its slices until its first step is measured.
 > OPEN, on the index's run merge: an index of many unmerged runs makes every restart costly. On the tests' 4 KiB layout
 > (55 runs, each one table holding a slice of every log) at a 94,797-byte step, 999 index steps and 31,888 reads for
 > 1,200 revisions: a restart opens about 32 tables, about 4.2 KB each, more than a step, so a step moves one row. The
@@ -8119,12 +8125,17 @@
 > the control shard held alone by busy work for the old budget at this build's cost and a window more; Adas-Mac-Studio-4,
 > base cdfbb4020: busy 31.8 s and the watch still waiting after it, ending at its reason at 32.3 s; with the change
 > reversed, the wait ended at 31.4 s while the shard was busy for 32.2 s, the refusal the daemon stopped on). Owed (w-k90-vendor):
-> slicing the encode poll (`git_encode.rs:345`). The same hazard in every other default observation since 2026-11-20
-> (g226, main's ruling): `Daemon::observe` had the observe budget, ten liveness windows, and a shard that stepped busy
-> past that budget's CPU without reaching the question refused it; a default observation now waits while its shard
-> lives (`Observation::patient`, looked at every liveness window, ended only by the shard's going; A-232's rule), and its
-> watchdog ends a stuck one (`a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs`, base 26e125adb:
-> the control shard held alone 31.6 s, answered after it; with the change reversed, refused at 31.9 s mid-work; and
+> slicing the encode poll (`git_encode.rs:345`).
+> Taken by w-git (2026-11-28, main's ruling of 00:33): that spin's site, `settle_encodings`, was deleted in 262d21ff5
+> and the turn is paced (A-783); the encoding's last whole unit, its parts' records, is sliced a placed entry a unit
+> ("The encode keep's slice", 152 and 454 entries in one unit before). Owed: the encoding's start (`Encoding::fragments`
+> reading D(k) whole); main's v2.0.0 run under load (run-requests.md). The same hazard in every other default
+> observation since 2026-11-20 (g226, main's ruling): `Daemon::observe` had the observe budget, ten liveness windows,
+> and a shard that stepped busy past that budget's CPU without reaching the question refused it; a default observation
+> now waits while its shard lives (`Observation::patient`, looked at every liveness window, ended only by the shard's
+> going; A-232's rule), and its watchdog ends a stuck one
+> (`a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs`, base 26e125adb: the control shard held
+> alone 31.6 s, answered after it; with the change reversed, refused at 31.9 s mid-work; and
 > `a_patient_wait_goes_on_while_the_shard_lives_and_ends_at_its_going`). Owed (R3): `OBSERVE_BUDGET_NS` still caps the
 > watchdog's window (`WINDOW_CEILING_NS`), the anchor's lapse bound and `live_ship`'s key wait, and bounds the daemon's
 > test-support waits (an explicit observation's budget is its asker's).

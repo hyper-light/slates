@@ -214,6 +214,7 @@ fn slice(state: &mut ShardState, id: RepositoryId, generation: u64, walk: &mut R
         .mercurial(id)
         .map(|(content, store)| walk.keep_counted(&mut store.index, content))
     });
+    super::hg_view::gathering_noted(state, walk.take_tally().gathered);
     match (stepped, kept) {
       (Some(Ok(true)), Some(Ok(_))) => {}
       (Some(Ok(false)), Some(Ok(_))) => {
