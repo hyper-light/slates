@@ -58324,6 +58324,16 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
     tree and a change-index entry above it reads as its twin at every version up to the head, every dimension, the
     changed paths, the change walk and a probe verdict of every kind at the head and the version before; before, the
     walk named the version above the head and the probes conflicted against the copy above it.
+  - **U1, the head moves at the publish, last; the mode history appended in place.** The commit pushed its version's
+    delta, which is what moves the head (`Green::head`), at the end of its emptied phase, before its links and change
+    index were recorded and before its increment was accepted; both now happen at the publish (`Green::publish_run`),
+    last, for every commit (whole, a unit a step, a replay's apply). A staged verdict (`engine::staging`:
+    `Green::{begin_staging, staging_step, publish, abandon_staging}`) runs the commit's steps without the publish;
+    the mode history is appended in place, where each path's history stood before the stage's first touch is marked
+    (`staging::Marks`), and a refusal truncates it there. Red first (`engine::publish_tests`): between every two of a
+    staged verdict's steps the head and every mode read up to it read as before (red: a reader saw the stage at unit
+    12, the head moved), and a stage given up after any turn leaves the mode history, the head and the accepted
+    increments exactly as they were (red: given up after 12 turns, the mode history kept the stage's entries).
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;

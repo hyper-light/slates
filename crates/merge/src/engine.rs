@@ -1523,6 +1523,9 @@ pub struct Green {
   /// Rejected results evicted or never retained for want of budget — the non-vacuity counter the
   /// bound's regression asserts.
   rejected_evicted: u64,
+  /// While a verdict is staged ([`Green::begin_staging`]), where each history it appends in place stood before its
+  /// first touch, so a refusal takes the stage's entries back (A-752 part 3c U1). None otherwise.
+  stage_marks: Option<Box<staging::Marks>>,
   history_current: usize,
   /// The bytes the IPC (special node) history retains beyond the current values, a running total: with the content
   /// history's chunks and lists less its current values, [`Green::history_bytes`].
@@ -6484,6 +6487,7 @@ impl Green {
   /// directory's and link's once nothing stands at the path, and a replaced tree's (A-626).
   fn drop_metadata(&mut self, path: &str, version: u64) {
     let owned = path.to_owned();
+    self.mark_mode(path);
     let at = self.seed_of(&self.mode_history, &owned, path, version);
     seed(
       &mut self.mode_history,
@@ -6616,6 +6620,27 @@ impl Green {
   /// Takes `run` on an effect, a staged removal or a staged file at a time, at least one, until `spent` says its caller's
   /// slice is spent: whether it has ended (its delta pushed and its changes recorded). No count of units: a file set
   /// costs many times a removal, so the caller's clock, not a number, ends the slice.
+  /// Publishes an ended commit run of increment `id` (A-752 part 3c U1): its delta pushed, which moves the head to its
+  /// version, and the increment accepted as it, both last, so no reader at the head saw any of it before. Its version.
+  fn publish_run(&mut self, run: &mut CommitRun, id: [u8; 32]) -> u64 {
+    self.deltas.push(core::mem::take(&mut run.delta));
+    self.accepted.insert(id, run.version);
+    run.version
+  }
+
+  /// Notes, while a verdict is staged, where `path`'s mode history stood before the stage first touched it (A-752 part
+  /// 3c U1): what a refusal truncates it back to.
+  fn mark_mode(&mut self, path: &str) {
+    let Some(marks) = self.stage_marks.as_mut() else {
+      return;
+    };
+    if marks.modes.contains_key(path) {
+      return;
+    }
+    let held = self.mode_history.get(path).map(Vec::len);
+    marks.modes.insert(path.to_owned(), held);
+  }
+
   fn commit_step(&mut self, run: &mut CommitRun, spent: &mut dyn FnMut() -> bool) -> bool {
     loop {
       match run.phase {
@@ -6690,10 +6715,8 @@ impl Green {
           self.drop_metadata(&path, run.version);
         }
       }
-      None => {
-        self.deltas.push(core::mem::take(&mut run.delta));
-        run.phase = CommitPhase::Links;
-      }
+      // The version's delta waits for the commit's publish, which moves the head last ([`Green::publish_run`]).
+      None => run.phase = CommitPhase::Links,
     }
   }
 
@@ -6895,6 +6918,7 @@ impl Green {
           .push((version, false));
       }
       Effect::Mode(path, mode) => {
+        self.mark_mode(&path);
         let at = self.seed_of(&self.mode_history, &path, &path, version);
         seed(
           &mut self.mode_history,
@@ -7863,8 +7887,7 @@ impl Green {
     if !self.commit_step(commit, spent) {
       return CommitStep::More;
     }
-    let version = commit.version;
-    self.accepted.insert(run.id, version);
+    let version = self.publish_run(commit, run.id);
     CommitStep::Committed(version, core::mem::take(applied))
   }
 
@@ -8011,8 +8034,7 @@ impl Green {
       return self.apply_effects_step(run, inc, applied, spent);
     };
     if self.commit_step(commit, spent) {
-      let version = commit.version;
-      self.accepted.insert(run.id, version);
+      let version = self.publish_run(commit, run.id);
       ApplyStep::Done(version)
     } else {
       ApplyStep::More
@@ -9794,8 +9816,15 @@ mod copy_restate_tests;
 #[cfg(test)]
 mod head_under_tests;
 
+// A held verdict staged a unit a step and published whole (A-752 part 3c).
+mod staging;
+pub use staging::{Staging, StagingStep};
+
 #[cfg(test)]
 mod head_bound_tests;
+
+#[cfg(test)]
+mod publish_tests;
 
 #[cfg(test)]
 mod tests {
