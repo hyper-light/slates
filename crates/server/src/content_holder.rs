@@ -1375,6 +1375,7 @@ pub(crate) fn note_borrow_held(
   site: &'static std::panic::Location<'static>,
 ) {
   let after = held_now(state);
+  note_held_at_borrow(state, after);
   let freed = after.saturating_sub(before.deferred);
   if freed == 0 {
     return;
@@ -1410,6 +1411,34 @@ pub(crate) fn note_borrow_held(
     );
   }
   state.count_max(IMAGE_HELD_BORROW_MOST, freed);
+}
+
+/// Format: the status counter of the most bytes held for the committed image at a borrow's end
+/// ([`note_held_at_borrow`]).
+pub(crate) const IMAGE_HELD_AT_BORROW_PEAK: &str = "vcs_store.image.held_at_borrow_peak_bytes";
+
+/// `held` bytes held for the committed image at a borrow's end ([`note_borrow_held`]): the most counted
+/// ([`IMAGE_HELD_AT_BORROW_PEAK`]), and at each doubling of it past a copy slice a line with the catch-up's state
+/// (`Encoder::catch_up_reading`) and the time since the encoder last turned. Main's 57k of 2026-11-28, run 1: no drain
+/// ran while held went from about 313 MB to 3.68 GB, so the drain's own line said nothing of why the cut in flight
+/// was not turned; a borrow ends many times a turn. A line a doubling, so at most the bits of a byte count.
+fn note_held_at_borrow(state: &mut ShardState, held: u64) {
+  let peak = state
+    .refusals
+    .get(IMAGE_HELD_AT_BORROW_PEAK)
+    .copied()
+    .unwrap_or(0);
+  if held > peak.saturating_mul(2) && held > state.config.copy_slice_bytes() {
+    let (catching_up, owed, since_begun, turns) = state.image_encoder.catch_up_reading();
+    let idle_ns = slates_rt::futures::now_ns().saturating_sub(state.image_encoder.turned_ns());
+    slates_machine::log_line!(
+      "slates-server: partition {}: {held} bytes held for the committed image at a borrow's end (the most before, \
+       {peak}): a catch-up running {catching_up}, a publication owed {owed}, the cut in flight begun {since_begun:?} \
+       turns ago, {turns} turns run, the last {idle_ns} ns ago",
+      state.partition
+    );
+  }
+  state.count_max(IMAGE_HELD_AT_BORROW_PEAK, held);
 }
 
 /// The shard's content arena as a borrow of its state begins ([`note_borrow_held`]): its held frees, and what tells
@@ -1722,6 +1751,7 @@ pub(crate) fn image_turn(state: &mut ShardState) -> crate::image_pages::Turned {
     ),
     &mut encoded,
   );
+  encoder.note_turned(slates_rt::futures::now_ns());
   state.image_encoder = encoder;
   for (family, page) in encoded {
     cut_page_frozen(state, family, (page.start, page.last()), false);

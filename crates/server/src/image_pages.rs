@@ -726,6 +726,8 @@ pub(crate) struct Encoder {
   turns: u64,
   /// Whether a task is encoding on to publish once caught up (`content_holder::image_catch_up`).
   catching_up: bool,
+  /// When the encoder last turned, on the host's monotonic clock ([`Encoder::note_turned`]): the catch-up's reading.
+  turned_ns: u64,
   /// The tasks whose elective changes wait while paused ([`Encoder::paused`]), each once (`Waker::will_wake`), woken by
   /// the publication that carries the cut ([`Encoder::committed`]). Bound: the let-go tasks live on the shard (a landed
   /// pack's queue, one; a committed hg run's or import's, one each).
@@ -762,6 +764,8 @@ struct Cut {
   marked: BTreeMap<(Family, Page), Marked>,
   /// Its generation in homes' tickets.
   generation: u64,
+  /// The encoder's turns as it began ([`Encoder::catch_up_reading`]).
+  begun_at: u64,
   /// Test support (F2's oracle): its pages at its moment, which bound its pre-images.
   #[cfg(test)]
   frozen: Vec<(Family, Page)>,
@@ -995,6 +999,7 @@ impl Encoder {
       remaining,
       marked: core::mem::take(&mut self.dirty_marks),
       generation,
+      begun_at: self.turns,
       #[cfg(test)]
       frozen: pages.clone(),
     });
@@ -1004,6 +1009,30 @@ impl Encoder {
   /// Whether a cut is in flight: begun, its publication not yet committed.
   pub(crate) fn cut_is_in_flight(&self) -> bool {
     self.cut.is_some()
+  }
+
+  /// Notes a turn at `now_ns` on the host's monotonic clock (`content_holder::image_turn`).
+  pub(crate) fn note_turned(&mut self, now_ns: u64) {
+    self.turned_ns = now_ns;
+  }
+
+  /// When the encoder last turned ([`Encoder::note_turned`]), none before its first.
+  pub(crate) fn turned_ns(&self) -> u64 {
+    self.turned_ns
+  }
+
+  /// The catch-up's state, for the held frees' reading (`content_holder::note_held_at_borrow`): whether a task encodes
+  /// on, whether a publication is owed, the turns since the cut in flight began (none without one), and the turns run.
+  pub(crate) fn catch_up_reading(&self) -> (bool, bool, Option<u64>, u64) {
+    (
+      self.catching_up,
+      self.owed.is_some(),
+      self
+        .cut
+        .as_ref()
+        .map(|cut| self.turns.saturating_sub(cut.begun_at)),
+      self.turns,
+    )
   }
 
   /// Test support (F2's oracle): the cut in flight's generation and its pages at its moment.
@@ -2320,6 +2349,47 @@ mod tests {
       RISING_HELD.ilog2() + 1,
       "one look a doubling of the held frees"
     );
+  }
+
+  /// Item 2's reading of main's 57k of 2026-11-28 (run 1: a cut in flight nothing turned while 3.68 GB were held). Do:
+  /// read a fresh encoder's catch-up state; mark a page, ask for a cut and begin it, note a catch-up task and an owed
+  /// publication, and read it again. Expect: nothing running, nothing owed, no cut in flight at first; then a catch-up
+  /// running, a publication owed, and the cut begun no turns ago.
+  #[test]
+  fn the_catch_up_reading_names_the_cut_in_flight_and_its_task() {
+    let mut encoder = Encoder::default();
+    assert_eq!(encoder.catch_up_reading(), (false, false, None, 0));
+    encoder.mark(Family::Windows, [7u64]);
+    encoder.ask();
+    assert!(encoder.begin(1).is_some(), "a cut begun");
+    assert!(encoder.start_catching_up(), "a catch-up noted");
+    let _lag = encoder.skipped();
+    assert_eq!(encoder.catch_up_reading(), (true, true, Some(0), 0));
+  }
+
+  /// The held frees at a borrow's end counted (`content_holder::note_held_at_borrow`, item 2's reading). Do: on a
+  /// shard, put objects and publish them, so a committed image names their windows; read the shard's arena as a borrow
+  /// begins; let the objects go, so their frees are held; then close the borrow's reading
+  /// (`content_holder::note_borrow_held`). Expect: frees held, and the most held at a borrow's end counted at them.
+  #[test]
+  fn a_borrows_end_counts_the_frees_held_then() {
+    let (held, counted) = crate::daemon::audit_on_shard(|state| {
+      let ids = put_objects(state, (0, 64));
+      state.image_encoder.ask();
+      while !crate::content_holder::image_turn(state).caught_up {}
+      crate::verbs::publish_shard(state).unwrap();
+      let before = crate::content_holder::BorrowArena::read(state);
+      let_go(state, &ids);
+      crate::content_holder::note_borrow_held(state, before, std::panic::Location::caller());
+      let counted = state
+        .refusals
+        .get(crate::content_holder::IMAGE_HELD_AT_BORROW_PEAK)
+        .copied()
+        .unwrap_or(0);
+      (crate::content_holder::held_now(state), counted)
+    });
+    assert!(held > 0, "the let-go's frees held");
+    assert_eq!(counted, held, "the most held at a borrow's end counted");
   }
 
   /// [`a_landed_segments_give_back_frees_at_most_a_copy_slice_a_borrow`]'s scene on a shard: one object of
