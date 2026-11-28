@@ -1226,9 +1226,12 @@
 > off its CPU while the process footprint fell 40.1 MB, the steps pages were returned in held all of a run's off-CPU
 > time (1.7-2.5 ms), and a run with no return during a landing step spent at most 18 µs off its CPU although 1,218 steps
 > met the reaper dropping. So it is the page return, not the reaper's drops, and neither slicing the reaper's drops
-> (measured: 804-2,442 µs, no better) nor dropping on the shard can split one return. The wide copy test holds
-> `LANDING_OFF_CPU_MOST_NS` to 84a's 1 ms bar and fails where a return stalls a step (2 of 4 debug runs; another run's
-> 8 return steps, 71 MB, stalled none, at most 22 µs off its CPU, so the stall is intermittent): the red the arena piece turns
+> (measured: 804-2,442 µs, no better) nor dropping on the shard can split one return. The footprint is the process's,
+> so the page-return reading is process-wide: in a suite, other tests' frees count against a step (w-git's 22:10 run,
+> 273 tests in one process: a prepare step 39.7 ms off its CPU while the footprint fell 376 MB), and an in-suite figure
+> is not this test's. The wide copy test prints `LANDING_OFF_CPU_MOST_NS` (its `OFFCPU` line); its 1 ms assert is out
+> until the fix lands with it (main's ruling of 2026-11-27 22:16 reversed 20:31's: a red lands with its fix), as it
+> failed where a return stalled a step (2 of 4 debug runs; another run's 8 return steps, 71 MB, stalled none): the red the arena piece turns
 > green (the landing's structures in the shard's arena, so a free never hands pages back mid-step). Unexplained, logged,
 > not attributed: one run's 5,025 µs in a step whose footprint did not fall.
 
