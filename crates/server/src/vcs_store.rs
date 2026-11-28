@@ -1741,6 +1741,11 @@ impl VcsStores {
     Ok(())
   }
 
+  /// Whether the shard's chunk store is lent to the content store now ([`Lent`]): inside a step's lend.
+  pub(crate) fn chunks_lent(&self) -> bool {
+    self.chunks_lent
+  }
+
   /// Lends `chunks` to the content store's windows, or to the storage a content store not made yet will keep them in,
   /// so a store made inside the step finds it lent (`Lent`): whether it took them.
   fn lend_in(&mut self, chunks: &mut slates_vfs::content::ChunkStore) -> bool {

@@ -2687,6 +2687,182 @@ mod tests {
     })
   }
 
+  /// Shape: the starved scene's borrows, each letting go one batch of granule objects and putting the next: far past
+  /// what the bound lets a cut hold, so the red holds every batch.
+  const STARVED_BORROWS: usize = 64;
+  /// Shape: the granule objects a starved borrow lets go.
+  const STARVED_BATCH: usize = 8;
+  /// Shape: the starved scene's page: small, so the cut in flight has many pages left.
+  const STARVED_PAGE: usize = 512;
+
+  /// Puts `count` objects of one granule each, numbered from `from`: a chunk each, so each let-go frees one.
+  fn granule_objects(
+    state: &mut crate::state::ShardState,
+    (from, count): (usize, usize),
+  ) -> Vec<slates_vcs::ContentId> {
+    let window = state.store.content.chunk_bytes();
+    state.vcs_stores.content_made(window).unwrap();
+    let granule = state.store.content.arena().granule();
+    let need = u64::try_from(count * granule).unwrap();
+    crate::vcs_store::within_budget(state, need, |stores| {
+      let content = stores.content_mut().unwrap();
+      (from..from + count)
+        .map(|at| {
+          let mut text =
+            format!("a chunk's text freed while its cut is starved, number {at}\n").into_bytes();
+          text.resize(granule, b's');
+          content.put_object(&text).unwrap()
+        })
+        .collect()
+    })
+  }
+
+  /// Item 2's bound (CLAUDE.md section 2 item 8; main's 57k of 2026-11-28, run 1 at load 82-91: one cut in flight and
+  /// nothing turning it, 3.68 GB held outside the arena while the push let go 4,553,787,722 B). A cut's held frees were
+  /// bounded in turns (a turn's frees times the turns it lasts), and the pause's lag counted in turns too, which bound
+  /// nothing in time when no turn runs. Do: on a shard whose pages are small, put and carry [`ENTRIES`] objects, let
+  /// every other go and publish, so a cut of many pages is in flight; read what it has left to encode; then run
+  /// [`STARVED_BORROWS`] borrows, each putting a batch of granule objects and letting the last batch go, each closed as
+  /// a borrow of the shard's state closes (`content_holder::borrow_closed`), and never run the catch-up task: inside
+  /// one closure the shard's other tasks never run, the most a loaded shard can starve them. Expect: the frees held at
+  /// every borrow's end at most twice the cut's cost, twice a batch's bytes and a copy slice, whatever the borrows'
+  /// count, and the cut that was in flight committed. Failing first: held grows by a batch a borrow, the cut never
+  /// ending.
+  #[test]
+  fn a_cut_starved_of_its_catch_up_holds_its_frees_within_its_cost() {
+    let (most, bound, ended) = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(STARVED_PAGE));
+      let outcome = starved_scene(state);
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      outcome
+    });
+    println!(
+      "held at most {most} bytes at a borrow's end against {bound}; the cut in flight ended {ended}"
+    );
+    assert!(
+      ended,
+      "the cut in flight never committed while its catch-up was starved ({most} bytes held, the bound {bound})"
+    );
+    assert!(
+      most <= bound,
+      "{most} bytes held at a borrow's end while the catch-up was starved, past {bound}"
+    );
+  }
+
+  /// Shape: the granule objects the lent step lets go: past twice what the starved cut has left, so one slice ends it.
+  const LENT_STEP_OBJECTS: usize = 256;
+
+  /// Item 2's bound across a lend (main 02:14: the slice skipped while the shard's chunk store is lent, since a
+  /// publication reads the shard's own store, a placeholder then). Do: on a shard whose pages are small, a cut of many
+  /// pages in flight; inside one `vcs_store::lent_state` step, let [`LENT_STEP_OBJECTS`] granule objects go and close a
+  /// borrow there (`content_holder::borrow_closed`); then close the outer borrow. Expect: nothing paid inside the lend,
+  /// the cut still in flight there; the outer borrow's end paying for it, the cut ended, and the frees held after it
+  /// within twice the cut's cost, the step's frees and a copy slice.
+  #[test]
+  fn a_lent_steps_frees_are_paid_at_its_outer_borrows_end() {
+    let (inside, outside, (held, bound)) = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(STARVED_PAGE));
+      let outcome = lent_step_scene(state);
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      outcome
+    });
+    assert_eq!(
+      inside,
+      (0, false),
+      "nothing paid inside the lend, the cut still in flight"
+    );
+    assert!(
+      outside.0 > 0 && outside.1,
+      "the outer borrow's end paid, the cut ended: {outside:?}"
+    );
+    assert!(
+      held <= bound,
+      "{held} bytes held after the outer borrow's end, past {bound}"
+    );
+  }
+
+  /// [`a_lent_steps_frees_are_paid_at_its_outer_borrows_end`]'s scene: the slices paid and whether the cut ended, inside
+  /// the lend and after the outer borrow's end; the frees held then, and their bound.
+  fn lent_step_scene(
+    state: &mut crate::state::ShardState,
+  ) -> ((u64, bool), (u64, bool), (u64, u64)) {
+    let begun = starved_cut(state);
+    let cost = state
+      .image_encoder
+      .in_flight_left(u64::try_from(STARVED_PAGE).unwrap());
+    let objects = granule_objects(state, (ENTRIES, LENT_STEP_OBJECTS));
+    let granule = state.store.content.arena().granule();
+    let freed = u64::try_from(granule * LENT_STEP_OBJECTS).unwrap();
+    let bound = 2 * cost + freed + state.config.copy_slice_bytes();
+    let read = |state: &crate::state::ShardState| {
+      let paid = state
+        .refusals
+        .get(crate::content_holder::IMAGE_CUT_PAID_SLICES)
+        .copied()
+        .unwrap_or(0);
+      let now = state
+        .image_encoder
+        .cut_in_flight()
+        .map(|(generation, _)| generation);
+      (paid, begun.is_some() && now != begun)
+    };
+    let inside = crate::vcs_store::lent_state(state, |state| {
+      let_go(state, &objects);
+      crate::content_holder::borrow_closed(state);
+      read(state)
+    });
+    crate::content_holder::borrow_closed(state);
+    (
+      inside,
+      read(state),
+      (crate::content_holder::held_now(state), bound),
+    )
+  }
+
+  /// [`a_cut_starved_of_its_catch_up_holds_its_frees_within_its_cost`]'s cut in flight: objects put and carried, every
+  /// other one let go and published. Its generation.
+  fn starved_cut(state: &mut crate::state::ShardState) -> Option<u64> {
+    let ids = put_objects(state, (0, ENTRIES));
+    state.image_encoder.ask();
+    while !crate::content_holder::image_turn(state).caught_up {}
+    state.image_encoder.ask();
+    crate::verbs::publish_shard(state).unwrap();
+    let every_other: Vec<slates_vcs::ContentId> = ids.iter().step_by(2).copied().collect();
+    let_go(state, &every_other);
+    state.image_encoder.ask();
+    crate::verbs::publish_shard(state).unwrap();
+    state
+      .image_encoder
+      .cut_in_flight()
+      .map(|(generation, _)| generation)
+  }
+
+  /// The starved scene: the most held at a borrow's end, the bound, and whether the cut in flight at its start ended.
+  fn starved_scene(state: &mut crate::state::ShardState) -> (u64, u64, bool) {
+    let begun = starved_cut(state);
+    let cost = state
+      .image_encoder
+      .in_flight_left(u64::try_from(STARVED_PAGE).unwrap());
+    let granule = state.store.content.arena().granule();
+    let batch_bytes = u64::try_from(granule * STARVED_BATCH).unwrap();
+    let bound = 2 * cost + 2 * batch_bytes + state.config.copy_slice_bytes();
+    let mut kept = granule_objects(state, (ENTRIES, STARVED_BATCH));
+    crate::content_holder::borrow_closed(state);
+    let mut most = 0u64;
+    for at in 1..=STARVED_BORROWS {
+      let next = granule_objects(state, (ENTRIES + at * STARVED_BATCH, STARVED_BATCH));
+      let_go(state, &kept);
+      crate::content_holder::borrow_closed(state);
+      kept = next;
+      most = most.max(crate::content_holder::held_now(state));
+    }
+    let now = state
+      .image_encoder
+      .cut_in_flight()
+      .map(|(generation, _)| generation);
+    (most, bound, begun.is_some() && now != begun)
+  }
+
   /// Shape: the batches [`a_stretched_cut`] can release, past the wakes its cut lasts at a copy slice each.
   const STRETCHED_BATCHES: usize = 16;
 

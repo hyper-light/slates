@@ -1797,6 +1797,8 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
     let held_before = crate::content_holder::BorrowArena::read(state);
     let result = f(state);
     crate::content_holder::note_borrow_held(state, held_before, site);
+    // A cut whose held frees passed what it has left is paid for by the borrow that freed past it (item 2's bound).
+    crate::content_holder::borrow_closed(state);
     // A deadline the borrow set before the one the shard's keeper sleeps for wakes it, whichever path set it (A-536).
     crate::deadlines::after_borrow(state);
     // A volume owed a hint drain whose host a landing gave back wakes the hint watcher (A-709).

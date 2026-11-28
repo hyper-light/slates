@@ -1226,6 +1226,34 @@ async fn image_catch_up() {
   }
 }
 
+/// Format: the status counter of catch-up slices a closing borrow ran because the frees held for the cut in flight had
+/// passed what it had left to encode ([`borrow_closed`]).
+pub(crate) const IMAGE_CUT_PAID_SLICES: &str = "vcs_store.image.cut_paid_slices";
+
+/// A borrow of the shard's state closed (`state::try_with_state`): where a cut is in flight and the frees held for it
+/// have passed what it has left to encode, the step that freed past it pays for the cut here, one catch-up slice
+/// ([`image_catch_up_slice`]: the larger of a copy slice and that excess), counted ([`IMAGE_CUT_PAID_SLICES`]). The
+/// slice ends the cut, its publication with it, once the held frees reach twice what it has left. So the frees held
+/// for a cut stay within twice its cost and one borrow's frees, whatever time the scheduler gives the catch-up task
+/// (CLAUDE.md section 2 item 8; main's 57k of 2026-11-28, run 1 at load 82-91: 3.68 GB held for one cut nothing
+/// turned, since both the held frees' bound and the pause's lag were counted in turns). At a borrow's end, as the
+/// catch-up task's own slices run, never inside a step; and not inside a lend, since a publication reads the shard's
+/// own chunk store, a placeholder then.
+pub(crate) fn borrow_closed(state: &mut ShardState) {
+  if !state.image_encoder.cut_is_in_flight() || state.vcs_stores.chunks_lent() {
+    return;
+  }
+  let held = held_now(state);
+  let left = state
+    .image_encoder
+    .in_flight_left(u64::try_from(page_bytes(state)).unwrap_or(u64::MAX));
+  if held <= left {
+    return;
+  }
+  state.count(IMAGE_CUT_PAID_SLICES, 1);
+  let _ended = image_catch_up_slice(state);
+}
+
 /// One wake of the catch-up ([`image_catch_up`]): its steps until it ends or a copy slice's bytes are spent
 /// (`DaemonConfig::copy_slice_bytes`: the measured memcpy rate times half the step quantum, the share copy-bound work
 /// takes of a step). A turn spends the paged families' page size, which a test sets far below the slice, so the slice,
