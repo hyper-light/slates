@@ -599,8 +599,11 @@
 >     it re-keyed a (a refuted at incarnation 1 once keyed). A peer now holds a's probes unjudged from learning of its
 >     new process until the re-key's install or one detection (`fleet.plane.rekey_*`), a local change to vendored
 >     hyper-swim (`Detector::hold_judging`, vendor README item 4). Bound: a process that dies just after its restart
->     is condemned within one detection plus `detection_bound`. **Owed:** proposed to hyper-raft's owner as a feature
->     gate (through Ada); main reruns winfleet on both Windows lanes.
+>     is condemned within one detection plus `detection_bound`. Measured (winfleet-7, GitHub run 46129937528, main
+>     6be709db6, 16 runs a test a lane): windows-11-arm 32 of 32, answers-its-peers 16 of 16 (11 and 9 of 16 in
+>     winfleet-5 and -6) and the warm-restart volume test 16 of 16; windows-latest 32 of 32; the logs carry 368 and
+>     341 rekey lines, the window running on both lanes. **Owed:** proposed to hyper-raft's owner as a feature gate
+>     (through Ada).
 >   - **FIXED, v3_takeover's adoption stall (A-933, w-shared, 2026-11-27):** about 1 run in 80 on Linux CI, a
 >     successor gave a taken-over green up "waiting on its adoption". Its rebuild could reach neither the record
 >     adoption (A-364: it checked the adopted record alone, so a successor short of version 0 never became
@@ -5292,8 +5295,25 @@
 > `a_streams_gathering_steps_are_held_to_their_slice_at_the_learned_row_cost` (red: 16,156 ns against 1,660). Measured
 > after, the cost learned online over 8 streams (release, load 15 to 37, slice 2,428 ns at 39.0 GB/s): p50 1,250 to
 > 2,500 ns and p90 2,000 to 3,791 ns once learned; the first stream, at the derived first value (640 B, about ten
-> times low), p50 11,792 ns. Owed: the first value's derivation undercounts a row's work about ten times, so a shard's
-> first stream runs past its slices until its first step is measured.
+> times low), p50 11,792 ns. Then the first value, BUILT (2026-11-28, w-interop; main's ruling of 00:46: a measured
+> gap, fixed now): measured at the start beside the memcpy rate (`config::hg_gather_row_ns`, the boot probe's history
+> gathered whole, `slates_hg::gather_probe`, noted in the boot profile with its inputs), no longer derived from a row's
+> cache lines. The probe gathers its history as a shard's streams do, in steps of the copy slice over a few rounds,
+> each at what the one before measured, and keeps the last round's (a walk of the whole history in one go missed the
+> walks' restart a step pays). Held by `a_shards_first_gathering_steps_are_held_to_their_slice_at_the_probes_first_cost`
+> (hg), `t_first_cost_a_fresh_daemons_first_stream_is_held_to_its_slice` (a fresh daemon's first stream, its median
+> gathering step) and `the_boot_profile_measures_a_gathered_rows_cost_with_its_inputs`. OPEN: one release run before
+> main's 01:19 ruling (the measurement is main's) read the probe at 739 ns a row against about 84 learned online, so a
+> shard's first stream is held to its slices but about a row a step until it learns; main's release run is requested
+> (run-requests.md) to read the probe against the learned cost.
+> OPEN (main's hg round 3 at 47e37df66, 2026-11-28 01:47; the read charge in, the row cost not; record
+> `~/.local/state/main-01a20182/rounds/hg-stream-3/`): the stream clone 4.717 s best against stock's 1.482 (3.18x;
+> stock's own fell 3.046, 2.274, 1.482 s run to run), clone even, push 1.98x, incremental push 12.2x. The count stage is
+> gone and data steps 680, 595, 240 (from 139,403). Two readings, main's, inferred: runs 1 and 2 still took 238,558 and
+> 182,834 index steps (reads 1,331,345 and 1,052,756) against run 3's 10,613 (28,856), so the index's run count right
+> after a push drives the stage (the run merge's timing, below); and the server's own span (0.94 to 1.99 s, store waits
+> 0.49 to 0.63 s) is well under the client's 4.7 to 6.4 s, hg reporting 13 to 18 MB/s from slates against 37 to 77 from
+> stock: the stream's write path (the socket, the write slices, the chunks' sizes sent) is where the wall's time is.
 > OPEN, on the index's run merge: an index of many unmerged runs makes every restart costly. On the tests' 4 KiB layout
 > (55 runs, each one table holding a slice of every log) at a 94,797-byte step, 999 index steps and 31,888 reads for
 > 1,200 revisions: a restart opens about 32 tables, about 4.2 KB each, more than a step, so a step moves one row. The

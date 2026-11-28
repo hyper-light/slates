@@ -444,7 +444,7 @@ fn a_views_manifest_read_is_one_text() {
     &store,
     state,
     (
-      slates_hg::render::StepCopy::derived(u64::MAX, LINE),
+      slates_hg::render::StepCopy::unlearned(u64::MAX, LINE),
       &mut Admission::new(u64::MAX),
     ),
   )
@@ -512,7 +512,7 @@ fn a_views_read_of_a_let_go_manifest_allocates_no_text() {
     &store,
     state,
     (
-      slates_hg::render::StepCopy::derived(u64::MAX, LINE),
+      slates_hg::render::StepCopy::unlearned(u64::MAX, LINE),
       &mut Admission::new(u64::MAX),
     ),
   )
