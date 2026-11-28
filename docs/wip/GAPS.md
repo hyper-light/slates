@@ -373,6 +373,26 @@
 >      candidacy owed"): A-919's open edge, which (C) closes. Rerun after (C) lands.
 >   2. Runs 1 and 16: a green owed at version 2, placed 1, no read past tolerance: FIXED by w-interop (the entry below,
 >      a region read that waited out a dead first home).
+> - **Shape 1 after (C), a test precondition (w-shared, 2026-11-27; main 01a20182's ruling of 15:51).** At 41aa47870
+>   (1 of 11 green; its placed Some(1) reds, "acknowledged []", bisected to 43a8563a2, main's finding of 16:02), run
+>   7's two reads past tolerance came after the
+>   second death, from the candidate the first death brought in: the root green's merge chain (no floor by design, (C)
+>   covers state logs) and the names log above a's floor. §4.8 settles a neighbourhood change once `f + 1` of the new
+>   cohort hold the newest record, the owner among them (`Configuration::placed_on_current`; the owner's own hold,
+>   `cluster/src/lib.rs` ~1040), so a and c settled the first death's change while the newcomer held nothing; c's death
+>   then was a second failure inside the first's repair window, more than `f = 1` promises, and `unable to commit` is
+>   the typed answer. a914 now waits, before the second death, until a counts every survivor among its green's newest
+>   placed version's holders and each holds the names log through its position at a (`Daemon::repair_window_holders`), and
+>   fails there, named, if that never holds (one focused run: closed with the names log at 4, both survivors holding 2
+>   to 4, the second push landed). The reads past tolerance now name their reader and who answered.
+> - **OPEN, a design question (main 01a20182's ruling of 2026-11-27 15:51, item 3; not now): may a newcomer adopt a live,
+>   never-restarted owner's chain on its report alone?** In run 7 above, after the second death the owner was the one
+>   live holder of the green's chain and the names log above its floor; the newcomer's reads were past tolerance, so
+>   it could not hold the green's next version, and that version could not place on the two survivors.
+>   The fold's tolerance (A-919's start rule, `FencedLedger`'s ReadSafety) does not tell an owner that never restarted
+>   (its hold never forgotten) from one that did. Adopting on such an owner's word would let a repository take pushes
+>   again with one copy left; it changes (C)'s rule and the model (the owner's lost mark as a reported fact), so it is
+>   designed and model-checked before any code.
 > - **FIXED (w-interop, 2026-11-27; main 01a20182's ruling of 12:37): a914's record barrier, placed Some(1) (its runs 1
 >   and 16 of 16).** Not durability: every object was served by a live home. A holder whose replica owed its push
 >   (P2) replayed the repository's replica store, reading each name it lacked from the region (`homes::read_in_region`),

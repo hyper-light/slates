@@ -82,7 +82,8 @@ use slates_ipc::{ClientEnd, HeldRendezvous, IpcError, connect};
 use slates_machine::MachineProfile;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_server::daemon::{
-  HEARTBEAT_NS, HomingWindowReading, LIVENESS_BUDGET_NS, LinkAfter, SessionHold, host_id_of,
+  HEARTBEAT_NS, HomingWindowReading, LIVENESS_BUDGET_NS, LinkAfter, RepairWindowHolders,
+  SessionHold, host_id_of,
 };
 use slates_server::deploy::member_id;
 use slates_server::head::HeadValue;
@@ -38136,11 +38137,16 @@ const CREATION_WATCH_PERIODS: u64 = 20;
 ///
 /// Recorded, not asserted: the first death's measured silence beside the estimate's window at it, the red for the
 /// prior a first death still lacks (A-914 (c)): 7 runs, macOS arm64 debug, 2026-11-25, silence 3.99 to 5.24 s against a
-/// window of 3.3 to 3.8 s, that push refused `retry` at its homing in 4 of 7. **Owed, a named debt:** the push during the
-/// second death is not asserted to land. On the learned window (16.9 to 18.7 s) it landed 4 of 7; 2 were refused at
-/// the record barrier (`unable to commit`, the new version's merge records unplaced 13 s after the takeover installed:
-/// A-912's sibling, w-shared's next piece), 1 fell short at its homing. With each death awaited to its unseating, 2 of
-/// 6 landed, 4 refused at the barrier. That piece adds the assertion here.
+/// window of 3.3 to 3.8 s, that push refused `retry` at its homing in 4 of 7.
+///
+/// **f = 1's repair-window precondition** (main 01a20182's ruling of 2026-11-27 15:51): before the second death, every
+/// survivor holds what a owns of the repository, so the first death's repair is over ([`repair_window_closed`]): a
+/// counts each among the holders of its green's newest placed version, and each holds its names log's newest placed
+/// head. §4.8 settles a's neighbourhood change once `f + 1` of its new cohort hold the newest record, a among them
+/// (`Configuration::placed_on_current`), so a and c may settle it while the candidate d's death brought in still holds
+/// nothing. Killing c then is a second failure inside the first's repair window, more than `f = 1` promises, and the
+/// push's `unable to commit` is the typed answer (41aa47870 run 7: the green placed at 2 of 3, the newcomer behind,
+/// `merge.behind.heard` 9). A precondition that never holds fails here, before the second death, named.
 #[test]
 fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first() {
   let _serial = serialize_fleet_tests();
@@ -38153,15 +38159,20 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
     (Some(lease), None),
   );
   let first = fleet.push(0, ("first.txt", b"main before any death\n"));
-  let mut during = Vec::new();
-  for (death, file) in [(3, "after-d.txt"), (2, "after-c.txt")] {
-    during.push(stretched_death(&mut fleet, death, file));
-  }
+  let at_d = stretched_death(&mut fleet, 3, "after-d.txt");
+  let (repaired, holders) = repair_window_closed(&fleet);
+  let during = [at_d, stretched_death(&mut fleet, 2, "after-c.txt")];
   fleet.stop();
   eprintln!(
-    "two stretched deaths: first push {first:?}; each (window at it, its push, taken over, after) {during:?}"
+    "two stretched deaths: first push {first:?}; each (window at it, its push, taken over, after) {during:?}; the \
+     first's repair window closed {repaired} at {holders:?}"
   );
   assert_eq!(first, Ok(()), "the push before any death landed");
+  assert!(
+    repaired,
+    "f = 1's repair-window precondition: every survivor held a's green and names log before the second death: \
+     {holders:?}"
+  );
   let [
     (first_window, _, first_taken, first_after),
     (second_window, second_push, second_taken, _),
@@ -38199,6 +38210,52 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
 
 /// A node's homing window as read from its status, or why it could not be ([`stretched_death`]'s readings).
 type WindowRead = Result<HomingWindowReading, ObserveError>;
+
+/// What [`repair_window_closed`] last read: a's count of its repository's holders ([`RepairWindowHolders`]) and each
+/// survivor's names-log positions but a's, or why either could not be read.
+type RepairRead = (
+  Result<RepairWindowHolders, ObserveError>,
+  Vec<Result<Vec<u64>, ObserveError>>,
+);
+
+/// f = 1's repair-window precondition of A-914 (a)'s test
+/// ([`a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`]): whether, within [`RETIREMENT_DEADLINE`], a counts every other survivor among the holders of its repository's green's
+/// newest placed version and every other survivor holds a's names log through its position
+/// (`Daemon::repair_window_holders`, `Daemon::names_log_positions`); with what it last read.
+fn repair_window_closed(fleet: &GitFleet) -> (bool, RepairRead) {
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let others = 1..fleet.daemons.len();
+  let closed = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    let held = fleet.daemons[0].repair_window_holders(fleet.repository)?;
+    others.clone().try_fold(true, |all, node| {
+      Ok(all && survivor_repaired(fleet, node, &held)?)
+    })
+  });
+  let positions = others
+    .map(|node| fleet.daemons[node].names_log_positions(fleet.repository))
+    .collect();
+  let held = fleet.daemons[0].repair_window_holders(fleet.repository);
+  (closed, (held, positions))
+}
+
+/// Whether survivor `node` holds what a counts of its repository ([`repair_window_closed`]): it is among the holders of
+/// the green's newest placed version, and its names-log positions reach the log's position at a.
+fn survivor_repaired(
+  fleet: &GitFleet,
+  node: usize,
+  held: &RepairWindowHolders,
+) -> Result<bool, ObserveError> {
+  let host = fleet.hosts[node];
+  let in_green = held
+    .green
+    .as_ref()
+    .is_some_and(|(_, holders)| holders.contains(&host));
+  let Some(head) = held.names_head else {
+    return Ok(false);
+  };
+  let positions = fleet.daemons[node].names_log_positions(fleet.repository)?;
+  Ok(in_green && positions.last().is_some_and(|last| *last >= head))
+}
 
 /// One of [`a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`]'s deaths: every node's
 /// periods stretched, node `death` stopped, a push on top from a, every survivor's takeover of it and its unseating from

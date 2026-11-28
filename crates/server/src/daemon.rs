@@ -264,6 +264,17 @@ pub struct RecordDialReport {
 /// held for.
 pub type RegionHold = ([u8; 32], Vec<slates_cluster::homes::HomeOwner>);
 
+/// What a green's owner counts held of it (A-914's repair-window precondition, `Daemon::repair_window_holders`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepairWindowHolders {
+  /// The newest placed version of the green's merge chain beside the holders that acknowledged it
+  /// (`MergeShardState::placed_holders`); `None` before a version placed.
+  pub green: Option<(u64, Vec<slates_db::HostId>)>,
+  /// The position of the names log of the repository the green is a member of; `None` where this node holds no such
+  /// repository.
+  pub names_head: Option<u64>,
+}
+
 /// A node's homing window as its control shard last derived it, with its terms (A-914, `Daemon::homing_window`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HomingWindowReading {
@@ -1876,6 +1887,35 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| {
       s.period_stretch_ns = stretch_ns.unwrap_or(0);
     })
+  }
+
+  /// Test support (A-914's repair-window precondition, main 01a20182's ruling of 2026-11-27 15:51): what this node, as
+  /// `green`'s owner, counts held of it ([`RepairWindowHolders`]): its merge chain's newest placed version with the holders
+  /// that acknowledged it, and its names log's position (its repository's register, `Repositories::log_position`). An
+  /// owner keeps no placed head of a state log and forgets a log's acknowledgements once it let every part go, so a test
+  /// reads who holds the names log's head from the holders (`Daemon::names_log_positions`). Across the shards; the typed
+  /// refusal when one could not be observed.
+  pub fn repair_window_holders(
+    &self,
+    green: [u8; 16],
+  ) -> Result<RepairWindowHolders, ObserveError> {
+    let object = slates_db::register::ObjectId(green);
+    let mut held = RepairWindowHolders::default();
+    for shard in self.shards.clone() {
+      let (placed, names) = self.observe(Some(shard), move |s| {
+        let placed = s.merge.placed_holders.get(&object).cloned();
+        let repositories = s.db.partition().repositories();
+        let names = repositories
+          .member(slates_db::catalog::VolumeId { bytes: green })
+          .and_then(|member| {
+            repositories.log_position(member.repository, slates_db::catalog::StateLog::Names)
+          });
+        (placed, names)
+      })?;
+      held.green = held.green.or(placed);
+      held.names_head = held.names_head.max(names);
+    }
+    Ok(held)
   }
 
   /// Test support (A-919): the bytes of the state logs' parts this node's shards still hold as an owner, owed to some
