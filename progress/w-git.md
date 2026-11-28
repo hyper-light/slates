@@ -937,3 +937,8 @@
   against 3 counted whole, 1 against 1 own. (2) P2 piece 2's settle turn answered more when its quantum ended on the
   last landing (its task held its slot a turn; red turn 4). NEXT, per 18:44: the clone's window peak under load (OPEN
   in GAPS), then P1 (bisect first).
+- 11-28 00:26 PST: LANDED the clone's window peak 5f7f5a187, on main as 47e37df66 (GAPS entry CLOSED): a clone checking a pushed
+  entry's CRC32 across let-go windows goes on where it stopped (packed::RawCrc), its cursor driving the look-ahead and
+  let-go behind, which also lets go past the look-ahead's reach; peak 12 of 13 before (deterministic, NO_FETCH_WAIT),
+  2 now against LOOK_AHEAD_WINDOWS + 1; windows brought back again counted (12). NEXT: P1, the partial clone
+  regression, bisect first; main runs the A/B on request.
