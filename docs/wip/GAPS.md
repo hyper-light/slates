@@ -1196,6 +1196,17 @@
 > deterministic in `crates/rt/tests/spin_kick.rs` (3 of 3 hung, shard parked), green 3 of 3
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
+> **FIXED 2026-11-27 (w-svn; main's git-2000 release rounds, 4 imports of 5 refused at r593): a stepped directory
+> removal judged again over a half-made count.** A step that decided one directory and was spent counting the next
+> one's children left the phase's place before the first, so the next decided it again and refused the revision
+> `DeleteModify` (`Green::decide_rmdirs_some`, A-920's ee0c95e8f). Each decided directory now keeps its place. Bug
+> record `docs/bugs/2026-11-27-an-imports-directory-removals-were-judged-again-over-a-half-made-count.md`; a refused
+> staging now logs what the member holds and the work does there (`ImportBatch::refusal_logged`). Its sibling, latent:
+> the ptrie's removal descent (`ptrie::remove_at`) went on past a child's label without checking the key held it, so
+> below the root removing "ax" beside "ab" took "ab"'s value; `Ptrie::remove` asks `get` first, so no caller met it.
+> Now matched as `get` matches it; the sweep found every other descent (`get`, `insert_at`, `graft_at`, `cut_at`,
+> `under_any`) already matching its labels whole. The oracle asserts an absent key's removal copies no node.
+
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
@@ -1222,7 +1233,11 @@
 > ms of the op's 4.29 (debug), and the cost was the identity's hash of the whole op (4.92 ms), which hashes each entry as
 > its digest since 13c. The log write's about 48 bytes a path stays, for a wider probe to judge. Release probe 17's
 > move leader was the test's own setup (the simulated host's copy of the dump), which now holds the dump moved in, never copied; the
-> product's create and begin print apart (`SETUP`). Copy's release unit was an allocator's batch of freed pages returned
+> product's create and begin print apart (`SETUP`). Release probe 18's move leader, `begin` (1.4 ms, CPU-bound, at any
+> load), was the simulated host again: its `open_file` cloned the whole dump as the open's snapshot (debug: 0.43 of
+> `begin`'s 0.46 ms, about twice add's for move's dump). Since (w-svn, main's ruling (a) of 2026-11-27 17:29) an open
+> copies nothing, as a real host's does, and a file displaced while open is retired whole, the files beneath a removed
+> directory too (`SimHost::retire`); held by `crates/vfs/tests/sim_opens.rs` (red: the open held the file's 1 MiB). Copy's release unit was an allocator's batch of freed pages returned
 > in one free (1.2-1.3 ms of system time in release); since the reaper, what a release frees is dropped on the daemon's
 > reaper thread (25 µs the longest unit, debug), owed probe 18's release read. The shard's handed and in-place counts are
 > read by the tests alone, not yet the status report. Move's `stage.committing` was the commit's node moves, a walk of
