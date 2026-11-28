@@ -34,7 +34,7 @@ const PROBE_FILES: usize = 4;
 /// Shape: the bytes of each probe text: a short file's, as most of a history's revisions are.
 const PROBE_TEXT_BYTES: usize = 48;
 
-/// A small history's index and its store, to time a gathering over ([`GatherProbe::gather`]).
+/// A small history's index and its store, to time a gathering over ([`GatherProbe::learn`]).
 #[derive(Debug)]
 pub struct GatherProbe {
   index: HgIndex,
