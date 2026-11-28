@@ -1936,8 +1936,13 @@ impl RowCost {
     let learned = if self.rows == 0 {
       RowCost::first(line)
     } else {
-      let ns = u128::from(self.ns) / u128::from(self.rows.max(1));
-      let bytes = ns.saturating_mul(u128::from(bytes_per_second)) / u128::from(NANOS_A_SECOND);
+      let ns = u128::from(self.ns)
+        .checked_div(u128::from(self.rows))
+        .unwrap_or(0);
+      let bytes = ns
+        .saturating_mul(u128::from(bytes_per_second))
+        .checked_div(u128::from(NANOS_A_SECOND))
+        .unwrap_or(0);
       u64::try_from(bytes).unwrap_or(u64::MAX)
     };
     learned.clamp(row_charge(), step_bytes.max(row_charge()))
