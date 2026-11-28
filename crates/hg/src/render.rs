@@ -904,7 +904,7 @@ impl Streaming {
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
     Ok(match stage {
-      Stage::Kept => self.from_kept(index),
+      Stage::Kept => self.head_from_kept(index),
       Stage::Start => first_log(index, store).map_or(Stage::Head, |log| Stage::Counting(log, 0)),
       Stage::Counting(log, rev) => self.count(index, store, (log, rev))?,
       Stage::Head => self.head(index, store, admission, out)?,
@@ -918,7 +918,7 @@ impl Streaming {
 
   /// The head's counts from what the index kept as revisions landed (goal 93, cut 2; [`HgIndex::rendered`]), so no walk
   /// comes before the head; none kept (a revision not sized, or one no stream can send as it is kept) serves none.
-  fn from_kept(&mut self, index: &HgIndex) -> Stage {
+  fn head_from_kept(&mut self, index: &HgIndex) -> Stage {
     match index.rendered() {
       Some(rendered) => self.counted = (rendered.files, rendered.bytes),
       None => self.not_served = true,
