@@ -597,8 +597,11 @@
 >     it re-keyed a (a refuted at incarnation 1 once keyed). A peer now holds a's probes unjudged from learning of its
 >     new process until the re-key's install or one detection (`fleet.plane.rekey_*`), a local change to vendored
 >     hyper-swim (`Detector::hold_judging`, vendor README item 4). Bound: a process that dies just after its restart
->     is condemned within one detection plus `detection_bound`. **Owed:** proposed to hyper-raft's owner as a feature
->     gate (through Ada); main reruns winfleet on both Windows lanes.
+>     is condemned within one detection plus `detection_bound`. Measured (winfleet-7, GitHub run 46129937528, main
+>     6be709db6, 16 runs a test a lane): windows-11-arm 32 of 32, answers-its-peers 16 of 16 (11 and 9 of 16 in
+>     winfleet-5 and -6) and the warm-restart volume test 16 of 16; windows-latest 32 of 32; the logs carry 368 and
+>     341 rekey lines, the window running on both lanes. **Owed:** proposed to hyper-raft's owner as a feature gate
+>     (through Ada).
 >   - **FIXED, v3_takeover's adoption stall (A-933, w-shared, 2026-11-27):** about 1 run in 80 on Linux CI, a
 >     successor gave a taken-over green up "waiting on its adoption". Its rebuild could reach neither the record
 >     adoption (A-364: it checked the adopted record alone, so a successor short of version 0 never became
