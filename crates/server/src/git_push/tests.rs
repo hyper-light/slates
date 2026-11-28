@@ -1229,7 +1229,8 @@ const PACED_HISTORY: usize = 600;
 
 /// Shape: the turns that line's one derivation takes besides those its work fills while nobody else waits on the shard:
 /// a turn to begin it, one to end the turn its work ends in, one to find nothing due, with room for a scheduler's
-/// spurious wake or two.
+/// spurious wake or two. Turns it yields to the shard's other work are not its own and are not counted against it
+/// ([`own_turns`]).
 const PACED_TURNS: u64 = 8;
 
 /// A-614 amended, paced (main's report of 2026-11-21, r52: a clone of git/git's branches took 465 s, its derivation of 8
@@ -1401,14 +1402,17 @@ fn tagged_line_request() -> Vec<u8> {
 }
 
 /// The derivation as this shard counted it: a reader's turns, the task behind's, handed over, and its nanoseconds.
-fn derive_driven(state: &mut ShardState) -> [u64; 4] {
-  use crate::vcs_store::git_derive::{BEHIND_HANDED, BEHIND_TURNS, NS, READ_TURNS};
+fn derive_driven(state: &mut ShardState) -> [u64; 5] {
+  use crate::vcs_store::git_derive::{
+    BEHIND_HANDED, BEHIND_TURNS, NS, READ_TURNS, READ_TURNS_YIELDED,
+  };
   let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
   [
     count(READ_TURNS),
     count(BEHIND_TURNS),
     count(BEHIND_HANDED),
     count(NS),
+    count(READ_TURNS_YIELDED),
   ]
 }
 
@@ -1422,8 +1426,8 @@ fn derive_driven(state: &mut ShardState) -> [u64; 4] {
 fn fetch_after_tagged_push(
   daemon: &crate::Daemon,
   name: &'static str,
-  behind: bool,
-) -> (u64, u64, u64) {
+  (behind, neighbour): (bool, bool),
+) -> Fetched {
   let repository = git_repository_on(daemon, name);
   let request = tagged_line_request();
   let before = crate::daemon::observe_first(daemon, derive_driven);
@@ -1431,7 +1435,7 @@ fn fetch_after_tagged_push(
     // Shared by this thread and the shard's task: leaked for the test's life, so neither owns it (D-8, no `Arc`).
     let pushed: &'static std::sync::atomic::AtomicBool =
       Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
-    let read = read_on_the_shard(daemon, repository, Some(pushed));
+    let read = read_on_the_shard(daemon, repository, (Some(pushed), neighbour));
     let (created, _) = pushed_in_steps(daemon, repository, &request).unwrap();
     pushed.store(true, std::sync::atomic::Ordering::Release);
     assert!(reasons(&created).iter().all(|reason| reason == b"ok"));
@@ -1439,14 +1443,29 @@ fn fetch_after_tagged_push(
   } else {
     let said = reasons(&pushed_on(daemon, repository, &request));
     assert!(said.iter().all(|reason| reason == b"ok"));
-    read_on_the_shard(daemon, repository, None)
+    read_on_the_shard(daemon, repository, (None, neighbour))
   };
   let took_ns = read
     .recv()
     .expect("the read answered")
     .unwrap_or_else(|missed| panic!("{missed}"));
   let after = crate::daemon::observe_first(daemon, derive_driven);
-  (after[0] - before[0], after[2] - before[2], took_ns)
+  Fetched {
+    turns: after[0] - before[0],
+    yielded: after[4] - before[4],
+    handed: after[2] - before[2],
+    took_ns,
+  }
+}
+
+/// What [`fetch_after_tagged_push`] saw of a fetch's derivation: its read turns, those of them it gave the shard's
+/// other tasks, the hand-overs, and its own time.
+#[derive(Debug)]
+struct Fetched {
+  turns: u64,
+  yielded: u64,
+  handed: u64,
+  took_ns: u64,
 }
 
 /// A fetch's read of `repository` ([`git_derive::derive_for_read`]) as a task of the shard, timed there from its start to
@@ -1459,7 +1478,7 @@ fn fetch_after_tagged_push(
 fn read_on_the_shard(
   daemon: &crate::Daemon,
   repository: RepositoryId,
-  pushed: Option<&'static std::sync::atomic::AtomicBool>,
+  (pushed, neighbour): (Option<&'static std::sync::atomic::AtomicBool>, bool),
 ) -> std::sync::mpsc::Receiver<Result<u64, String>> {
   use crate::vcs_store::git_derive::{BEHIND, behind_and_under_way, derive_for_read};
   let (done, read) = std::sync::mpsc::channel();
@@ -1489,14 +1508,36 @@ fn read_on_the_shard(
           }
         }
       }
+      let neighbour = neighbour.then(yielding_neighbour);
       let began = slates_rt::futures::now_ns();
       derive_for_read(repository).await;
-      let _ = done.send(Ok(slates_rt::futures::now_ns().saturating_sub(began)));
+      let took = slates_rt::futures::now_ns().saturating_sub(began);
+      if let Some(ended) = neighbour {
+        ended.store(true, std::sync::atomic::Ordering::Release);
+      }
+      let _ = done.send(Ok(took));
     })
     .expect("the read's task");
     slates_rt::futures::detach(task).expect("the read's task detached");
   });
   read
+}
+
+/// A task of this shard that waits on it, a yield at a time, until the flag it answers is set: the shard's other work a
+/// slow host keeps waiting through a fetch's derivation (diag CI 12's TSan lane), which ends each of the reader's turns
+/// early ([`crate::vcs_store::git_derive::READ_TURNS_YIELDED`]). The flag is leaked for the test's life, shared by the
+/// reader and this task (D-8, no `Arc`).
+fn yielding_neighbour() -> &'static std::sync::atomic::AtomicBool {
+  let ended: &'static std::sync::atomic::AtomicBool =
+    Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+  let task = slates_rt::futures::spawn(async move {
+    while !ended.load(std::sync::atomic::Ordering::Acquire) {
+      slates_rt::futures::yield_now().await;
+    }
+  })
+  .expect("the neighbour's task");
+  slates_rt::futures::detach(task).expect("the neighbour's task detached");
+  ended
 }
 
 /// Main 01a20182's ruling of 2026-11-25 (derive_behind withdrawn: a clone arriving mid-derivation ran it in slivers, the
@@ -1537,7 +1578,7 @@ fn by_driver(state: &mut ShardState) -> ([[u64; 3]; 3], u64) {
 #[test]
 fn a_derivations_turns_time_and_versions_are_counted_by_who_drove_them() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let _ = fetch_after_tagged_push(&daemon, "by-driver", true);
+  let _ = fetch_after_tagged_push(&daemon, "by-driver", (true, false));
   let (counted, left_due) = crate::daemon::observe_first(&daemon, by_driver);
   daemon.stop();
   let [read, behind, all] = counted;
@@ -1555,27 +1596,65 @@ fn a_derivations_turns_time_and_versions_are_counted_by_who_drove_them() {
   assert_eq!(left_due, 0, "no reader left versions due");
 }
 
+/// Main 01a20182's ruling of 2026-11-25 (a fetch arriving mid-derivation is handed it, never run in slivers beside the
+/// task behind). Do: push the tagged line as the edge does, a fetch reading it mid-derivation behind the push, then the
+/// same push and read with nothing behind. Expect: the fetch handed the derivation; no more of its own turns than alone
+/// but the hand-over's ([`own_turns`], [`PACED_TURNS`]); and no later than twice alone. A turn the shard's other work
+/// asked for is not the derivation's: diag CI 12's TSan lane counted 21 turns against 9 when they were counted in.
 #[test]
 fn a_fetch_arriving_mid_derivation_is_no_later_than_one_with_nothing_behind() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (turns, handed, took) = fetch_after_tagged_push(&daemon, "mid-derivation", true);
-  let (alone_turns, _, alone_took) = fetch_after_tagged_push(&daemon, "nothing-behind", false);
+  let mid = fetch_after_tagged_push(&daemon, "mid-derivation", (true, false));
+  let alone = fetch_after_tagged_push(&daemon, "nothing-behind", (false, false));
   daemon.stop();
-  eprintln!(
-    "mid-derivation: {turns} turns, {took} ns, {handed} handed; alone: {alone_turns} turns, {alone_took} ns"
-  );
+  eprintln!("mid-derivation: {mid:?}; alone: {alone:?}");
+  assert_turns_alone_but_the_hand_overs(&mid, &alone);
   assert!(
-    turns <= alone_turns + PACED_TURNS,
-    "no more turns than alone, but the hand-over's: {turns} against {alone_turns}"
+    mid.took_ns <= 2 * alone.took_ns,
+    "no later than alone: {} ns against {}",
+    mid.took_ns,
+    alone.took_ns
   );
+}
+
+/// The turns of a fetch's derivation its own work's ceiling ended ([`Fetched::turns`] less [`Fetched::yielded`]): a
+/// reader runs to the step's ceiling unless another task waits on the shard (`git_derive::paced`), so each turn it
+/// yields is the shard's other work's, never the derivation's.
+fn own_turns(fetched: &Fetched) -> u64 {
+  fetched.turns.saturating_sub(fetched.yielded)
+}
+
+/// Holds `mid`, a fetch handed a derivation, to no more of its own turns than `alone` but the hand-over's
+/// ([`PACED_TURNS`]), and to having been handed it.
+fn assert_turns_alone_but_the_hand_overs(mid: &Fetched, alone: &Fetched) {
   assert!(
-    took <= 2 * alone_took,
-    "no later than alone: {took} ns against {alone_took}"
-  );
-  assert!(
-    handed >= 1,
+    mid.handed >= 1,
     "the fetch arrived mid-derivation and was handed it"
   );
+  assert!(
+    own_turns(mid) <= own_turns(alone) + PACED_TURNS,
+    "no more of its own turns than alone, but the hand-over's: {mid:?} against {alone:?}"
+  );
+}
+
+/// Main 01a20182's diag CI 12 (TSan lane, run 46099781322: "no more turns than alone, but the hand-over's: 21 against
+/// 9"). Do: as [`a_fetch_arriving_mid_derivation_is_no_later_than_one_with_nothing_behind`], with a task of the shard
+/// waiting through the mid-derivation fetch's read, a yield at a time ([`yielding_neighbour`]), as a slow host's other
+/// work does. Expect: the fetch handed the derivation, turns of it yielded to the neighbour, and no more of its own
+/// turns than alone but the hand-over's ([`own_turns`]). Red with every turn counted: 935 against 3, 934 of them
+/// yielded.
+#[test]
+fn a_fetch_handed_a_derivation_while_its_shard_has_other_work_takes_no_more_turns_than_alone() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let mid = fetch_after_tagged_push(&daemon, "mid-neighboured", (true, true));
+  let alone = fetch_after_tagged_push(&daemon, "alone-quiet", (false, false));
+  daemon.stop();
+  eprintln!("mid-derivation beside a neighbour: {mid:?}; alone: {alone:?}");
+  assert!(
+    mid.yielded >= 1,
+    "the neighbour waited through the read: {mid:?}"
+  );
+  assert_turns_alone_but_the_hand_overs(&mid, &alone);
 }
 
 /// Lets go of every window of `pack` on this shard by hand, as a landed pack's let-go would (its home told first, each
