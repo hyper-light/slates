@@ -836,6 +836,24 @@ impl Files {
     std::mem::swap(&mut self.blocks, &mut other.blocks);
   }
 
+  /// [`Dim::swap_with_fork`]: the arena and the blocks staying in this field (A-752 part 3c U7).
+  pub(crate) fn swap_with_fork(&mut self, fork: &mut Files) {
+    std::mem::swap(self, fork);
+    self.lend(fork);
+  }
+
+  /// [`Dim::release_fork`]: the blocks the freed nodes held let go with them, so a block the stage copied a node of is
+  /// released once, by the last node holding it (A-752 part 3c U7).
+  pub(crate) fn release_fork(&mut self, mut fork: Files) {
+    fork.map.root.release(&mut self.map.nodes, &mut self.blocks);
+  }
+
+  /// The blocks live and the nodes the map's arena holds live: what a test holds a stage's release to (A-752 part 3c U7).
+  #[cfg(test)]
+  pub(crate) fn live(&self) -> (usize, usize) {
+    (self.blocks.live(), self.map.live_nodes())
+  }
+
   /// [`Dim::releasing`]: the blocks are let go as their nodes are freed.
   pub(crate) fn releasing(&mut self) -> Releasing {
     self.map.releasing()
