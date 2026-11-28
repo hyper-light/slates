@@ -803,3 +803,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Red: a_holders_first_replica_build_at_a_second_death_after_a_refused_push_lands_the_push. b and c delay home answers 30 s (first push refused on purpose), then the second death; its push is refused "unable to commit", building {b: 0}.
 - Logs: b refused v2 foreign_generation (config one step behind a), then replica.owes (build: replay 5 ms), then foreign_generation again. Not region reads.
 - Asked main: lag handling or eager replica builds; whether to add a build-turns/made log first.
+
+## 2026-11-27 19:31 PST: A-936 in progress (local, uncommitted)
+- The catch-up runs on the forward lane (an inline wait held the session carrying the council's appends); "newer" also covers the copy's acceptor authority (the install walk lags), with install_on_copy ahead.
+- Result: foreign_generation refusals 15 to 0; caught up 2, short 0. Still red: the barrier window expired during the 1.9 s catch-up wait; v2 accepted at the barrier's moment.
+- Asked main: (a) a typed catching-up answer counted as barrier progress (recommended), (b) widen the window during config change, (c) none.
