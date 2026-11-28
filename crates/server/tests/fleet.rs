@@ -37249,7 +37249,9 @@ fn push_on_top_at_edge(
     ],
   );
   if !cloned.status.success() {
-    return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
+    let refused = String::from_utf8_lossy(&cloned.stderr).into_owned();
+    note_unreachable_edge(port, &refused);
+    return Err(refused);
   }
   commit_in(&dir, "copy", (file, bytes));
   let work = format!("{}/copy", dir.path);
@@ -37261,8 +37263,34 @@ fn push_on_top_at_edge(
   if pushed.status.success() {
     Ok(())
   } else {
-    Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
+    let refused = String::from_utf8_lossy(&pushed.stderr).into_owned();
+    note_unreachable_edge(port, &refused);
+    Err(refused)
   }
+}
+
+/// Where a git client's `refused` says it could not connect to the edge at `port` (main 01a20182's ask of 2026-11-27
+/// 17:05: a914's run 3, refused at 0 ms on a live node's own port): logs, on the fleet trace and stderr, the process's
+/// monotonic time, the port, and whether a connect to it made at once from here is accepted, so the edge's own
+/// "listens on" and "closed" lines (`vcs_http`) place the refusal: before the bind, after a close, or with the listener
+/// bound.
+fn note_unreachable_edge(port: u16, refused: &str) {
+  if !refused.contains("Failed to connect") {
+    return;
+  }
+  let at = slates_machine::clock::monotonic_ns();
+  let probe = std::net::TcpStream::connect_timeout(
+    &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+    Duration::from_secs(1),
+  )
+  .map(|_| ())
+  .map_err(|error| format!("{:?}: {error}", error.kind()));
+  common::trace::record(format_args!(
+    "edge unreachable: port {port} refused at {at} ns; a connect from here at once {probe:?}"
+  ));
+  eprintln!(
+    "edge unreachable: port {port} refused at {at} ns; a connect from here at once {probe:?}"
+  );
 }
 
 /// Counter: home exchanges a node was asked, counted as each arrives (`vcs_store::homes::REMOTE_ASKED`).
