@@ -478,6 +478,10 @@ pub struct Upload<A> {
   /// progress or ends (A-864 piece 2's progress); a window let go again behind the stream (piece 3) may be stopped at
   /// again once the stream has gone on.
   last_stop: Option<(ContentId, u64)>,
+  /// A pushed entry's CRC32 check under way where it stopped at a let-go window ([`packed::RawCrc`]): the entry, its
+  /// header as read, and what the check hashed, so the next turn goes on from there and the windows it passed may be
+  /// let go behind it ([`Upload::reading_next`]). None once the entry is judged.
+  checking: Option<(packed::InPack, (entry::Header, u64), packed::RawCrc)>,
   /// Whether the stream has stopped at a let-go window at all: its look-ahead begins then ([`Upload::reading_next`]).
   stopped_any: bool,
   /// The loose stage's objects charged their placement and put back before they were placed, by a stop or their base
@@ -523,6 +527,7 @@ impl<A: Answered> Upload<A> {
       pack_lens: Vec::new(),
       waiting: core::cell::Cell::new(None),
       last_stop: None,
+      checking: None,
       stopped_any: false,
       prepaid: BTreeSet::new(),
       last_read: None,
@@ -1303,6 +1308,14 @@ impl<A: Answered> Upload<A> {
     if !self.stopped_any {
       return None;
     }
+    // A pushed entry's check under way reads on from where it stopped.
+    if let Some((place, _, check)) = &self.checking {
+      return Some(packed::Waited {
+        pack: place.pack,
+        len: place.len,
+        offset: place.offset.saturating_add(check.at()),
+      });
+    }
     if let Some(Pending::Copy {
       content, len, from, ..
     }) = &self.pending
@@ -1627,20 +1640,33 @@ impl<A: Answered> Upload<A> {
     (row, place, packed): (&ObjectRow, InPack, rows::PackedRow),
     out: &mut impl Out,
   ) -> Result<Option<Reuse>, StoreRefused> {
-    let room = cx.repository.largest_object().max(row.len);
-    let (header, data) = match packed::entry_header(cx.store, (place, self.format), room) {
-      Ok(found) => found,
-      Err(refused) => {
-        return Ok(
-          self
-            .stopped_by(cx.store, &refused)
-            .then_some(Reuse::Stopped),
-        );
+    // A check that stopped at a let-go window goes on where it stopped, its header as it read it.
+    let (found, mut check) = match self.checking.take() {
+      Some((at, found, check)) if at == place => (Some(found), check),
+      _ => (None, packed::RawCrc::default()),
+    };
+    let (header, data) = match found {
+      Some(found) => found,
+      None => {
+        let room = cx.repository.largest_object().max(row.len);
+        match packed::entry_header(cx.store, (place, self.format), room) {
+          Ok(found) => found,
+          Err(refused) => {
+            return Ok(
+              self
+                .stopped_by(cx.store, &refused)
+                .then_some(Reuse::Stopped),
+            );
+          }
+        }
       }
     };
-    let crc = match packed::raw_crc(cx.store, place, packed.len) {
+    let crc = match check.hash(cx.store, place, packed.len) {
       Ok(crc) => Some(crc),
-      Err(refused) if self.stopped_by(cx.store, &refused) => return Ok(Some(Reuse::Stopped)),
+      Err(refused) if self.stopped_by(cx.store, &refused) => {
+        self.checking = Some((place, (header, data), check));
+        return Ok(Some(Reuse::Stopped));
+      }
       Err(_) => None,
     };
     if crc != Some(packed.crc) {

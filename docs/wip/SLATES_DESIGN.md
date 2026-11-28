@@ -61892,6 +61892,19 @@ landing (item 2b) lifted 2026-11-27 (GAPS "LIFTED").
   `a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed` (1,115,127 bytes let go before the
   listing); `an_advertisement_over_a_let_go_pack_is_the_one_over_it_held`; `t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed`;
   `a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+- **A pushed entry's check across turns (2026-11-27, w-git; main 01a20182's ruling of 23:25; GAPS' clone window peak,
+  OPEN since 13:47).** A clone whose answer begins before its repository's encoding is kept reads the let-go pack.
+  Its check of a pushed entry's CRC32 before reusing it (`Upload::reused_as_kept`) read the entry's raw bytes in one
+  call (`packed::raw_crc`), so a 3 MiB blob's check held each window it had brought back until the entry was sent: 12 of
+  13, against the look-ahead's two and the window a turn stopped at. The check now goes on where it stopped
+  (`packed::RawCrc`: the CRC32's state and how far it hashed, kept in the stream with the entry's header), and its
+  cursor is the one the look-ahead and the let-go behind follow (`Upload::reading_next`). The copy follows only on a
+  match, as git's `check_pack_crc` reads an entry before it writes it, so each window the check passed is brought
+  back again for the copy (`vcs_store.git_resident.brought_again`). The let-go behind also lets go what lies past the
+  look-ahead's reach from the cursor (`let_go_behind`), which the copy's return to the entry's start leaves: four held
+  before that. An answer holds at most `LOOK_AHEAD_WINDOWS` and one window at once, whatever its objects' sizes. Test:
+  `a_clone_racing_its_encoding_of_a_let_go_pack_holds_at_most_a_turns_windows` (`git_encode::NO_FETCH_WAIT`, test-only:
+  6 stops, peak 2, 12 brought again, the clone whole; red 12, every run).
 - **The encoding's side** (main 01a20182's note of 2026-11-22: the last whole-pack residency). An encoding unit whose
   pushed entry lies in a let-go window, or a copy reaching one, stops the same way (`Encoding::waiting`, `stopped`), its
   object put back first in line; its driver brings that window back before the next turn. Nothing makes a repository's

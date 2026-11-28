@@ -204,7 +204,13 @@ pub(crate) async fn brought_back_all(away: Vec<slates_git::store::packed::Waited
 
 /// Format: the windows a fetch's look-ahead brings back ahead of its next turn (A-864 piece 2): the one it begins to read
 /// in and the next, so a turn reading on into the next window finds it held; one reading past them stops cleanly there.
-const LOOK_AHEAD_WINDOWS: u64 = 2;
+/// With the window a turn stopped at, what an answer holds at once, whatever its objects' sizes (A-864 piece 3).
+pub(crate) const LOOK_AHEAD_WINDOWS: u64 = 2;
+
+/// Counter: windows a fetch brought back a second time, having let them go behind its cursor (A-864 piece 3): a pushed
+/// entry's check that crossed let-go windows reads them, then its copy reads them again, as git's `check_pack_crc`
+/// reads an entry before it writes it. Format: a counter name.
+pub(crate) const BROUGHT_AGAIN: &str = "vcs_store.git_resident.brought_again";
 
 /// Counter: windows a fetch's look-ahead brought back ahead of its turn (A-864 piece 2). Format: a counter name.
 pub(crate) const AHEAD_BROUGHT: &str = "vcs_store.git_resident.ahead_brought";
@@ -293,12 +299,15 @@ async fn brought_one(
   };
   match bring_back_within(waited).await {
     Ok(bytes) if bytes > 0 => {
-      resident.push(crate::vcs_http::git::upload::Brought {
+      let again = resident.push(crate::vcs_http::git::upload::Brought {
         pack: waited.pack,
         end: start.saturating_add(len),
         window,
         pinned,
       });
+      if again {
+        let _ = crate::state::with_state_counted(|state| state.count(BROUGHT_AGAIN, 1));
+      }
       true
     }
     Ok(_) => false,
@@ -315,20 +324,41 @@ fn note_peak(resident: &crate::vcs_http::git::upload::Resident) {
   let _ = crate::state::with_state_counted(|state| state.count_max(PEAK_WINDOWS, held));
 }
 
-/// Lets go again the windows of `resident` an answer's cursor has passed (A-864 piece 3): those of the pack `next` reads
-/// that end at or before where it reads, and every one of another pack (a pack is read front to back, each in turn);
-/// every one with no `next`. A window a home holds here is kept (`vcs_store::let_go_read`'s `Pinned`); one met again
-/// later is brought back again, its stop and look-ahead as before.
+/// Lets go again the windows of `resident` an answer's cursor has passed (A-864 piece 3): those of the pack `next`
+/// reads that end at or before where it reads, and every one of another pack (a pack is read front to back, each in
+/// turn); every one with no `next`. And those past the look-ahead's reach from it ([`LOOK_AHEAD_WINDOWS`]), which a
+/// cursor gone back leaves: a pushed entry's copy begins at its start once its check, which read on to its end, matched
+/// (the clone's window peak of 2026-11-27: the check's last windows held beside the copy's first, four). A window a
+/// home holds here is kept (`vcs_store::let_go_read`'s `Pinned`); one met again later is brought back again, its stop
+/// and look-ahead as before ([`BROUGHT_AGAIN`]).
 pub(crate) fn let_go_behind(
   state: &mut ShardState,
   resident: &mut crate::vcs_http::git::upload::Resident,
   next: Option<slates_git::store::packed::Waited>,
 ) {
+  let window = state
+    .vcs_stores
+    .content()
+    .map_or(1, |content| to_u64(content.window()).max(1));
+  // Where the look-ahead's windows end: the window `next` reads in and the next.
+  let reach = next.map(|next| {
+    (next.offset.checked_div(window).unwrap_or(0))
+      .saturating_add(LOOK_AHEAD_WINDOWS)
+      .saturating_mul(window)
+  });
   resident.retain(|brought| {
     // A window a read stopped at stays while the stream still reads the object it stopped for.
     let pinned = next.is_some() && brought.pinned == next;
-    let behind =
-      !pinned && next.is_none_or(|next| next.pack != brought.pack || brought.end <= next.offset);
+    let start = brought
+      .end
+      .saturating_sub(1)
+      .checked_div(window)
+      .unwrap_or(0)
+      .saturating_mul(window);
+    let past_reach = reach.is_some_and(|reach| start >= reach);
+    let behind = !pinned
+      && next
+        .is_none_or(|next| next.pack != brought.pack || brought.end <= next.offset || past_reach);
     if pinned {
       state.count(PINNED_HELD, 1);
     }

@@ -4719,6 +4719,58 @@ pub(crate) const LET_GO_FILE: usize = 3 << 20;
 /// pack's windows unread.
 #[test]
 fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
+  let seen = clone_of_a_let_go_pack(false);
+  eprintln!("clone of a let-go pack: {seen:?}");
+  // The clone may copy the encoding's kept parts rather than read the let-go pack; where it reads the pack, at most a
+  // turn's windows are held at once (`t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed` holds the
+  // mechanism to it whatever the clone reads; the raced test below holds this clone to it reading the pack).
+  assert_whole_holding_a_turns_windows(&seen);
+}
+
+/// The clone's window peak (w-git, main 01a20182's ruling of 2026-11-27 23:25; GAPS, OPEN since 13:47: 2 of 32 runs
+/// under 12 burners held 10 and 8 of 13 windows). Do: as
+/// [`a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`], the clone answering without waiting
+/// for the repository's encoding (`git_encode::NO_FETCH_WAIT`, as an encoding outlasting the wait under load leaves
+/// it), so it reads the let-go pack and checks the pushed entry's CRC32 before it copies it. Expect: the clone whole;
+/// it stopped at let-go windows; at most a turn's windows held at once, the look-ahead's
+/// (`vcs_store::upload::LOOK_AHEAD_WINDOWS`) and the window a turn stopped at, whatever the object's size; windows let
+/// go behind its cursor; and windows brought back a second time, the copy after the check
+/// (`vcs_store.git_resident.brought_again`). Red before: the check read the entry from its start each turn, holding 12
+/// of the pack's 13 windows at once.
+#[test]
+fn a_clone_racing_its_encoding_of_a_let_go_pack_holds_at_most_a_turns_windows() {
+  let seen = clone_of_a_let_go_pack(true);
+  eprintln!("clone of a let-go pack, raced: {seen:?}");
+  let (stops, _, let_go_behind) = seen.observed;
+  assert!(
+    stops >= 1 && let_go_behind >= 1,
+    "read the let-go pack: {seen:?}"
+  );
+  assert!(
+    seen.brought_again >= 1,
+    "the copy after the check counted: {seen:?}"
+  );
+  assert_whole_holding_a_turns_windows(&seen);
+}
+
+/// Holds `seen` to its clone whole and at most a turn's windows held at once: the look-ahead's and the window a turn
+/// stopped at (`vcs_store::upload::LOOK_AHEAD_WINDOWS` and one), fewer than the pack's.
+fn assert_whole_holding_a_turns_windows(seen: &ClonedLetGo) {
+  assert!(seen.let_go.0 >= 1, "windows let go: {:?}", seen.let_go);
+  assert_eq!((seen.status, seen.objects), (200, 3), "the clone whole");
+  let turns = crate::vcs_store::upload::LOOK_AHEAD_WINDOWS.saturating_add(1);
+  let (_, peak, _) = seen.observed;
+  assert!(
+    peak <= turns && peak < u64::try_from(seen.windows).unwrap(),
+    "at most a turn's windows held, {turns}: {seen:?}; windows pinned after the push and let-gos a pin refused: {:?}",
+    seen.pins
+  );
+}
+
+/// [`a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`]'s history, its fetch answering without
+/// waiting for the repository's encoding where `raced` (`git_encode::NO_FETCH_WAIT`), as one does under load whose
+/// encoding outlasts the wait: what it saw.
+fn clone_of_a_let_go_pack(raced: bool) -> ClonedLetGo {
   let (identity, certificate) = identity();
   let daemon = daemon(identity);
   let port = daemon.vcs_http_port().expect("the edge started");
@@ -4784,6 +4836,11 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
       .collect();
     (went, why)
   });
+  if raced {
+    crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+      crate::vcs_store::git_encode::NO_FETCH_WAIT.with(|off| off.set(true));
+    });
+  }
   let fetched = uploaded(edge, &name, &fetch_of(commit));
   let counted = |kind| counted_on(&daemon, REPOSITORY, kind);
   let observed = (
@@ -4800,33 +4857,31 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
         .map_or(0, |content| content.counters().kept_unlanded)
     }),
   );
+  let brought_again = counted("vcs_store.git_resident.brought_again");
   daemon.stop();
-  eprintln!(
-    "clone of a let-go pack: (stops, peak, let go behind) {observed:?} of {} windows; pinned after the push, \
-     let-gos a pin refused: {pins:?}",
-    windows.len()
-  );
-  assert!(
-    let_go >= 1,
-    "{let_go} of {} windows let go: {refused:?}",
-    windows.len()
-  );
-  assert_eq!(fetched.0, 200);
-  assert_eq!(
-    ids_in(&fetched_pack(&fetched.1)).len(),
-    3,
-    "the clone whole"
-  );
-  // The clone may copy the encoding's kept parts rather than read the let-go pack; where it reads the pack, at most a
-  // turn's windows are held at once (`t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed` holds the
-  // mechanism to it whatever the clone reads).
-  let (_, peak, _) = observed;
-  assert!(
-    peak <= 3,
-    "at most a turn's windows held: {observed:?} of {}; windows pinned after the push and let-gos a pin refused: \
-     {pins:?}",
-    windows.len()
-  );
+  ClonedLetGo {
+    observed,
+    brought_again,
+    pins,
+    windows: windows.len(),
+    let_go: (let_go, refused),
+    status: fetched.0,
+    objects: ids_in(&fetched_pack(&fetched.1)).len(),
+  }
+}
+
+/// What [`clone_of_a_let_go_pack`] saw: the clone's (stops, peak windows, windows let go behind), the windows it
+/// brought back a second time, the windows pinned after the push and the let-gos a pin refused, the pack's windows, the
+/// windows let go before the clone and why any was not, and the clone's status and objects.
+#[derive(Debug)]
+struct ClonedLetGo {
+  observed: (u64, u64, u64),
+  brought_again: u64,
+  pins: (u64, u64),
+  windows: usize,
+  let_go: (usize, Vec<String>),
+  status: u16,
+  objects: usize,
 }
 
 /// A pushed history whose one file is chained as offset deltas ([`chained_create`]): the request creating `main` at its
