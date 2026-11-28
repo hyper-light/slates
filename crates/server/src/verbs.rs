@@ -22366,7 +22366,21 @@ thread_local! {
 /// caller must not acknowledge stability. Missing recovery storage refuses `RecoveryIncomplete`.
 /// Efficiency gate: it re-images
 /// every volume on each call; an incremental publish is the owed refinement (docs/wip/recovery.md).
+///
+/// Every caller is a barrier something waits behind, so it asks for the paged families' next cut whatever its cost
+/// (A-930's cadence, main's ruling of 2026-11-27 08:54, plan (a)): a change made before the call is in the image once
+/// its owed catch-up ends, as before the cadence. Only the catch-up's own publication asks for nothing
+/// ([`publish_shard_unasked`]), so the byte rule gates only the chain of cuts the catch-up begins at each commit.
 pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
+  state.image_encoder.ask();
+  publish_shard_unasked(state)
+}
+
+/// [`publish_shard`] asking for no cut: the catch-up's own publication of a cut it encoded
+/// (`content_holder::image_catch_up`), whose commit begins the next cut only once it is due (`Encoder::due`).
+pub(crate) fn publish_shard_unasked(
+  state: &mut ShardState,
+) -> Result<Published, slates_vfs::VfsError> {
   #[cfg(test)]
   if PUBLICATIONS_LEFT.with(|left| match left.get() {
     Some(0) => true,

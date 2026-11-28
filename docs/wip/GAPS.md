@@ -623,6 +623,11 @@
 > diff reversed both pass, 2 of 2. Its 57k effect, measured before the revert (main's a930-57k run 1 at 81950e77c, load
 > 62-66): cuts 3,291 to 5, bytes copied 697,376,174 to 7,084,213, held-deferred peak 148,221,952 bytes, resident after
 > the push 845,504 KiB (834,960 at 894a1e111). Re-lands with the restart's red first (w-perf).
+> **Part 3 RE-LAND BUILT, not landed (w-perf, 2026-11-27; main's plan (a) of 08:54):** every publication asks for its
+> cut, so no barrier defers one; the byte rule gates only the catch-up's chain (`verbs::publish_shard_unasked`); the
+> sweep drains before it looks, begins a due cut while busy and asks for one once idle. Reds: the restart rule
+> (image-level and w-svn's two tests), the chain, the held bound under a busy sweep, the sweep's look. HELD for main's
+> 57k round with samplers (it reverted once on persistence).
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
