@@ -788,6 +788,48 @@ fn a_landing_of_several_refs_is_mapped_by_the_shards_task_after_its_step() {
   });
 }
 
+/// P2 piece 3 (CLAUDE.md §3: a step over user-scaled data is bounded; `slates_git::store::Shedding`). Do: push the
+/// fixtures' `create`, its objects in its pack. Expect: `ok`; its maps by object given up by its landing and freed by
+/// the shard's task after its step (`vcs_store.landed.shed_entries` moved by three entries an object at least: its
+/// place, its pack entry and its position; none left queued, the task ended).
+#[test]
+fn a_landed_pushs_maps_by_object_are_freed_by_the_shards_task_after_its_step() {
+  on_stored_shard_awaited(["shed"], |[repository]| async move {
+    let created = scenario!("create");
+    let received = pushed_awaited(repository, created.request).await;
+    assert_eq!(reasons(&received), [b"ok"]);
+    let shed = |state: &mut ShardState| {
+      let freed = state
+        .refusals
+        .get(crate::vcs_store::SHED_ENTRIES)
+        .copied()
+        .unwrap_or(0);
+      (state.vcs_stores.sheds(), freed)
+    };
+    let mut turns = 0;
+    while on_state(shed).0 != (0, false) {
+      turns += 1;
+      assert!(
+        turns < MAPPING_TURNS,
+        "the landed push's maps were never freed"
+      );
+      slates_rt::futures::yield_now().await;
+    }
+    let positions = on_state(|state| {
+      state
+        .vcs_stores
+        .git_ref(repository)
+        .map_or(0, |(_, store)| store.repository.counters().positions)
+    });
+    let (_, freed) = on_state(shed);
+    // Each object its place, its pack entry and its position: three entries an object at least.
+    assert!(
+      positions > 0 && freed >= positions.saturating_mul(3),
+      "freed {freed} entries for {positions} objects"
+    );
+  });
+}
+
 /// Format: the ref the atomic test's fixtures push as `copy`.
 const COPY_REF: &[u8] = b"refs/heads/copy";
 /// Format: the tag the atomic test's fixtures push.

@@ -98,7 +98,9 @@ pub use encoding::{Encoding, EncodingCounters};
 pub use fragment::{FragmentRefused, Placed, Stored};
 pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
 pub use positions::Positions;
-pub use push::{Entries, HeldAt, HeldObject, Incoming, Push, PushRefused, StoredAt, stored_bytes};
+pub use push::{
+  Entries, HeldAt, HeldObject, Incoming, Push, PushRefused, Shedding, StoredAt, stored_bytes,
+};
 pub use repository::abbrev::Abbrev;
 pub use repository::admitting::Admitting;
 pub use repository::deriving::{Derived, Deriving};
