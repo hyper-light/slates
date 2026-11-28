@@ -1333,9 +1333,33 @@
 > `a_retired_members_content_history_frees_no_key_or_tree_node_to_the_heap`). Page return, one debug run each of the server's wide tests (a point, not a judged figure): the copy's landing
 > step most off its CPU 3.9 µs, 20,054,184 bytes returned over 23 steps, none in a step whose footprint fell; the
 > move's 3.13 ms, in a step whose footprint fell 114,557,048 bytes (185,811,088 returned over 126 steps), so the
-> move's remains still return pages inside a step. Next, unit
-> 1b: the entry lists as runs of a lineage store (about 9,000 fewer), then 1c: the values' pieces (about 9,000 fewer);
-> the 1 ms assert returns with the piece after which the remains' drop frees nothing large.
+> move's pages were not the remains': see the buffer entry below. The remains' 9.8 MB took about a fifth of a 50 MB
+> return, and the whole content history 3.5 MB of it (debug, byte table at 9,000 paths). So 1c (the values' pieces as
+> runs, which makes a value `Copy`) and then 1b (the entry lists as plain runs) come after the pile's cuts (main's
+> ruling of 2026-11-28 01:31).
+
+> **A-920 a landing's increment buffer BUILT (w-svn, 2026-11-28; main's rulings of 01:38 and 01:46): the buffer is the
+> shard's, reserved once at the increment's exact length.** A test-only probe of the wide move's slowest landing step
+> (landing.prepare, 1,173,333 ns off its CPU, the footprint falling 25,427,992 bytes) saw the shard free one block,
+> 262,144 bytes, and the reaper 144 blocks, 8,999 bytes, in it. The pages came from earlier frees; one large free paid
+> for all of them. Its large frees were `IncrementEncoding`'s output doubling through 64 KiB to 1 MiB, then the 2 MiB
+> buffer dropped after its hold, for a 1,250,037-byte increment. Now `Increment::encode_step` measures first, a doc piece
+> a unit (`OpsDoc::piece_len`), and reserves its buffer once (`an_increments_stepped_encoding_reserves_exactly_its_length`
+> holds the room equal to the length). The buffer is the shard's (`staging::IncrementBuffer`): a landing takes it and
+> gives it back emptied, the larger kept within the green-chain byte cap and charged to the shard's budget as
+> retention while kept. A buffer too small, or not kept, is replaced by one of exact length and the old one goes to the
+> reaper (`repository.svn_commit.increment_buffer_reused`, `_made`, `_let_go`). Red: the wide move's prepare steps made
+> 10 frees of 64 KiB or more, 0 after (`staging::returned`'s `prepare_large_frees`, by the server's test-only counting
+> allocator). One debug run each after, a point: the copy's landing step most off its CPU 22.5 µs, 3,096,576 bytes
+> returned; the move's 26.1 µs, 2,654,208 bytes, none in a step whose footprint fell (it had been 1.17-3.13 ms with a
+> 25-115 MB fall). The 1 ms bar is not asserted in the wide tests (main's ruling of 02:42): debug in a loaded lib suite
+> preempts a step past it with no page return (1.70 ms with returned_steps 0 at load 39; 34.7 ms in the server set's
+> run), so main's bare-metal release rounds hold it, and the count holds the fix. On main's head after 86a8f9885 the old
+> encoder's runs showed no footprint fall at all (three debug runs, returned_bytes 0), where 1b7ea3a12's had 20-185 MB:
+> a change of regime main attributes by its own three-arm run (C = 1b7ea3a12, A = 86a8f9885, B = A less 0bf1837a7).
+> Left: the chain entry's measure (19,499 frees, 2.4 MB, in one prepare unit), then the pile the
+> shard frees before a return: 838,930 blocks and 179,702,034 bytes before the move's first, against the reaper's
+> 64,933 and 5,353,567. By phase, stage.recording first (374 MB freed in one copy import), probe first.
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a

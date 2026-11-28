@@ -330,12 +330,24 @@ pub(crate) mod returned {
     pub(crate) bytes: u64,
     /// How far it fell in the step that spent the most off its CPU, and that step's off-CPU time.
     pub(crate) slowest: (u64, u64),
+    /// The frees of `crate::counting::LARGE_BYTES` or more the landings' prepare steps made on the thread (A-920: none,
+    /// since the increment buffer is kept and reserved once).
+    pub(crate) prepare_large_frees: u64,
   }
 
   std::thread_local! {
     static RETURNED: Cell<Returned> = const {
-      Cell::new(Returned { steps: 0, off_ns: 0, bytes: 0, slowest: (0, 0) })
+      Cell::new(Returned { steps: 0, off_ns: 0, bytes: 0, slowest: (0, 0), prepare_large_frees: 0 })
     };
+  }
+
+  /// A prepare step that made `large` frees of `crate::counting::LARGE_BYTES` or more.
+  pub(super) fn prepared(large: u64) {
+    RETURNED.with(|kept| {
+      let mut now = kept.get();
+      now.prepare_large_frees = now.prepare_large_frees.saturating_add(large);
+      kept.set(now);
+    });
   }
 
   /// How far the footprint read before a step as `before` has fallen now.
@@ -439,10 +451,120 @@ struct Preparing {
   phase: PreparePhase,
 }
 
+/// The buffer a shard's landings encode their versions' increments into ([`Staging::prepared`]), kept between them
+/// (A-920, main's ruling of 2026-11-28 01:38 and its conditions of 01:46).
+///
+/// **Why.** Each version's increment was encoded into a buffer of its own that doubled as it went, and was dropped
+/// once its hold had copied it: one import's 1,250,037-byte increment freed 64 KiB, 128 KiB, 256 KiB, 512 KiB and 1 MiB
+/// as it grew, then its 2 MiB buffer, all on the shard. The 512 KiB one was freed inside the landing step whose
+/// footprint fell 29.8 MB, 1.19 ms off its CPU (debug, the wide move import): one large free paying the allocator's
+/// return of pages the shard had freed before. So the encoding is measured and its buffer reserved once at its exact
+/// length (`slates_merge::engine::IncrementEncoding`), into the buffer the shard keeps.
+///
+/// **What.** A landing takes the kept buffer ([`IncrementBuffer::take`]) and writes into it when its room holds the
+/// increment; otherwise the encoding makes one of the increment's exact length and the smaller one goes to the reaper
+/// ([`IncrementBuffer::began`]). Given back emptied once its hold has copied it ([`IncrementBuffer::give_back`]), the
+/// larger of it and any buffer kept meanwhile is kept, so the kept room is the largest increment the shard encoded,
+/// and no buffer the landing let go is freed on the shard. [`INCREMENT_BUFFER_REUSED`] and [`INCREMENT_BUFFER_MADE`]
+/// count which way each encoding went, so a reuse path that never runs cannot pass for one that does.
+///
+/// **Its bound and charge.** The kept room is at most the partition's green-chain byte cap
+/// (`merge_service::rejected_cache_budget`), the one merge byte bound: an increment's encoding is a chain entry's, and a
+/// buffer past the cap is let go, not kept. While kept it is charged to the shard's budget as retention (the A-16
+/// ledger's retention line, `slates_mem::budget::ShardBudget::charge_retention`), exactly its room; a landing that takes it credits the
+/// charge back, the buffer then the landing's working memory as the buffer it replaces was. A charge refused lets the
+/// buffer go to the reaper, counted ([`INCREMENT_BUFFER_LET_GO`]).
+#[derive(Debug, Default)]
+pub(crate) struct IncrementBuffer {
+  /// The buffer, while no landing has it.
+  kept: Option<Vec<u8>>,
+  /// The bytes charged to the shard's budget for it: its room while kept, else nothing.
+  charged: u64,
+}
+
+impl IncrementBuffer {
+  /// The kept buffer, its charge credited back; an empty one when none is kept (another landing has it, or none was).
+  fn take(state: &mut ShardState) -> Vec<u8> {
+    let Some(buffer) = state.increment_buffer.kept.take() else {
+      return Vec::new();
+    };
+    let charged = core::mem::take(&mut state.increment_buffer.charged);
+    state.store.budget.credit_retention(charged);
+    buffer
+  }
+
+  /// An encoding begun in a buffer of `room` has ended: counted as reusing it, or as having made one of its exact
+  /// length (no buffer kept, or the kept one too small, which goes to the reaper).
+  fn began(
+    state: &mut ShardState,
+    encoding: &mut slates_merge::engine::IncrementEncoding,
+    room: usize,
+  ) {
+    match encoding.take_outgrown() {
+      Some(outgrown) => {
+        let_go(outgrown);
+        state.count(INCREMENT_BUFFER_MADE, 1);
+      }
+      None if room == 0 => state.count(INCREMENT_BUFFER_MADE, 1),
+      None => state.count(INCREMENT_BUFFER_REUSED, 1),
+    }
+  }
+
+  /// `buffer` given back emptied, its hold having copied it: kept when it is larger than the buffer kept now, within
+  /// the bound and charged (the smaller of the two let go to the reaper); else let go itself.
+  fn give_back(state: &mut ShardState, mut buffer: Vec<u8>) {
+    buffer.clear();
+    let kept_room = state
+      .increment_buffer
+      .kept
+      .as_ref()
+      .map_or(0, Vec::capacity);
+    if buffer.capacity() <= kept_room {
+      let_go(buffer);
+      return;
+    }
+    let room = u64::try_from(buffer.capacity()).unwrap_or(u64::MAX);
+    let bound =
+      u64::try_from(crate::merge_service::rejected_cache_budget(state)).unwrap_or(u64::MAX);
+    if !charged_within(state, room, bound) {
+      state.count(INCREMENT_BUFFER_LET_GO, 1);
+      let_go(buffer);
+      return;
+    }
+    let earlier = core::mem::replace(&mut state.increment_buffer.charged, room);
+    state.store.budget.credit_retention(earlier);
+    if let Some(smaller) = state.increment_buffer.kept.replace(buffer) {
+      let_go(smaller);
+    }
+  }
+}
+
+/// Whether `room` bytes, at most `bound`, were charged to the shard's budget as retention ([`IncrementBuffer`]'s "Its
+/// bound and charge"): refused, nothing charged, past the bound or past what the budget admits.
+fn charged_within(state: &mut ShardState, room: u64, bound: u64) -> bool {
+  if room > bound {
+    return false;
+  }
+  state.store.make_room(room);
+  state.store.budget.charge_retention(room).is_ok()
+}
+
+/// `buffer` sent to the daemon's reaper to be freed there, never on the shard ([`IncrementBuffer`]).
+fn let_go(buffer: Vec<u8>) {
+  if buffer.capacity() == 0 {
+    return;
+  }
+  let mut reaped = slates_merge::reaped::Reaped::default();
+  reaped.whole(Box::new(buffer));
+  crate::reaper::reap(reaped);
+}
+
 /// Where the next version of a [`Preparing`] stands.
 enum PreparePhase {
-  /// Its increment being encoded.
-  Encoding(slates_merge::engine::IncrementEncoding),
+  /// Its increment's encoding not begun: it begins in the shard's kept buffer ([`IncrementBuffer`]).
+  Begin,
+  /// Its increment being encoded, and the room of the buffer it began in.
+  Encoding(slates_merge::engine::IncrementEncoding, usize),
   /// Its increment's encoding being held.
   Holding(Vec<u8>, crate::merge_service::IncrementHold),
   /// Its chain entry being encoded, its increment held.
@@ -471,28 +593,42 @@ fn prepare_some(
       .saturating_add(u64::try_from(index).unwrap_or(u64::MAX))
       .saturating_add(1);
     let chunk = usize::try_from(state.config.copy_slice_bytes()).unwrap_or(usize::MAX);
-    preparing.phase = match core::mem::replace(
-      &mut preparing.phase,
-      PreparePhase::Encoding(slates_merge::engine::IncrementEncoding::default()),
-    ) {
-      PreparePhase::Encoding(mut encoding) => {
+    preparing.phase = match core::mem::replace(&mut preparing.phase, PreparePhase::Begin) {
+      PreparePhase::Begin => {
+        let buffer = IncrementBuffer::take(state);
+        let room = buffer.capacity();
+        PreparePhase::Encoding(
+          slates_merge::engine::IncrementEncoding::with_buffer(buffer),
+          room,
+        )
+      }
+      PreparePhase::Encoding(mut encoding, room) => {
         match staged
           .increment
           .encode_step(&mut encoding, chunk, &mut spent)
         {
-          Some(encoded) => PreparePhase::Holding(
-            encoded,
-            crate::merge_service::IncrementHold::begin(green, version),
-          ),
-          None => PreparePhase::Encoding(encoding),
+          Some(encoded) => {
+            IncrementBuffer::began(state, &mut encoding, room);
+            PreparePhase::Holding(
+              encoded,
+              crate::merge_service::IncrementHold::begin(green, version),
+            )
+          }
+          None => PreparePhase::Encoding(encoding, room),
         }
       }
       PreparePhase::Holding(encoded, mut hold) => match hold.unit(state, (&encoded, chunk)) {
-        Some(Ok(held)) => PreparePhase::Entry(
-          held,
-          slates_merge::chain_entry::encoding(held.inputs, staged.identity),
-        ),
-        Some(Err(refusal)) => return Err(refusal),
+        Some(Ok(held)) => {
+          IncrementBuffer::give_back(state, encoded);
+          PreparePhase::Entry(
+            held,
+            slates_merge::chain_entry::encoding(held.inputs, staged.identity),
+          )
+        }
+        Some(Err(refusal)) => {
+          IncrementBuffer::give_back(state, encoded);
+          return Err(refusal);
+        }
         None => PreparePhase::Holding(encoded, hold),
       },
       PreparePhase::Entry(held, mut encoding) => {
@@ -507,7 +643,7 @@ fn prepare_some(
               held,
               entry,
             });
-            PreparePhase::Encoding(slates_merge::engine::IncrementEncoding::default())
+            PreparePhase::Begin
           }
           None => PreparePhase::Entry(held, encoding),
         }
@@ -531,7 +667,7 @@ pub(crate) fn prepared_whole(
   let mut preparing = Preparing {
     head,
     ready: Vec::new(),
-    phase: PreparePhase::Encoding(slates_merge::engine::IncrementEncoding::default()),
+    phase: PreparePhase::Begin,
   };
   match prepare_some(state, (batch, green), &mut preparing, u64::MAX) {
     Ok(_) => Ok(preparing.ready),
@@ -541,6 +677,18 @@ pub(crate) fn prepared_whole(
     }
   }
 }
+
+/// Counter: a landing's increment encoded into the shard's kept buffer, its room enough ([`IncrementBuffer`]). Format: a
+/// counter name in the daemon's status report.
+pub(crate) const INCREMENT_BUFFER_REUSED: &str = "repository.svn_commit.increment_buffer_reused";
+
+/// Counter: a landing's increment encoded into a buffer made at its exact length, none kept or the kept one too small
+/// ([`IncrementBuffer`]). Format: a counter name in the daemon's status report.
+pub(crate) const INCREMENT_BUFFER_MADE: &str = "repository.svn_commit.increment_buffer_made";
+
+/// Counter: a landing's increment buffer not kept, past the green-chain byte cap or its charge refused, and sent to the
+/// reaper ([`IncrementBuffer`]). Format: a counter name in the daemon's status report.
+pub(crate) const INCREMENT_BUFFER_LET_GO: &str = "repository.svn_commit.increment_buffer_let_go";
 
 /// Counter: a step of a landing's making its versions ready for the register's op ([`Staging::prepared`]): more than one
 /// a landing shows it was sliced. Format: a counter name in the daemon's status report.
@@ -2015,7 +2163,7 @@ impl Staging {
     let mut preparing = Preparing {
       head,
       ready: Vec::new(),
-      phase: PreparePhase::Encoding(slates_merge::engine::IncrementEncoding::default()),
+      phase: PreparePhase::Begin,
     };
     let mut refused = None;
     until_done(|state| {
@@ -2023,7 +2171,12 @@ impl Staging {
       let Some(batch) = self.batch.as_ref() else {
         return true;
       };
-      match prepare_some(state, (batch, green), &mut preparing, slice_deadline_ns()) {
+      #[cfg(test)]
+      let large = crate::counting::large_frees();
+      let prepared = prepare_some(state, (batch, green), &mut preparing, slice_deadline_ns());
+      #[cfg(test)]
+      returned::prepared(crate::counting::large_frees().saturating_sub(large));
+      match prepared {
         Ok(done) => done,
         Err(refusal) => {
           refused = Some(refusal);

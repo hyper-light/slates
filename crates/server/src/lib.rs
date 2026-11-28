@@ -40,6 +40,8 @@ mod content_holder;
 mod content_pool;
 pub(crate) mod content_ranges;
 pub mod content_retention;
+#[cfg(test)]
+mod counting;
 mod idle_sweep;
 mod image_pages;
 pub(crate) mod memory_gauges;

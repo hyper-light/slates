@@ -1533,6 +1533,9 @@ pub struct ShardState {
   pub pending_tombstones: BTreeMap<ObjectId, PendingTombstone>,
   /// On the control shard: the work route keeper's nudge and waker (A-288, `crate::work_route`).
   pub(crate) work_routes: crate::work_route::WorkRoutes,
+  /// The buffer a landing encodes its versions' increments into, kept between landings at its largest room and charged
+  /// to the shard's budget while kept (A-920, `crate::repository::svn_commit::staging::IncrementBuffer`). One a shard.
+  pub(crate) increment_buffer: crate::repository::svn_commit::staging::IncrementBuffer,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.

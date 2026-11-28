@@ -1727,6 +1727,124 @@ mod tests {
     }
   }
 
+  /// Shape: the files of [`several_files`], so its ops document has several paths, a node and several ops.
+  const SEVERAL: usize = 40;
+
+  /// An increment writing [`SEVERAL`] files under two directories, one of them a node the work moved, with evidence and
+  /// a named run: every kind of piece the encoding has.
+  fn several_files() -> Increment {
+    let mut doc = OpsDoc::new();
+    let mut post_state = Vec::new();
+    for n in 0..SEVERAL {
+      let body = format!("the bytes of file {n}, at some length").into_bytes();
+      let path = doc.paths.intern(&format!("dir{}/file{n}.c", n % 2));
+      doc.ops.push(Op {
+        kind: OpKind::Overwrite,
+        flags: 0,
+        path,
+        at: 0,
+        len: body.len() as u64,
+        src: post_state.len() as u64,
+      });
+      post_state.extend_from_slice(&body);
+    }
+    let moved = doc.paths.intern("dir0");
+    doc.nodes.intern(crate::ops_doc::NodeRef {
+      path: moved,
+      origin: crate::ops_doc::NodeOrigin::Base,
+    });
+    doc.canonicalize();
+    let mut increment = Increment {
+      id: [3; 32],
+      base: 5,
+      doc,
+      post_state,
+      evidence: vec![[4; 32]],
+      named: Default::default(),
+    };
+    increment.push_named(crate::named::NamedRun {
+      identity: crate::named::Identity {
+        hash: [5; 32],
+        len: 9,
+      },
+      offset: 0,
+      len: 9,
+    });
+    increment
+  }
+
+  /// `increment` encoded a unit a step from `encoding` to its end.
+  fn encoded_stepped(
+    increment: &Increment,
+    encoding: &mut crate::engine::IncrementEncoding,
+  ) -> Vec<u8> {
+    loop {
+      if let Some(bytes) = increment.encode_step(encoding, 1, &mut || true) {
+        return bytes;
+      }
+    }
+  }
+
+  /// A-920 (main's ruling of 2026-11-28 01:46: the measure must fail loudly when wrong). Do: encode a unit a step, from
+  /// an empty buffer, a one-file increment and one of [`SEVERAL`] files with a node, evidence and a named run. Expect the
+  /// bytes the whole encoding gives, the measure equal to their length, and the buffer reserved at exactly that length:
+  /// a measure short by a byte would grow the buffer (its room past the length), long by one would leave a byte unused.
+  #[test]
+  fn an_increments_stepped_encoding_reserves_exactly_its_length() {
+    for increment in [one_file(b"abcdef"), several_files()] {
+      reserves_exactly(&increment);
+    }
+  }
+
+  /// [`an_increments_stepped_encoding_reserves_exactly_its_length`] for one increment.
+  fn reserves_exactly(increment: &Increment) {
+    let mut encoding = crate::engine::IncrementEncoding::default();
+    let bytes = encoded_stepped(increment, &mut encoding);
+    assert_eq!(bytes, increment.encode());
+    assert_eq!(encoding.measured(), Some(bytes.len()), "the measure");
+    assert_eq!(bytes.capacity(), bytes.len(), "the room reserved");
+    assert!(
+      encoding.take_outgrown().is_none(),
+      "an empty buffer set aside"
+    );
+  }
+
+  /// A-920 (main's ruling of 2026-11-28 01:38: the landing's encoding buffer kept across landings). Do: encode
+  /// [`several_files`] into a buffer handed in with at least its room, counting the heap frees the encoding makes; then
+  /// into one too small. Expect no free with the room there, the buffer's own room kept and its earlier bytes gone; and
+  /// with too little, the small buffer handed back whole (not freed) and the bytes written into one of exactly their
+  /// length. Red before: the encoding wrote into a buffer of its own that doubled as it went, freeing each smaller one.
+  #[test]
+  fn an_increment_encoded_into_a_buffer_with_its_room_frees_nothing() {
+    let increment = several_files();
+    let whole = increment.encode();
+    let mut room = Vec::with_capacity(whole.len().saturating_mul(2));
+    room.extend_from_slice(b"earlier bytes");
+    let kept = room.capacity();
+    let mut encoding = crate::engine::IncrementEncoding::with_buffer(room);
+    let before = crate::counting::frees();
+    let bytes = encoded_stepped(&increment, &mut encoding);
+    assert_eq!(
+      crate::counting::frees() - before,
+      0,
+      "frees encoding into a buffer with its room"
+    );
+    assert_eq!(
+      (bytes.as_slice(), bytes.capacity()),
+      (whole.as_slice(), kept)
+    );
+    let mut small = crate::engine::IncrementEncoding::with_buffer(Vec::with_capacity(16));
+    let bytes = encoded_stepped(&increment, &mut small);
+    assert_eq!(
+      (bytes.as_slice(), bytes.capacity()),
+      (whole.as_slice(), whole.len())
+    );
+    assert_eq!(
+      small.take_outgrown().map(|outgrown| outgrown.capacity()),
+      Some(16)
+    );
+  }
+
   /// One effect of every kind [`put_applied`] writes, each of its encodings: a splice as declared and one mapped, a copy
   /// with and without edits, a tree copy with and without its fix.
   fn every_kind_applied(increment: &Increment) -> Vec<Applied> {
