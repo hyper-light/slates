@@ -970,3 +970,8 @@
   handed read calls derive_for_read with no live fetch held, so it meets a let-go the design defers: the one bring-back
   (8-11 ms) is the test's premise, not the product's. The fix, owed as its own piece: the test's read holds
   Live::fetch as a fetch's request does, so its handed read brings back 0 and the margin is the hand-over's alone.
+- 11-28 03:41 PST: LANDED the mid-derivation test's premise, on main as ba83f870f: the test's read holds vcs_share::Live::fetch from
+  its arrival, as a fetch's answer is counted, so the let-go behind the push is owed past it; the handed read held to
+  bringing back 0 (red 1). Green alone (43.1/44.2 ms) and inside git_push:: beside its neighbours, twice (47.2/36.7,
+  60.9/52.9 ms, brought 0). w-shared's 3.65x failure on 24edc3158 was the bring-back (brought 1, 125.7 ms), not the
+  hand-over's cost. WAITING: main's v2.0.0 matrix run and the resident figure.
