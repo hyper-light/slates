@@ -1088,7 +1088,11 @@
 > ms of the op's 4.29 (debug), and the cost was the identity's hash of the whole op (4.92 ms), which hashes each entry as
 > its digest since 13c. The log write's about 48 bytes a path stays, for a wider probe to judge. Release probe 17's
 > move leader was the test's own setup (the simulated host's copy of the dump), which now holds the dump moved in, never copied; the
-> product's create and begin print apart (`SETUP`). Copy's release unit was an allocator's batch of freed pages returned
+> product's create and begin print apart (`SETUP`). Release probe 18's move leader, `begin` (1.4 ms, CPU-bound, at any
+> load), was the simulated host again: its `open_file` cloned the whole dump as the open's snapshot (debug: 0.43 of
+> `begin`'s 0.46 ms, about twice add's for move's dump). Since (w-svn, main's ruling (a) of 2026-11-27 17:29) an open
+> copies nothing, as a real host's does, and a file displaced while open is retired whole, the files beneath a removed
+> directory too (`SimHost::retire`); held by `crates/vfs/tests/sim_opens.rs` (red: the open held the file's 1 MiB). Copy's release unit was an allocator's batch of freed pages returned
 > in one free (1.2-1.3 ms of system time in release); since the reaper, what a release frees is dropped on the daemon's
 > reaper thread (25 µs the longest unit, debug), owed probe 18's release read. The shard's handed and in-place counts are
 > read by the tests alone, not yet the status report. Move's `stage.committing` was the commit's node moves, a walk of
