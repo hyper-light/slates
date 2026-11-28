@@ -28,3 +28,8 @@ seconds even at about 1 µs a step in release.
 2. Write index rows a run a step, as many as fit the room, as the ask's gathering already reads `rows_a_step` at a
    time: per-row steps down to a few per window of bytes.
 A 600-changeset run confirming the per-revision scaling is going now.
+
+## 2026-11-27 18:20 PST: cut 2 of my list (index rows a run a step) landed, c5862b6a0
+`Index::iter_range` (slates-vcs) plus `HgIndex::numbers_from`. `rows_held` now gathers each log's numbers in one range
+walk, and the index stage writes from them with no lookups. 0.37 index reads a revision, from 4.47. The kept rendered
+length (cut 1 above) is next, with an oracle, a recovery story and a typed stale refusal.
