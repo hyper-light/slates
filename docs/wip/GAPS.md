@@ -4346,12 +4346,10 @@
 > publish, last, and the mode history appended in place and taken back at a refusal; U2 BUILT, every value history
 > alike; U3 BUILT, the change index; U4 BUILT, `file_removed` and the `*_changed` maps written aside; U5 BUILT, the
 > identity's marks aside; U6 BUILT, the seven chunk-free current maps forked into the stage; U7 BUILT, the content map
-> forked and U5's drain-first rule deleted (design's part 3c). **Gap until U8:** the content history is still written
-> in place, so a stage given up after `set_file`'s re-anchor leaves the published history naming the stage's new
-> block (blocks 6 live against 5); **rule:** no production path drives a staged commit, and `repository::push`'s
-> landing is not wired to it, until U8 has landed. Owed, in main's order of 03:10: the content history staged with
-> chunk-holding copies (its red first: that refusal's blocks, (6, 4) from (5, 4)), the commit's scalars written back
-> at the publish, and the staged commit wired into `repository::push`'s landing (t_a752's 14 ms the bar). Found by reading (2026-11-28, not worked): `file_removed` keeps only a
+> forked and U5's drain-first rule deleted; U8 BUILT, the content history forked with chunk-holding copies and a
+> stage's re-anchor in full, closing U7's gap (design's part 3c). Owed, in main's order of 03:10: the commit's scalars
+> written back at the publish, then the staged commit wired into `repository::push`'s landing (t_a752's 14 ms the
+> bar). Found by reading (2026-11-28, not worked): `file_removed` keeps only a
 > path's latest removal, so `stack::levels`'s `== version` read (`levels.rs`:293) and its span read (:326) miss an
 > earlier removal that a later one overwrote.
 >

@@ -8,15 +8,13 @@
 //! history stood at the stage's first touch ([`Marks`], U1 and U2). The change index's version list is recorded above
 //! the head and taken out at a refusal, and the earlier entries it makes no longer last are marked at the publish
 //! (U3). Each key's last change and the identity's marks are written aside and moved in at the publish
-//! (`last_changes`, U4 and U5). The eight current maps are forked at the stage's begin and the commit's steps read and
-//! write the forks, every reader between steps the published maps ([`Forks`], U6 and U7), so a reader's fold of the
-//! identity reads only what is published. **Owed:** the content history staged with its values' chunks held, the
-//! commit's scalars written back at the publish, and the staged commit wired into a push's landing.
-//!
-//! **Gap until U8, and its rule** (main 01a20182's ruling (b) of 2026-11-28 03:41). The content history is still
-//! written in place: a stage given up after `set_file`'s re-anchor leaves the published history changed, its latest
-//! value naming the stage's new block (blocks 6 live against 5 in `publish_tests`). So no production path drives a
-//! staged commit until U8 has landed: `repository::push`'s landing is not wired to it before then.
+//! (`last_changes`, U4 and U5). The eight current maps and the content history are forked at the stage's begin, and
+//! the commit's steps read and write the forks, every reader between steps the published ones ([`Forks`], U6 to U8):
+//! a reader's fold of the identity reads only what is published, and a node of the content history the stage copies
+//! holds its values' chunks (`history::HistoryHolders`), so the stage's copies and the published values release each
+//! chunk once. A staged commit re-anchors a changed file's history in full, never by the layered route, which repoints
+//! the path's shared anchor chunk (U8). **Owed:** the commit's scalars written back at the publish, then the staged
+//! commit wired into a push's landing (main 01a20182's order of 2026-11-28 03:10).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,6 +28,9 @@ use crate::special::SpecialNode;
 /// the published maps. A publish swaps them in for good and releases the published roots; a refusal releases them.
 /// What a release frees is the nodes the stage copied: O(the paths it changed × their depth).
 struct Forks {
+  /// The content history (A-752 part 3c U8): a node the stage copies holds its entries' chunks
+  /// ([`crate::history::HistoryHolders`]), and a freed node gives them back, so each chunk is released once.
+  content_history: Dim<crate::history::Entries>,
   /// The content map (A-752 part 3c U7): a node the stage copies holds the blocks it names, and a freed node lets them
   /// go, so the stage's copies and the published ones release each block once.
   content: Files,
@@ -199,6 +200,7 @@ impl Green {
   /// The stage's forks of the eight current maps, one count each ([`Forks`]).
   fn fork_maps(&mut self) -> Forks {
     Forks {
+      content_history: self.content_history.fork(),
       content: self.content.fork(),
       specials: self.specials.fork(),
       dirs: self.dirs.fork(),
@@ -213,6 +215,9 @@ impl Green {
   /// Exchanges the green's eight current maps with `forks`, the arenas staying in the green: the stage's
   /// in place for a step, and the published back after it. Twice is none.
   fn swap_forks(&mut self, forks: &mut Forks) {
+    self
+      .content_history
+      .swap_with_fork(&mut forks.content_history);
     self.content.swap_with_fork(&mut forks.content);
     self.specials.swap_with_fork(&mut forks.specials);
     self.dirs.swap_with_fork(&mut forks.dirs);
@@ -225,6 +230,13 @@ impl Green {
 
   /// Gives `forks`' holds back in the green's arenas: the nodes no published map shares freed.
   fn release_forks(&mut self, forks: Forks) {
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
+    self
+      .content_history
+      .release_fork_held(forks.content_history, &mut holders);
     self.content.release_fork(forks.content);
     self.specials.release_fork(forks.specials);
     self.dirs.release_fork(forks.dirs);

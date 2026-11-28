@@ -2964,3 +2964,124 @@ fn a_readers_fold_between_a_staged_copys_turns_reads_no_copy_above_the_head() {
     }
   }
 }
+
+/// Every path of the staged-commit tests ([`super::fold_tests::PATHS`]) made as an eight-byte file.
+fn made_eight() -> Work {
+  let mut work = Work::default();
+  for path in super::fold_tests::PATHS {
+    work.create(path, b"made0123");
+  }
+  work
+}
+
+/// One byte of each named file overwritten in place (`changes`: the path's place, the byte's offset, the byte): the
+/// change the history's layered re-anchor takes (A-803).
+fn overwrites(changes: &[(usize, u8, u8)]) -> Work {
+  let mut work = Work::default();
+  for (index, at, byte) in changes {
+    let path = super::fold_tests::PATHS[*index % super::fold_tests::PATHS.len()];
+    work.overwrite(path, u64::from(*at % 8), &[*byte]);
+  }
+  work
+}
+
+/// The overwrite works [`proptest`] generates: one to six, each of one to three bytes.
+fn overwrite_works() -> impl Strategy<Value = Vec<Vec<(usize, u8, u8)>>> {
+  prop::collection::vec(
+    prop::collection::vec((0usize..5, any::<u8>(), any::<u8>()), 1..4),
+    1..7,
+  )
+}
+
+/// A green given every path ([`made_eight`]) and then `works` whole.
+fn overwritten(works: &[Vec<(usize, u8, u8)>]) -> Green {
+  let mut green = Green::new();
+  accept(&mut green, &made_eight(), 1);
+  for (id, changes) in (2u64..).zip(works) {
+    accept(&mut green, &overwrites(changes), id);
+  }
+  green
+}
+
+/// Gives up the stage of `works`' last work after `turns` steps on a green given the others: whether it finished within
+/// its turns, refused where the content history, the content map's live blocks and nodes or any chunk's holds were left
+/// otherwise than before.
+fn overwrite_given_up_after(works: &[Vec<(usize, u8, u8)>], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let mut green = overwritten(before);
+  let inc = overwrites(last).at(u64::MAX, green.head());
+  let Judgment::Accepted(held) = green.judge(&inc) else {
+    return Ok(true);
+  };
+  let history = super::publish_tests::content_history_held(&green);
+  let (live, holds) = (green.content.live(), green.chunks.holds());
+  let mut staging = green.begin_staging(held);
+  for _ in 0..turns {
+    if let super::StagingStep::Staged = green.staging_step(&mut staging, &mut || true) {
+      return Ok(true);
+    }
+  }
+  green.abandon_staging(staging);
+  if super::publish_tests::content_history_held(&green) != history {
+    return Err(format!(
+      "a stage given up after {turns} turns left the content history changed"
+    ));
+  }
+  let left = green.content.live();
+  if left != live {
+    return Err(format!(
+      "a stage given up after {turns} turns left (blocks, nodes) {left:?}, from {live:?}"
+    ));
+  }
+  // Every chunk's holds as before: a recount from the values' pieces leaves out a layered anchor's layers, which hold
+  // the overwritten bytes of the history the serial commits made (A-803).
+  let left = green.chunks.holds();
+  if left != holds {
+    return Err(format!(
+      "a stage given up after {turns} turns left chunk holds {left:?}, from {holds:?}"
+    ));
+  }
+  Ok(false)
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
+
+  /// A-752 part 3c U8 (a staged overwrite re-anchors its own copies in full; main 01a20182's rulings of 2026-11-28 01:29
+  /// and 04:01). Do: on a serial twin and a staged green, every path made; then generated works overwriting a byte of a
+  /// standing file in place, the change the history's layered re-anchor takes; each staged one unit a step on the
+  /// staged green, the published content history and every value's bytes read through the chunks between every two
+  /// steps, then published, and given whole to the serial twin. Expect the published history held as before between
+  /// the steps, every version's bytes the twin's after each publish, and the chunk guard. Red with a stage allowed the
+  /// layered route: it repoints the path's shared anchor chunk, which the published values name.
+  #[test]
+  fn a_staged_overwrite_re_anchors_its_own_copies_and_leaves_the_published_anchor(steps in overwrite_works()) {
+    let (mut serial, mut staged) = (overwritten(&[]), overwritten(&[]));
+    for (id, changes) in (2u64..).zip(&steps) {
+      let inc = overwrites(changes).at(id, staged.head());
+      let version = super::publish_tests::content_history_unseen(&mut staged, &inc).map_err(TestCaseError::fail)?;
+      let expected = accept(&mut serial, &overwrites(changes), id);
+      prop_assert_eq!(version, Some(expected));
+      prop_assert_eq!(
+        super::publish_tests::content_bytes_read(&staged),
+        super::publish_tests::content_bytes_read(&serial)
+      );
+    }
+  }
+
+  /// A-752 part 3c U8 (a staged overwrite given up at every turn). Expect the content history, the content map's live
+  /// blocks and nodes, and every chunk's holds as before.
+  #[test]
+  fn a_staged_overwrite_given_up_at_any_turn_leaves_the_content_history_as_it_was(steps in overwrite_works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if overwrite_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+}

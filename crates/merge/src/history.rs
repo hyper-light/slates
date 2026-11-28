@@ -255,6 +255,18 @@ pub(crate) struct Chunks {
 }
 
 impl Chunks {
+  /// Each live chunk's slot and the pieces its count says name it: what a test recounts against the values that hold
+  /// them (A-752 part 3c's chunk guard).
+  #[cfg(test)]
+  pub(crate) fn holds(&self) -> std::collections::BTreeMap<usize, usize> {
+    self
+      .slots
+      .iter()
+      .enumerate()
+      .filter_map(|(slot, held)| held.as_ref().map(|(_, count)| (slot, *count)))
+      .collect()
+  }
+
   /// The layers reads have examined, in all ([`Chunks::resolve_into`]).
   pub(crate) fn layers_examined(&self) -> u64 {
     self.examined.get()
@@ -573,6 +585,31 @@ impl Chunks {
 /// A path's content history: the value at each version its content changed, `None` marking a removal, oldest first
 /// (the engine's per-path history, A-534; a node's value in the lineage's content history arena since A-920 unit 1).
 pub(crate) type Entries = Vec<(u64, Option<Value>)>;
+
+/// The holders of a content history's entries in its map (A-752 part 3c U8; main 01a20182's rulings of 2026-11-28 01:29
+/// and 03:10): a node the map copies (a stage's fork changed) holds every chunk its entries' values name, and the last
+/// node holding entries freed gives their chunks back, so a stage's copies and the published ones release each chunk
+/// once. The chunks and the blocks are the green's own: a fork is always of one green's history.
+pub(crate) struct HistoryHolders<'a> {
+  /// The green's chunks.
+  pub(crate) chunks: &'a mut Chunks,
+  /// The green's blocks.
+  pub(crate) blocks: &'a mut crate::dims::Blocks,
+}
+
+impl crate::ptrie::Holders<Entries> for HistoryHolders<'_> {
+  fn copied(&mut self, entries: &Entries) {
+    for value in entries.iter().filter_map(|(_, value)| value.as_ref()) {
+      value.hold(self.chunks);
+    }
+  }
+
+  fn freed(&mut self, entries: Entries) {
+    for value in entries.into_iter().filter_map(|(_, value)| value) {
+      value.release(self.chunks, self.blocks);
+    }
+  }
+}
 
 /// One version of a file in the history: its pieces and its length (module docs).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1066,6 +1103,21 @@ impl Value {
     Some(runs)
   }
 
+  /// The chunk each of its pieces names, in order: what a test recounts a chunk's holds from (A-752 part 3c).
+  #[cfg(test)]
+  pub(crate) fn chunks_named(&self) -> impl Iterator<Item = usize> + '_ {
+    self.pieces.iter().map(|piece| piece.chunk)
+  }
+
+  /// One more hold on every chunk the value's pieces name, each as a piece's first reference takes it
+  /// ([`Chunks::retain_piece`]): what a copy of the value costs its chunks, so either copy's release gives back its own
+  /// (A-752 part 3c U8).
+  pub(crate) fn hold(&self, chunks: &mut Chunks) {
+    for piece in &self.pieces {
+      chunks.retain_piece(piece);
+    }
+  }
+
   /// Gives the value's chunks back: each piece's reference released, a chunk's block let go with its last.
   pub(crate) fn release(self, chunks: &mut Chunks, blocks: &mut Blocks) {
     for piece in self.pieces {
@@ -1267,8 +1319,12 @@ pub(crate) fn reanchor(
   chunks: &mut Chunks,
   blocks: &mut Blocks,
   (block, ops): (Block, &[Op]),
+  layered: bool,
 ) -> Option<Reanchored> {
-  if layered_allowed()
+  // `layered`: whether this history's anchor is its own to repoint, never while a stage's copies share it with the
+  // published values (A-752 part 3c U8).
+  if layered
+    && layered_allowed()
     && let Some(overlaid) = overlay(&mut values, chunks, blocks, (block, ops))
   {
     return Some(overlaid);
@@ -1796,6 +1852,7 @@ mod tests {
       chunks,
       files.blocks_mut(),
       (block, ops),
+      true,
     );
     let (value, anchored) = match anchored {
       Some(done) => (done.value, true),

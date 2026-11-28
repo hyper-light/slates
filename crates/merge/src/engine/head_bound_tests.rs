@@ -68,13 +68,18 @@ fn carried_above_head(green: &mut Green) {
   let above = green.head().saturating_add(1);
   for path in PATHS {
     let value = crate::history::Value::whole(&mut green.chunks, b"above the head");
-    // The content history is a lineage `Dim` (A-920 arena unit 1): its entry list changed in place, or made.
-    match green.content_history.get_mut(path) {
+    // The content history is a lineage `Dim` (A-920 arena unit 1), its copied nodes holding their chunks (A-752 part
+    // 3c U8): its entry list changed in place, or made.
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut green.chunks,
+      blocks: green.content.blocks_mut(),
+    };
+    match green.content_history.get_mut_held(path, &mut holders) {
       Some(history) => history.push((above, Some(value))),
       None => {
         green
           .content_history
-          .insert(path, vec![(above, Some(value))]);
+          .insert_held(path, vec![(above, Some(value))], &mut holders);
       }
     }
     push(&mut green.special_history, path.to_owned(), (above, None));
