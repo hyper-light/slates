@@ -869,3 +869,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - f50661a99: U5 (identity marks aside + drain-first) 3255f5458.
 - Six-guard staging red still uncommitted in my tree (patch ~/.local/state/w-shared/logs/a752-3c-red-tracked.patch + staging_tests.rs copy).
 - Owed: Dims fork (8 current maps; deletes drain-first), scalars at publish, content history with held chunks, wiring into repository::push.
+
+## 2026-11-28 04:01 PST: A-752 3c U6, U7 landed
+- 24edc3158 U6: seven chunk-free current maps forked into the stage (staging::Forks, swap/release). Server sets 170 on rerun (git_push mid-derivation timing test flaked once under load; alone 3/3).
+- 2f68bd7ac (12e9057fc) U7: content map forked (Files, blocks as holders), fold's copy reads bounded by head, drain-first deleted, mark_dirty marks every key aside. Gap until U8: refused stage leaves content history naming stage block (6 vs 5); rule: no wiring into repository::push before U8.
+- Next: U8 content history staged with chunk-holding copies (red: refusal blocks (6,4) from (5,4) + chunk guard). Reanchor's layered route repoints a shared anchor slot -> must make a new slot in the stage.
