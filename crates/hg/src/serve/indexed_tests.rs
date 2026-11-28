@@ -34,7 +34,10 @@ mod rendered;
 const WINDOW: usize = 1 << 12;
 /// Shape: a fetch's texts asked a want with no step bound but the room's, past every fixture's texts
 /// ([`Store::text_bytes_a_step`]); the step's own test sets one.
-const UNSTEPPED: u64 = u64::MAX;
+const UNSTEPPED: crate::render::StepCopy = crate::render::StepCopy {
+  bytes: u64::MAX,
+  line: super::super::tests::TEST_LINE,
+};
 
 /// A store with room for every history the tests make, many times over.
 fn store() -> ContentStore {
@@ -1817,12 +1820,35 @@ fn a_streams_data_chunks_are_written_a_run_a_step() {
   );
 }
 
-/// What [`stock_streamed`] streamed: the history's revisions, the stream's answer and its tally by stage.
+/// What [`stock_streamed`] streamed: the history's revisions, the stream's answer, its tally by stage and each
+/// gathering step's trace.
 struct StockStreamed {
   revisions: u64,
   out: Vec<u8>,
   tally: crate::render::StageTally,
+  gathered: Vec<crate::render::GatherTraced>,
 }
+
+/// Shape: the layout the server streams over (main 01a20182's ruling of 2026-11-27 22:13): its content window (16 KiB
+/// pages times 16, `slates_vfs::content::chunk_bytes` on an Apple M-series Mac) and main's bench's copy budget
+/// (`copy_slice_bytes`, 94,797 B), at the Mac's 128-byte line.
+const SERVER_LAYOUT: (usize, crate::render::StepCopy) = (
+  1 << 18,
+  crate::render::StepCopy {
+    bytes: 94_797,
+    line: super::super::tests::TEST_LINE,
+  },
+);
+
+/// The red's layout: the tests' [`WINDOW`] (a few rows a table, so a sealed history is 48 runs and more) and
+/// [`STEP_BYTES`].
+const TEST_LAYOUT: (usize, crate::render::StepCopy) = (
+  WINDOW,
+  crate::render::StepCopy {
+    bytes: STEP_BYTES,
+    line: super::super::tests::TEST_LINE,
+  },
+);
 
 /// A history stock `hg` makes ([`stock_history`]: 300 changesets over 8 files) imported, sized from its whole texts
 /// ([`sized_by`]), its index sealed into runs (so its rows are read from the content store, as a landed repository's
@@ -1830,12 +1856,20 @@ struct StockStreamed {
 /// [`STEP_BYTES`]. None where `hg` does not run.
 fn stock_streamed(name: &str) -> Option<StockStreamed> {
   let mut dot = stock_history(name)?;
-  let mut store = store();
-  let mut imported = import(&mut dot, &mut store, Admission::new(1 << 26)).unwrap();
+  Some(stock_streamed_at(&mut dot, TEST_LAYOUT))
+}
+
+/// [`stock_streamed`] of `dot` over a store of `window`'s windows, each step held to `copy`.
+fn stock_streamed_at(
+  dot: &mut Dot,
+  (window, copy): (usize, crate::render::StepCopy),
+) -> StockStreamed {
+  let mut store = ContentStore::new(1 << 26, window).unwrap();
+  let mut imported = import(dot, &mut store, Admission::new(1 << 26)).unwrap();
   let recount = sized_by(&mut imported.index, &mut store, &|index, store| {
     Box::new(whole_texts(index, store))
   });
-  eprintln!("{name}: sized once, {recount:?}");
+  eprintln!("window {window}: sized once, {recount:?}");
   imported.index.rows().seal_all(&mut store).unwrap();
   let revisions: u64 = [Log::Changelog, Log::Manifest]
     .iter()
@@ -1849,7 +1883,7 @@ fn stock_streamed(name: &str) -> Option<StockStreamed> {
     .map(u64::from)
     .sum();
   let mut streaming = crate::render::Streaming::default();
-  streaming.set_step_bytes(STEP_BYTES);
+  streaming.set_step_copy(copy);
   let mut source = whole_texts(&imported.index, &store);
   let mut out = Vec::new();
   loop {
@@ -1862,15 +1896,82 @@ fn stock_streamed(name: &str) -> Option<StockStreamed> {
     }
   }
   let tally = streaming.take_tally();
+  let gathered = streaming.take_gather_trace();
+  check_gathered((&store, copy), &gathered);
   eprintln!(
-    "{name}: {revisions} revisions over {} runs; {tally:?}",
-    imported.index.rows().run_tables().len()
+    "window {window}, {copy:?}: {revisions} revisions over {} runs; {tally:?}; {} gathering steps",
+    imported.index.rows().run_tables().len(),
+    gathered.len()
   );
-  Some(StockStreamed {
+  StockStreamed {
     revisions,
     out,
     tally,
-  })
+    gathered,
+  }
+}
+
+/// The gathering's rule (main 01a20182's ruling of 2026-11-27 22:13), held of every step in `gathered` over `store` and
+/// `copy`: a step its budget ended spent at least the budget less one row's or one read's charge (`render::row_charge`,
+/// `render::read_charge`: no step ends early); and every step read at most one table its walks met.
+fn check_gathered(
+  (store, copy): (&ContentStore, crate::render::StepCopy),
+  gathered: &[crate::render::GatherTraced],
+) {
+  let (row, read) = (
+    crate::render::row_charge(),
+    crate::render::read_charge(store, copy.line),
+  );
+  for (at, step) in gathered.iter().enumerate() {
+    if step.ended == crate::render::GatherEnd::Budget {
+      let spent = step.rows * row + step.reads * read;
+      assert!(
+        spent >= copy.bytes.saturating_sub(row.max(read)),
+        "step {at} ended early: {spent} B of {} ({step:?}, a row {row} B, a read {read} B)",
+        copy.bytes
+      );
+    }
+    assert!(
+      step.reads <= step.tables,
+      "step {at} read a table twice: {step:?}"
+    );
+  }
+}
+
+/// Goal 93, hg's whole-history gap (main 01a20182's ruling of 2026-11-27 22:13: hg-src's index stage took a step a row,
+/// 238,557 steps and 524,131 reads, its gathering charged a whole window a read). Do: stream a history stock `hg`
+/// makes, sized and sealed, at the server's layout ([`SERVER_LAYOUT`]: a 256 KiB window, a 94,797-byte step) and at the
+/// tests' window (48 runs and more) at that step. Expect at each: every gathering step its budget ended to have spent the
+/// budget less one charge at least, and every step to read a table its walks met once at most ([`check_gathered`]); at
+/// the server's layout, the index stage's steps under half the revisions and its reads at most one a revision. Red
+/// before: a read charged the window, so at the server's layout a step gathered one row (1,221 index steps, 3,755
+/// reads for 1,200 revisions), and on the tests' layout each log's end searched every run for the next log (971
+/// reads). Skips, saying so, where stock `hg` does not run.
+#[test]
+fn a_streams_gathering_spends_each_step_and_reads_a_table_once() {
+  let Some(mut dot) = stock_history("gathering") else {
+    eprintln!("SKIPPED a_streams_gathering_spends_each_step_and_reads_a_table_once: no `hg` here");
+    return;
+  };
+  let server = stock_streamed_at(&mut dot, SERVER_LAYOUT);
+  // The tests' window at the server's budget: 55 runs and steps its budget ends (at [`STEP_BYTES`] one step gathers it
+  // all).
+  let test = stock_streamed_at(&mut dot, (WINDOW, SERVER_LAYOUT.1));
+  for streamed in [&server, &test] {
+    assert!(streamed.out.starts_with(b"0\n"), "the stream served");
+    assert!(
+      streamed
+        .gathered
+        .iter()
+        .any(|step| step.ended == crate::render::GatherEnd::Budget),
+      "some step ended by its budget: the rule held of some"
+    );
+  }
+  let (revisions, index) = (server.revisions, server.tally.index);
+  assert!(
+    index.steps * 2 < revisions && index.reads <= revisions,
+    "at the server's layout, {index:?} for {revisions} revisions"
+  );
 }
 
 /// Goal 93, hg's whole-history gap (main 01a20182's ruling of 2026-11-27 16:23): a stream's steps and the content
@@ -2931,7 +3032,13 @@ fn a_fetchs_wants_of_let_go_texts_hold_a_steps_bytes() {
       &imported.index,
       &store,
       state_of(&imported),
-      (step, &mut room()),
+      (
+        crate::render::StepCopy {
+          bytes: step,
+          ..UNSTEPPED
+        },
+        &mut room(),
+      ),
     )
     .unwrap()
     .answering_log_texts(saved.clone());
@@ -2942,7 +3049,7 @@ fn a_fetchs_wants_of_let_go_texts_hold_a_steps_bytes() {
     while walk.step(&view, &mut room(), &mut out).unwrap() {}
     (out, view.texts_asked())
   };
-  let (unstepped, whole) = clone_within(UNSTEPPED);
+  let (unstepped, whole) = clone_within(UNSTEPPED.bytes);
   let (stepped, asked) = clone_within(step);
   assert_eq!(stepped, unstepped, "the same changegroup within the step");
   let total: u64 = saved.values().map(|text| text.len() as u64).sum();
