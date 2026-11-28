@@ -57111,6 +57111,9 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   runs in place, the store's charge moved from the sets' bytes to the runs', the room lent for them
   (`settle_room`). A refused charge leaves the landing answered by its sets for the next commit's task, counted
   `vcs_store.landings.settle_refused`.
+- **Fixed the same day.** A turn whose quantum ran out on the last landing's runs answered more, so the server's task
+  held its slot a turn past the mapping. Its test met that at load 44. A turn now answers done exactly when none is
+  left; the git test's driver holds every turn to that (red: turn 4 answered more with none left).
 - **Tests.** `slates-git` `store::tests::commit_walk::a_landing_of_several_moves_maps_none_of_its_positions_in_its_step`
   (599 commits, two greens: 0 positions mapped in the step, red 599; every bringer as the line says before and after
   the turns; all 599 mapped in more than one turn; the store empty once released). The refusal oracle's two-move push
@@ -64423,6 +64426,15 @@ GAPS.
   against 1 and 47.3 ms, handed once. `vcs_http::daemon_edge::tests::a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it`:
   red with one count of every derive turn (100 → 117 across the listing); green, a reader's turns 0 → 0 while the task
   behind turned 364, the listing answered in 14.8 ms (its patience scaled by `test_lane::slowdown`).
+- **A turn yielded is the shard's, not the derivation's (2026-11-27, w-git; main 01a20182's diag CI 12, TSan run
+  46099781322: "no more turns than alone, but the hand-over's: 21 against 9").** A reader's turn runs to the step's
+  ceiling unless another task waits on the shard (`paced`), so a slow host, whose other tasks wait longer, ends more
+  of them early. The bound the design holds is on the reader's own turns, those its ceiling ended: handed a
+  derivation, no more than alone but the hand-over's (`PACED_TURNS`, a turn to begin, one to end, one to find
+  nothing due, room for a spurious wake). Counted `vcs_store.git_derive.read_turns_yielded` beside `read_turns`.
+  Red, made deterministic with a task waiting through the read a yield at a time
+  (`a_fetch_handed_a_derivation_while_its_shard_has_other_work_takes_no_more_turns_than_alone`): every turn counted,
+  935 against 3, 934 of them yielded. Green with the reader's own turns, 1 against 1.
 - **Whether any is due, from counts (2026-11-25, main 01a20182's sample).** A 3 s sample of git/git's clone waiting for
   its first pack bytes found the encoding behind the push spending a third of its time in
   `Repository::derivations_due` (309 of its 951 samples), which every derivation and encoding turn asks before it

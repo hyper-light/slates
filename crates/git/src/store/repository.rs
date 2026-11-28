@@ -2136,8 +2136,9 @@ impl Repository {
         Ok(SettleUnit::Settled) => {}
         Err(refused) => break Err(refused),
       }
+      // A quantum spent on the last unit answers done where none is left, so its task ends this turn, never one later.
       if quantum.clock.now_ns() >= deadline {
-        break Ok(false);
+        break Ok(self.unsettled.is_empty());
       }
     };
     self.count(|counters| counters.landing_mapped = counters.landing_mapped.saturating_add(mapped));
