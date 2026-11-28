@@ -962,3 +962,11 @@
   allocated reading 16,384,000 of objects before, 516,949 now. Held: git_push's mid-derivation test failed its time
   check twice with it (80.4/39.3, 74.3/34.5 ms) and passed twice without (54.8/49.4, 48.1/46.7); main's A/B asked
   (10 an arm, interleaved). Local worktree w-git-p2 carries the commit unpushed to main.
+- 11-28 03:01 PST: LANDED the intake's reused buffers 13fc3d487, on main as 72b1516f6 (main's A/B 20 of 20, worst 1.81 A / 1.70 B
+  against 2; every handed run brought back 1 window on both arms). The mid-derivation test's thin margin, judged against
+  the design's rule (main's ruling of 02:33): a landed pack's let-go is never made under a fetch's answer
+  (vcs_store::commit, landed_let_go_may: fetches_live == 0), and is owed until the fetch ends. A real fetch derives
+  inside its request, counted live (vcs_share::Live::fetch), so its let-go waits and it brings nothing back. The test's
+  handed read calls derive_for_read with no live fetch held, so it meets a let-go the design defers: the one bring-back
+  (8-11 ms) is the test's premise, not the product's. The fix, owed as its own piece: the test's read holds
+  Live::fetch as a fetch's request does, so its handed read brings back 0 and the margin is the hand-over's alone.
