@@ -38299,6 +38299,120 @@ fn poll_taken_over_and_unseated(survivors: &[Daemon], gone: HostId) -> bool {
     })
 }
 
+/// A-934 (main 01a20182's ruling of 2026-11-27 15:51, its item 2: §4.8's settle and the state logs). Do: on a four-node
+/// `f = 1` git fleet with a repository on a, push `main`; hold a's state-log parts off y, one of its two remote
+/// candidates (`Daemon::hold_state_log_shipping_from`), and push on top, so the names log's newest part is held by a and
+/// the other candidate, x, alone; hold every part off every member (`Daemon::hold_state_log_shipping`); stop x and await
+/// its takeover and unseating, so a's new cohort is a, y and the fourth node, z, and only a holds that part of it. Expect
+/// a's neighbourhood change not to settle while the hold stands (`Daemon::council_settlement`), and to settle once it is
+/// lifted and y and z hold the part. Red before A-934: the settle asked each volume's head and catalog and each green's
+/// newest merge record to be held by `f + 1` of the new cohort (`fleet::records_placed_on_current_neighbourhood`) but no
+/// state log, so a and y settled it, the old set retired, and the names log's newest part was held by one member of the
+/// cohort a takeover of a recovers through.
+#[test]
+fn a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_cohort() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), stores, lease) =
+    started_git_fleet_of("settle-state-logs", &["a", "b", "c", "d"]);
+  let mut fleet = founded_git_fleet(
+    "settle-state-logs",
+    (daemons, hosts),
+    stores,
+    (Some(lease), None),
+  );
+  let first = fleet.push(0, ("first.txt", b"main, its parts held everywhere\n"));
+  let (x, y) = remote_candidates(&fleet);
+  let second = push_with_part_held_from(&mut fleet, y);
+  let taken = stop_and_take_over(&mut fleet, x);
+  let while_held = settled_within(&fleet, x);
+  let held = (
+    names_positions(&fleet),
+    fleet.daemons[0].repair_window_holders(fleet.repository),
+  );
+  fleet.daemons[0].hold_state_log_shipping(false).unwrap();
+  let lifted = settled_within(&fleet, x);
+  let after = names_positions(&fleet);
+  fleet.stop();
+  eprintln!(
+    "settle-state-logs: pushes {first:?} {second:?}; x {x:?} y {y:?}; taken over {taken}; settled while held \
+     {while_held}, the names-log positions of a and the survivors and a's count of its holders then {held:?}; settled \
+     once lifted {lifted}, positions {after:?}"
+  );
+  assert!(
+    first.is_ok() && second.is_ok(),
+    "both pushes landed: {first:?} {second:?}"
+  );
+  assert!(taken, "the survivors took x over and unseated it");
+  assert!(
+    !while_held,
+    "a's neighbourhood change did not settle while its names log's newest part was held by a alone of its new cohort: \
+     {held:?}"
+  );
+  assert!(
+    lifted,
+    "a's neighbourhood change settled once its parts reached the new cohort: {after:?}"
+  );
+}
+
+/// a's two remote candidates in a [`GitFleet`] of four (A-934's test): the hosts of its placement neighbourhood but a.
+fn remote_candidates(fleet: &GitFleet) -> (HostId, HostId) {
+  let own = fleet.hosts[0];
+  let others: Vec<HostId> = fleet.daemons[0]
+    .placement_neighbourhood()
+    .unwrap()
+    .into_iter()
+    .filter(|host| *host != own)
+    .collect();
+  let [x, y] = others[..] else {
+    panic!("a's neighbourhood holds two other hosts: {others:?}");
+  };
+  (x, y)
+}
+
+/// Pushes on top at a with its state-log parts held off `y` (A-934's test), so the push's names-log part is held by a and
+/// its other candidate alone; then holds every part off every member. The push's answer.
+fn push_with_part_held_from(fleet: &mut GitFleet, y: HostId) -> Result<(), String> {
+  fleet.daemons[0].hold_state_log_shipping_from(y).unwrap();
+  let pushed = fleet.push_on_top(0, ("second.txt", b"on top, its part held off y\n"));
+  fleet.daemons[0].hold_state_log_shipping(true).unwrap();
+  pushed
+}
+
+/// Stops the node of `gone` (dropping it from the fleet's hosts too, so they stay aligned with its daemons) and awaits
+/// every survivor's takeover of it and its unseating ([`poll_taken_over_and_unseated`]).
+fn stop_and_take_over(fleet: &mut GitFleet, gone: HostId) -> bool {
+  let node = fleet
+    .hosts
+    .iter()
+    .position(|host| *host == gone)
+    .expect("a node of the fleet");
+  fleet.daemons.remove(node).stop();
+  fleet.hosts.remove(node);
+  poll_taken_over_and_unseated(&fleet.daemons, gone)
+}
+
+/// Whether a's neighbourhood change away from `gone` settles within [`RETIREMENT_DEADLINE`] (A-934's test): its placement
+/// neighbourhood without `gone`, and the council's settled neighbourhood for a fixed at its current one's version
+/// (`Daemon::council_settlement`).
+fn settled_within(fleet: &GitFleet, gone: HostId) -> bool {
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let own = fleet.hosts[0];
+  poll_until(&observed, RETIREMENT_DEADLINE, || {
+    let moved = !fleet.daemons[0].placement_neighbourhood()?.contains(&gone);
+    let settlement = fleet.daemons[0].council_settlement(own)?;
+    Ok(moved && settlement.is_some_and(|(settled, current)| settled == current))
+  })
+}
+
+/// Each node's held names-log positions of the fleet's repository (`Daemon::names_log_positions`), in node order.
+fn names_positions(fleet: &GitFleet) -> Vec<Result<Vec<u64>, ObserveError>> {
+  fleet
+    .daemons
+    .iter()
+    .map(|daemon| daemon.names_log_positions(fleet.repository))
+    .collect()
+}
+
 /// A-919 (main 01a20182's rulings of 2026-11-25: the worse failure of a candidate a death brings in). Do: on a four-node
 /// `f = 1` git fleet with a repository on a, push `main` and wait for both of a's remote candidates to hold its green's
 /// version 1 (and so the repository's state logs); stop one of them, so the fourth node, which holds none of the
