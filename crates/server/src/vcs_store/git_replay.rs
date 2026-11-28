@@ -18,11 +18,10 @@
 //! **Given back.** A replay refused, or ended by its rebuild's end, gives back what its push held ([`GitReplay::abandon`]).
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 
 use slates_git::object_name::{Kind, ObjectFormat, ObjectId};
 use slates_git::store::{Admitting, Incoming, Move, Push, PushRefused};
-use slates_git::unpack::{self, Contents, Keep, NoIndex, Object, Outside, Reader};
+use slates_git::unpack::{self, Contents, Keep, NoIndex, ObjectRef, Outside, Queued, Reader};
 use slates_git::{Admission, Hold};
 use slates_vcs::{ContentId, ContentStore};
 
@@ -65,6 +64,9 @@ pub(crate) struct GitReplay {
   pack_hold_owed: bool,
   /// What comes next.
   stage: Stage,
+  /// The buffer its site's queue copies a call's objects into, kept from call to call as a live push's is
+  /// (`slates_git::unpack::Queued`).
+  queue_bytes: Vec<u8>,
 }
 
 impl core::fmt::Debug for GitReplay {
@@ -124,8 +126,8 @@ enum Stage {
 /// read back from the queue, else the push where it lies in its pack, else the repository; a thin pack's outside bases
 /// from the repository.
 struct Site<'s> {
-  /// The objects this call resolved, by position, with their holds.
-  queue: BTreeMap<usize, (Object, Hold)>,
+  /// The objects this call resolved, by position, with their holds, their bytes in one buffer kept from call to call.
+  queue: Queued,
   /// The push and the repository, read only.
   quarantined: Quarantined<'s>,
   /// The repository's objects as a thin pack's bases.
@@ -134,8 +136,8 @@ struct Site<'s> {
 
 impl Contents for Site<'_> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
-    if let Some((object, _)) = self.queue.get(&at) {
-      return (object.id == *id).then_some(Cow::Borrowed(object.content.as_slice()));
+    if let Some(content) = self.queue.content(at, id) {
+      return Some(Cow::Borrowed(content));
     }
     self.quarantined.content(at, id)
   }
@@ -145,12 +147,17 @@ impl Keep for Site<'_> {
   fn keep(
     &mut self,
     at: usize,
-    object: Object,
+    object: ObjectRef<'_>,
     hold: Hold,
-    _admission: &mut Admission,
+    admission: &mut Admission,
   ) -> Result<(), unpack::Refusal> {
-    self.queue.insert(at, (object, hold));
-    Ok(())
+    self
+      .queue
+      .keep(at, object, hold)
+      .map_err(|(refused, hold)| {
+        admission.release(hold);
+        refused
+      })
   }
 
   fn release(&mut self, hold: Hold, admission: &mut Admission) {
@@ -231,6 +238,7 @@ impl GitReplay {
       named,
       packed: record.packed,
       pack_hold_owed: false,
+      queue_bytes: Vec::new(),
       moves: record.moves,
       stage: Stage::Reading {
         reader: Box::new(Reader::new(format, &NO_INDEX)),
@@ -351,7 +359,8 @@ impl GitReplay {
           None => &[],
         };
         let (took, queue) = {
-          let mut site = self.site(content, store);
+          let reused = core::mem::take(&mut self.queue_bytes);
+          let mut site = self.site((content, store), reused);
           let took = reader
             .read_into(piece, &mut admission, &mut site)
             .map_err(ReplayRefused::Pack)?;
@@ -369,7 +378,8 @@ impl GitReplay {
           (Stage::Resolving { reader, admission }, None)
         } else if piece_was_empty || took == 0 {
           // No more to give it: ended, a pack cut short refused by its end.
-          let mut site = self.site(content, store);
+          let reused = core::mem::take(&mut self.queue_bytes);
+          let mut site = self.site((content, store), reused);
           reader
             .finish_into(&mut admission, &mut site)
             .map_err(ReplayRefused::Pack)?;
@@ -396,7 +406,8 @@ impl GitReplay {
           ns: 0,
         };
         let (resolved, queue) = {
-          let mut site = self.site(content, store);
+          let reused = core::mem::take(&mut self.queue_bytes);
+          let mut site = self.site((content, store), reused);
           let resolved = reader
             .resolve_turn(&mut admission, &mut site, quantum)
             .map_err(ReplayRefused::Pack)?;
@@ -408,7 +419,8 @@ impl GitReplay {
           return Ok(UnitDone::Next);
         }
         let queue = {
-          let mut site = self.site(content, store);
+          let reused = core::mem::take(&mut self.queue_bytes);
+          let mut site = self.site((content, store), reused);
           reader
             .finish_into(&mut admission, &mut site)
             .map_err(ReplayRefused::Pack)?;
@@ -494,9 +506,13 @@ impl GitReplay {
   }
 
   /// The site the reader hands its objects to this call ([`Site`]): the push and the repository read only.
-  fn site<'s>(&'s self, content: &'s ContentStore, store: &'s GitStore) -> Site<'s> {
+  fn site<'s>(
+    &'s self,
+    (content, store): (&'s ContentStore, &'s GitStore),
+    reused: Vec<u8>,
+  ) -> Site<'s> {
     Site {
-      queue: BTreeMap::new(),
+      queue: Queued::reusing(reused),
       quarantined: Quarantined::new(Some(&self.push), content, (&store.repository, None)),
       outside: StoreBases(slates_git::store::views::IndexedObjects::new(
         &store.repository,
@@ -512,14 +528,28 @@ impl GitReplay {
   fn admit_queued(
     &mut self,
     (content, store): (&mut ContentStore, &GitStore),
-    queue: BTreeMap<usize, (Object, Hold)>,
+    queue: Queued,
     admission: &mut Admission,
   ) -> Result<(), ReplayRefused> {
-    for (object, hold) in queue.into_values() {
+    let (objects, bytes) = queue.into_parts();
+    let admitted = self.admit_each((content, store), (objects, &bytes), admission);
+    self.queue_bytes = bytes;
+    admitted
+  }
+
+  /// [`GitReplay::admit_queued`]'s objects, their bytes in `bytes`, each hold given back as its object is admitted.
+  fn admit_each(
+    &mut self,
+    (content, store): (&mut ContentStore, &GitStore),
+    (objects, bytes): (Vec<(slates_git::unpack::QueuedObject, Hold)>, &[u8]),
+    admission: &mut Admission,
+  ) -> Result<(), ReplayRefused> {
+    for (queued, hold) in objects {
+      let object = queued.object(bytes);
       let incoming = Incoming {
         kind: object.kind,
         claimed: Some(object.id),
-        content: &object.content,
+        content: object.content,
         depth: object.chain.as_ref().map_or(0, |chain| chain.depth),
       };
       admit_object(
@@ -531,7 +561,7 @@ impl GitReplay {
       .map_err(ReplayRefused::Git)?;
       self
         .push
-        .keep_read(object.offset, object.kind, object.content);
+        .keep_read_lent(object.offset, object.kind, object.content);
       admission.release(hold);
     }
     // What its reads keep lately widened for the chains it carries now, within the content store's room, as a live

@@ -491,12 +491,7 @@ impl Hasher {
   pub fn raw(format: ObjectFormat) -> Hasher {
     let state = match format {
       // git's own configuration of the detection: on, with the safe hash off (`git_SHA1DCInit`).
-      ObjectFormat::Sha1 => State::Sha1(Box::new(
-        sha1_checked::Sha1::builder()
-          .detect_collision(true)
-          .safe_hash(false)
-          .build(),
-      )),
+      ObjectFormat::Sha1 => State::Sha1(Box::new(fresh_sha1())),
       ObjectFormat::Sha256 => {
         State::Sha256(aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256))
       }
@@ -520,32 +515,81 @@ impl Hasher {
     }
   }
 
-  /// The name of what was hashed, or the attack SHA-1's detection found in it.
-  pub fn finish(self) -> Result<ObjectId, CollisionAttack> {
-    match self.state {
-      State::Sha1(hash) => {
-        let result = (*hash).try_finalize();
-        let name = ObjectId::from_bytes(ObjectFormat::Sha1, result.hash().as_slice());
-        let name = name.unwrap_or(ObjectId {
-          format: ObjectFormat::Sha1,
-          bytes: [0; MAX_RAW_LEN],
-        });
-        if result.has_collision() {
-          return Err(CollisionAttack { sha1: name });
-        }
-        Ok(name)
-      }
+  /// The name of `content`, an object of `kind`, hashed by this hasher made fresh again in place, its state's room kept
+  /// (a pack's reader names every object with one, main 01a20182's ruling of 2026-11-28 01:23: SHA-1's detection state
+  /// boxed an object was 3.8 MB made and freed for 4,000 objects); what [`name_of`] answers.
+  pub fn name(&mut self, kind: Kind, content: &[u8]) -> Result<ObjectId, CollisionAttack> {
+    self.restart();
+    write_header(
+      Header {
+        kind,
+        size: to_u64(content.len()),
+      },
+      self,
+    );
+    self.update(content);
+    self.take()
+  }
+
+  /// Makes the running hash fresh, in place: nothing hashed.
+  fn restart(&mut self) {
+    match &mut self.state {
+      State::Sha1(hash) => **hash = fresh_sha1(),
       State::Sha256(context) => {
-        let digest = context.finish();
-        Ok(
-          ObjectId::from_bytes(ObjectFormat::Sha256, digest.as_ref()).unwrap_or(ObjectId {
-            format: ObjectFormat::Sha256,
-            bytes: [0; MAX_RAW_LEN],
-          }),
-        )
+        *context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256)
       }
     }
   }
+
+  /// [`Hasher::finish`] of what was hashed, the hasher made fresh in its place.
+  fn take(&mut self) -> Result<ObjectId, CollisionAttack> {
+    match &mut self.state {
+      State::Sha1(hash) => finished_sha1(core::mem::replace(hash.as_mut(), fresh_sha1())),
+      State::Sha256(context) => Ok(finished_sha256(core::mem::replace(
+        context,
+        aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
+      ))),
+    }
+  }
+
+  /// The name of what was hashed, or the attack SHA-1's detection found in it.
+  pub fn finish(self) -> Result<ObjectId, CollisionAttack> {
+    match self.state {
+      State::Sha1(hash) => finished_sha1(*hash),
+      State::Sha256(context) => Ok(finished_sha256(context)),
+    }
+  }
+}
+
+/// A SHA-1 hasher with git's collision detection, as [`Hasher::raw`] makes one.
+fn fresh_sha1() -> sha1_checked::Sha1 {
+  sha1_checked::Sha1::builder()
+    .detect_collision(true)
+    .safe_hash(false)
+    .build()
+}
+
+/// The name a SHA-1 hash taken out of its [`Hasher`] finishes as, or the attack its collision detection found.
+fn finished_sha1(hash: sha1_checked::Sha1) -> Result<ObjectId, CollisionAttack> {
+  let result = hash.try_finalize();
+  let name = ObjectId::from_bytes(ObjectFormat::Sha1, result.hash().as_slice());
+  let name = name.unwrap_or(ObjectId {
+    format: ObjectFormat::Sha1,
+    bytes: [0; MAX_RAW_LEN],
+  });
+  if result.has_collision() {
+    return Err(CollisionAttack { sha1: name });
+  }
+  Ok(name)
+}
+
+/// The name a SHA-256 hash taken out of its [`Hasher`] finishes as.
+fn finished_sha256(context: aws_lc_rs::digest::Context) -> ObjectId {
+  let digest = context.finish();
+  ObjectId::from_bytes(ObjectFormat::Sha256, digest.as_ref()).unwrap_or(ObjectId {
+    format: ObjectFormat::Sha256,
+    bytes: [0; MAX_RAW_LEN],
+  })
 }
 
 impl Out for Hasher {

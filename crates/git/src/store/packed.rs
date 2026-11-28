@@ -313,6 +313,19 @@ impl Recent {
     Some((*kind, bytes))
   }
 
+  /// [`Recent::keep`] of an object lent, not given (a pack reader's buffer, which it reuses): copied into the newest
+  /// chunk, or, a chunk long or more, into a chunk of its own.
+  pub fn keep_lent(&mut self, place: InPack, kind: Kind, bytes: &[u8]) {
+    if !self.takes(place, bytes.len()) {
+      return;
+    }
+    if bytes.len() >= self.chunk_len() {
+      self.keep_whole(place, kind, bytes.to_vec());
+    } else {
+      self.lay(place, kind, bytes);
+    }
+  }
+
   /// Keeps `bytes`, the object of type `kind` whose entry begins at `place`: taken whole as a chunk of its own when it is
   /// a chunk long or more, else copied into the newest chunk and its buffer given back at once. None kept where it alone
   /// passes the budget or the entry's object is kept already.
