@@ -942,3 +942,8 @@
   let-go behind, which also lets go past the look-ahead's reach; peak 12 of 13 before (deterministic, NO_FETCH_WAIT),
   2 now against LOOK_AHEAD_WINDOWS + 1; windows brought back again counted (12). NEXT: P1, the partial clone
   regression, bisect first; main runs the A/B on request.
+- 11-28 00:49 PST: P1 closed (11-20's 7b66e7225; main's A/B tonight checks it). The encode poll spin's 11-20 site is gone
+  (settle_encodings deleted in 262d21ff5). LANDED f52faa290, on main as 65384c6dc: a version's parts are recorded a
+  placed entry a unit (Stage::Record, Keeping; 152 and 454 entries in one unit before). Run request for main's v2.0.0
+  encode under load in run-requests.md. NEXT: the encoding's start (Encoding::fragments reading D(k) whole), then
+  deepen's bad pack and 217 s (w-bugs', after a check that it's still open).
