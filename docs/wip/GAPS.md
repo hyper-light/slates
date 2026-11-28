@@ -1028,14 +1028,19 @@
 >   and `push_through_awaited` now assert their landing where the push brings an object, which they dropped (`let _ =`),
 >   so this surfaced late as `ContentUnavailable` rather than at the landing (`home_and_land` answers none for a push
 >   with nothing to home too, so they ask it apart).
-> - OPEN (w-git, 2026-11-27, main's ruling of 13:47; after the flip, red first): a clone of a let-go pack holds more
->   than a turn's windows under load. `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_
->   at_most_a_turns_windows` failed 2 of 32 runs under 12 burners with B10 and 0 of 24 without (about p 0.5, not B10's:
->   its instrumented A/B, d16e6fe20, printed no window pinned after the push and no let-go a pin refused in any of 16
->   runs), at peaks of 10 and 8 of 13 against 3, and once before B10 under TSan at 4. A clone racing the encoding reads
->   the let-go pack instead of copying the kept parts, and its let-go behind its cursor lags its bring-backs: ten stops,
->   ten let go behind, ten held at once. The test prints its stops, peak and let-go-behind every run, with the pinned
->   windows (`mem.gauge.vcs_content.pinned_unlanded`) and refused let-gos.
+> - CLOSED (w-git, 2026-11-27, main's ruling of 23:25; OPEN since 13:47): a clone of a let-go pack held more than a
+>   turn's windows under load (2 of 32 runs under 12 burners, peaks 10 and 8 of 13 against 3). Cause: a clone whose
+>   answer begins before its repository's encoding is kept reads the let-go pack, and its check of a pushed entry's
+>   CRC32 (`Upload::reused_as_kept`, `packed::raw_crc`) read the entry's raw bytes in one call, all 13 windows of a 3
+>   MiB blob. Each let-go window stopped the turn and retook the entry from its start, while the windows brought back
+>   for it stayed ahead of the cursor. Red made deterministic (`git_encode::NO_FETCH_WAIT`, test-only):
+>   `vcs_http::daemon_edge::tests::a_clone_racing_its_encoding_of_a_let_go_pack_holds_at_most_a_turns_windows`, peak 12
+>   every run. Fixed: the check goes on where it stopped (`packed::RawCrc`, kept in the stream with the entry's header),
+>   its cursor what the look-ahead and the let-go behind follow (`Upload::reading_next`). The let-go behind lets go too
+>   what lies past the look-ahead's reach, which the copy's return to the entry's start leaves. Peak 2 against
+>   `LOOK_AHEAD_WINDOWS` + 1; each window the check passed brought back again for the copy, counted
+>   `vcs_store.git_resident.brought_again` (12).
+
 > - OPEN (w-git, 2026-11-27, main's note of 09:17; its own item, not B10's): a git push dropped where the shard's state
 >   is not lent to its drop gives back nothing. `ReceivePack`'s `Drop` and `git_push::hooks::dropped` take the state
 >   with `with_state` and, finding none, log "a git push dropped mid-read could not give back its quarantine: the
@@ -5269,10 +5274,16 @@
 > `a_streams_gathering_spends_each_step_and_reads_a_table_once` (no step its budget ends ends early; no table read twice
 > in a step): on the 1,200-revision stock history at the server's layout, 27 index steps and 52 reads, from 1,221 and
 > 3,755; on the tests' 4 KiB, 55-run layout at 1 MiB, 100 reads, from 971.
-> OPEN (w-interop, main's ruling of 23:39: the very next piece): the row's cost. Measured in release on the MacBook
-> (load 22 to 45): gathering steps its budget ended took 17,666 ns at the median and 36,125 at most, 84.5 ns a row,
-> against a slice of 1,660 ns (94,797 B at 57.1 GB/s): about ten times past it, since a row is charged its held form's
-> 180 B (about 3 ns). Next, a per-shard learned cost a row from the stream's own steps (§4.17.1's learned-tunable rule).
+> The row's cost, BUILT (2026-11-28, w-interop; main's ruling of 2026-11-27 23:39). Measured before, in release on the
+> MacBook: gathering steps its budget ended took 17,666 ns at the median, 84.5 ns a row, against a 1,660 ns slice, a row
+> charged its held form's 180 B. Now a row is charged the shard's learned cost (`render::RowCost`, §4.17.1's rule:
+> the gathering steps' time over their rows on the shard's clock, as bytes at the copy rate; bounds the held form and a
+> step; first value the cache lines a row moves), and a step judges each row before it. Held by
+> `a_streams_gathering_steps_are_held_to_their_slice_at_the_learned_row_cost` (red: 16,156 ns against 1,660). Measured
+> after, the cost learned online over 8 streams (release, load 15 to 37, slice 2,428 ns at 39.0 GB/s): p50 1,250 to
+> 2,500 ns and p90 2,000 to 3,791 ns once learned; the first stream, at the derived first value (640 B, about ten
+> times low), p50 11,792 ns. Owed: the first value's derivation undercounts a row's work about ten times, so a shard's
+> first stream runs past its slices until its first step is measured.
 > OPEN, on the index's run merge: an index of many unmerged runs makes every restart costly. On the tests' 4 KiB layout
 > (55 runs, each one table holding a slice of every log) at a 94,797-byte step, 999 index steps and 31,888 reads for
 > 1,200 revisions: a restart opens about 32 tables, about 4.2 KB each, more than a step, so a step moves one row. The
@@ -8070,6 +8081,14 @@
 > under it. The same matrix on the Mac Studio (release 907c246ac, load 13-30) was 24 of 24 with no spin. git v2.0.0 on
 > the same Linux run: 26 of 27, two spins in `git_encode.rs:359` (`settle_encodings`, w-k90-vendor's encode spin) and
 > no kill; deepen's bad pack is w-bugs'. Report: adacachy `~/.cache/w-interop/r-linuxc-2239.txt`, anchor logs beside it.
+> Deepen's bad pack checked on today's main (w-git, 2026-11-28, main's order of 00:33): w-interop bisected it on
+> 2026-11-21 to the matrix's annotated tag pushed and deleted before the row ran (deepen over a fresh v2.0.0 passed
+> every N 1 to 100), the whole-clone failure of the same night to git/git's annotated tags, which A-855 then fixed (an
+> answer was admitted one ring region, 256 KiB). The row's sequence through the daemon's edge, history, tag push, tag
+> delete, then `fetch --deepen 100` from a shallow clone, answers whole now:
+> `vcs_http::daemon_edge::tests::a_shallow_clone_is_deepened_whole_after_an_annotated_tag_was_pushed_and_deleted`. Stock
+> git's own row, and its seconds against the 217 s of 2026-11-20, are read in main's v2.0.0 matrix run under load
+> (run-requests.md, 2026-11-28).
 > The restarted daemon's start spin (`daemon.rs:1186`, `start_shard`, "the most CPU in one [slice] 962,859 µs, ending
 > at unit 1") was the catalog's whole replay in one unit of the sliced start: it is replayed a record a unit since this
 > change (w-bugs; `a_shards_start_replays_its_catalog_a_record_a_unit`, 256 records in one unit before, 1 after).
@@ -8097,12 +8116,18 @@
 > the control shard held alone by busy work for the old budget at this build's cost and a window more; Adas-Mac-Studio-4,
 > base cdfbb4020: busy 31.8 s and the watch still waiting after it, ending at its reason at 32.3 s; with the change
 > reversed, the wait ended at 31.4 s while the shard was busy for 32.2 s, the refusal the daemon stopped on). Owed (w-k90-vendor):
-> slicing the encode poll (`git_encode.rs:345`). The same hazard in every other default observation since 2026-11-20
-> (g226, main's ruling): `Daemon::observe` had the observe budget, ten liveness windows, and a shard that stepped busy
-> past that budget's CPU without reaching the question refused it; a default observation now waits while its shard
-> lives (`Observation::patient`, looked at every liveness window, ended only by the shard's going; A-232's rule), and its
-> watchdog ends a stuck one (`a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs`, base 26e125adb:
-> the control shard held alone 31.6 s, answered after it; with the change reversed, refused at 31.9 s mid-work; and
+> slicing the encode poll (`git_encode.rs:345`).
+> Taken by w-git (2026-11-28, main's ruling of 00:33): that spin's site, `settle_encodings`, was deleted in 262d21ff5
+> and the turn is paced (A-783); the encoding's last whole unit, its parts' records, is sliced a placed entry a unit
+> ("The encode keep's slice", 152 and 454 entries in one unit before). The encoding's start is sliced too, its D(k) read
+> a node a unit (113 runs in one unit before). Owed: main's v2.0.0 run under load (run-requests.md). The same hazard in
+> every other default
+> observation since 2026-11-20 (g226, main's ruling): `Daemon::observe` had the observe budget, ten liveness windows,
+> and a shard that stepped busy past that budget's CPU without reaching the question refused it; a default observation
+> now waits while its shard lives (`Observation::patient`, looked at every liveness window, ended only by the shard's
+> going; A-232's rule), and its watchdog ends a stuck one
+> (`a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs`, base 26e125adb: the control shard held
+> alone 31.6 s, answered after it; with the change reversed, refused at 31.9 s mid-work; and
 > `a_patient_wait_goes_on_while_the_shard_lives_and_ends_at_its_going`). Owed (R3): `OBSERVE_BUDGET_NS` still caps the
 > watchdog's window (`WINDOW_CEILING_NS`), the anchor's lapse bound and `live_ship`'s key wait, and bounds the daemon's
 > test-support waits (an explicit observation's budget is its asker's).

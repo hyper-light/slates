@@ -3714,6 +3714,75 @@ fn a_shallow_clone_of_a_merge_heavy_history_is_deepened_over_the_daemons_edge() 
   );
 }
 
+/// w-interop's git matrix row `deepen` (2026-11-21, 1a35ab091: "remote: aborting due to possible repository corruption
+/// on the remote side / protocol error: bad pack header", where deepen over a fresh repository of git v2.0.0 passed):
+/// the matrix had pushed an annotated tag and deleted it before the row ran (rows `tag-push`, `tag-delete`). Do: push
+/// [`merge_history`] through the daemon's edge, then an annotated tag of its tip, then that tag's delete; then, as a
+/// shallow clone of the tip, fetch at protocol v2 as `git fetch --deepen 100` asks. Expect: each push `200`, the fetch
+/// `200` with a `shallow-info` section and a packfile section whose pack reads whole, as git's index-pack reads one.
+#[test]
+fn a_shallow_clone_is_deepened_whole_after_an_annotated_tag_was_pushed_and_deleted() {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, tip) = merge_history();
+  let created = pushed(edge, &name, &request);
+  let tag = format!(
+    "object {tip}\ntype commit\ntag v-matrix\ntagger A <a@example.com> 1700000002 +0000\n\nthe matrix's tag\n"
+  )
+  .into_bytes();
+  let tag_id = git_name(Kind::Tag, &tag);
+  let tag_push = {
+    let mut request = Vec::new();
+    let line = format!("{ZERO} {tag_id} refs/tags/v-matrix\0{CAPABILITIES}");
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+    pktline::write(Packet::Flush, &mut request).expect("the flush");
+    request.extend_from_slice(&stored_pack(&[(Kind::Tag, tag.as_slice())]));
+    request
+  };
+  let tagged = pushed(edge, &name, &tag_push);
+  let tag_delete = {
+    let mut request = Vec::new();
+    let line = format!("{tag_id} {ZERO} refs/tags/v-matrix\0{CAPABILITIES}");
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+    pktline::write(Packet::Flush, &mut request).expect("the flush");
+    request
+  };
+  let untagged = pushed(edge, &name, &tag_delete);
+  let deepened = uploaded(edge, &name, &deepen_of(tip, 100));
+  daemon.stop();
+  assert_git_pushed(&created);
+  for (row, answer) in [("tag-push", &tagged), ("tag-delete", &untagged)] {
+    assert_eq!(
+      answer.0,
+      200,
+      "{row}: {}",
+      String::from_utf8_lossy(&answer.1)
+    );
+    assert!(
+      !String::from_utf8_lossy(&answer.1).contains("ng refs/tags"),
+      "{row}: {}",
+      String::from_utf8_lossy(&answer.1)
+    );
+  }
+  let head = String::from_utf8_lossy(
+    deepened
+      .1
+      .get(..deepened.1.len().min(400))
+      .unwrap_or_default(),
+  )
+  .into_owned();
+  assert_eq!(deepened.0, 200, "{head}");
+  assert!(head.contains("shallow-info"), "{head}");
+  let pack = fetched_pack_after(&deepened.1);
+  assert!(!ids_in(&pack).is_empty(), "a pack read whole");
+}
+
 /// The v2 `fetch` stock git 2.50's `git fetch --deepen <depth>` sends from a shallow clone of `tip` (its
 /// `GIT_TRACE_PACKET` against slates, read): its choices with `sideband-all`, the tip its `shallow` line, `deepen <depth>`
 /// and `deepen-relative`, `want-ref` its branch (slates advertises `ref-in-want`), `have` the tip, and no `done`, so its
@@ -4719,6 +4788,58 @@ pub(crate) const LET_GO_FILE: usize = 3 << 20;
 /// pack's windows unread.
 #[test]
 fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
+  let seen = clone_of_a_let_go_pack(false);
+  eprintln!("clone of a let-go pack: {seen:?}");
+  // The clone may copy the encoding's kept parts rather than read the let-go pack; where it reads the pack, at most a
+  // turn's windows are held at once (`t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed` holds the
+  // mechanism to it whatever the clone reads; the raced test below holds this clone to it reading the pack).
+  assert_whole_holding_a_turns_windows(&seen);
+}
+
+/// The clone's window peak (w-git, main 01a20182's ruling of 2026-11-27 23:25; GAPS, OPEN since 13:47: 2 of 32 runs
+/// under 12 burners held 10 and 8 of 13 windows). Do: as
+/// [`a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`], the clone answering without waiting
+/// for the repository's encoding (`git_encode::NO_FETCH_WAIT`, as an encoding outlasting the wait under load leaves
+/// it), so it reads the let-go pack and checks the pushed entry's CRC32 before it copies it. Expect: the clone whole;
+/// it stopped at let-go windows; at most a turn's windows held at once, the look-ahead's
+/// (`vcs_store::upload::LOOK_AHEAD_WINDOWS`) and the window a turn stopped at, whatever the object's size; windows let
+/// go behind its cursor; and windows brought back a second time, the copy after the check
+/// (`vcs_store.git_resident.brought_again`). Red before: the check read the entry from its start each turn, holding 12
+/// of the pack's 13 windows at once.
+#[test]
+fn a_clone_racing_its_encoding_of_a_let_go_pack_holds_at_most_a_turns_windows() {
+  let seen = clone_of_a_let_go_pack(true);
+  eprintln!("clone of a let-go pack, raced: {seen:?}");
+  let (stops, _, let_go_behind) = seen.observed;
+  assert!(
+    stops >= 1 && let_go_behind >= 1,
+    "read the let-go pack: {seen:?}"
+  );
+  assert!(
+    seen.brought_again >= 1,
+    "the copy after the check counted: {seen:?}"
+  );
+  assert_whole_holding_a_turns_windows(&seen);
+}
+
+/// Holds `seen` to its clone whole and at most a turn's windows held at once: the look-ahead's and the window a turn
+/// stopped at (`vcs_store::upload::LOOK_AHEAD_WINDOWS` and one), fewer than the pack's.
+fn assert_whole_holding_a_turns_windows(seen: &ClonedLetGo) {
+  assert!(seen.let_go.0 >= 1, "windows let go: {:?}", seen.let_go);
+  assert_eq!((seen.status, seen.objects), (200, 3), "the clone whole");
+  let turns = crate::vcs_store::upload::LOOK_AHEAD_WINDOWS.saturating_add(1);
+  let (_, peak, _) = seen.observed;
+  assert!(
+    peak <= turns && peak < u64::try_from(seen.windows).unwrap(),
+    "at most a turn's windows held, {turns}: {seen:?}; windows pinned after the push and let-gos a pin refused: {:?}",
+    seen.pins
+  );
+}
+
+/// [`a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`]'s history, its fetch answering without
+/// waiting for the repository's encoding where `raced` (`git_encode::NO_FETCH_WAIT`), as one does under load whose
+/// encoding outlasts the wait: what it saw.
+fn clone_of_a_let_go_pack(raced: bool) -> ClonedLetGo {
   let (identity, certificate) = identity();
   let daemon = daemon(identity);
   let port = daemon.vcs_http_port().expect("the edge started");
@@ -4784,6 +4905,11 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
       .collect();
     (went, why)
   });
+  if raced {
+    crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+      crate::vcs_store::git_encode::NO_FETCH_WAIT.with(|off| off.set(true));
+    });
+  }
   let fetched = uploaded(edge, &name, &fetch_of(commit));
   let counted = |kind| counted_on(&daemon, REPOSITORY, kind);
   let observed = (
@@ -4800,33 +4926,31 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
         .map_or(0, |content| content.counters().kept_unlanded)
     }),
   );
+  let brought_again = counted("vcs_store.git_resident.brought_again");
   daemon.stop();
-  eprintln!(
-    "clone of a let-go pack: (stops, peak, let go behind) {observed:?} of {} windows; pinned after the push, \
-     let-gos a pin refused: {pins:?}",
-    windows.len()
-  );
-  assert!(
-    let_go >= 1,
-    "{let_go} of {} windows let go: {refused:?}",
-    windows.len()
-  );
-  assert_eq!(fetched.0, 200);
-  assert_eq!(
-    ids_in(&fetched_pack(&fetched.1)).len(),
-    3,
-    "the clone whole"
-  );
-  // The clone may copy the encoding's kept parts rather than read the let-go pack; where it reads the pack, at most a
-  // turn's windows are held at once (`t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed` holds the
-  // mechanism to it whatever the clone reads).
-  let (_, peak, _) = observed;
-  assert!(
-    peak <= 3,
-    "at most a turn's windows held: {observed:?} of {}; windows pinned after the push and let-gos a pin refused: \
-     {pins:?}",
-    windows.len()
-  );
+  ClonedLetGo {
+    observed,
+    brought_again,
+    pins,
+    windows: windows.len(),
+    let_go: (let_go, refused),
+    status: fetched.0,
+    objects: ids_in(&fetched_pack(&fetched.1)).len(),
+  }
+}
+
+/// What [`clone_of_a_let_go_pack`] saw: the clone's (stops, peak windows, windows let go behind), the windows it
+/// brought back a second time, the windows pinned after the push and the let-gos a pin refused, the pack's windows, the
+/// windows let go before the clone and why any was not, and the clone's status and objects.
+#[derive(Debug)]
+struct ClonedLetGo {
+  observed: (u64, u64, u64),
+  brought_again: u64,
+  pins: (u64, u64),
+  windows: usize,
+  let_go: (usize, Vec<String>),
+  status: u16,
+  objects: usize,
 }
 
 /// A pushed history whose one file is chained as offset deltas ([`chained_create`]): the request creating `main` at its

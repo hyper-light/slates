@@ -175,10 +175,50 @@ pub(crate) struct Brought {
 }
 
 /// The windows an answer brought back and has not let go (A-864 piece 3): a turn's look-ahead, and the windows the
-/// object under way stopped at (`Brought::pinned`), the cursor passing each. The pinned windows are at most those one
-/// object's read lies in: its delta chain's entries, at most the deepest chain a push carried, each at most the largest
-/// object and so its bytes' windows and one more.
-pub(crate) type Resident = Vec<Brought>;
+/// object under way stopped at (`Brought::pinned`), the cursor passing each; and those it let go behind it. The pinned
+/// windows are at most those one object's read lies in: its delta chain's entries, at most the deepest chain a push
+/// carried, each at most the largest object and so its bytes' windows and one more.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Resident {
+  /// The windows held now.
+  held: Vec<Brought>,
+  /// The windows let go behind the cursor so far, each once: what tells a window brought back a second time (an
+  /// entry's check that crossed let-go windows, then its copy; `vcs_store::upload::BROUGHT_AGAIN`). Bounded by the
+  /// windows of the packs one answer reads.
+  passed: std::collections::BTreeSet<slates_vcs::ContentId>,
+}
+
+impl Resident {
+  /// None held, none passed.
+  pub(crate) fn new() -> Resident {
+    Resident::default()
+  }
+
+  /// The windows held now.
+  pub(crate) fn len(&self) -> usize {
+    self.held.len()
+  }
+
+  /// Keeps `brought` held; whether this answer let its window go behind its cursor before (brought back a second
+  /// time).
+  pub(crate) fn push(&mut self, brought: Brought) -> bool {
+    let again = self.passed.contains(&brought.window);
+    self.held.push(brought);
+    again
+  }
+
+  /// Keeps the windows `keep` keeps, each it lets go noted passed.
+  pub(crate) fn retain(&mut self, mut keep: impl FnMut(&Brought) -> bool) {
+    let passed = &mut self.passed;
+    self.held.retain(|brought| {
+      let kept = keep(brought);
+      if !kept {
+        passed.insert(brought.window);
+      }
+      kept
+    });
+  }
+}
 
 /// Where an answer's pack reads next and the let-go window its last turn stopped at (A-864 piece 2,
 /// `slates_git::upload::Streamed::pack_reads`).

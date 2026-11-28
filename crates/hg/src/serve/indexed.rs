@@ -183,8 +183,8 @@ pub struct Indexed<'a> {
   lends: Cell<Lends>,
   /// The most bytes of texts one want of a fetch asks the changeset store for ([`Store::text_bytes_a_step`]).
   text_step: u64,
-  /// The machine's cache line ([`Store::cache_line`]).
-  cache_line: u64,
+  /// What a stream's step over it may move ([`Store::step_copy`]).
+  copy: crate::render::StepCopy,
   /// The tests' changeset store answered at once from the index's own texts ([`Indexed::answering_from_its_texts`]),
   /// each text by its identity as the rows named it; none in the daemon, whose changeset store answers between steps.
   #[cfg(test)]
@@ -205,7 +205,7 @@ impl<'a> Indexed<'a> {
   /// store cannot read; and for a changelog row from the first changeset that is not public on that the index cannot
   /// read, or that names a parent at or after itself (`Graph` then names the changelog's revision). A fetch over it asks
   /// the changeset store for at most `copy`'s bytes of texts a want ([`Store::text_bytes_a_step`]), and a stream over it
-  /// charges a read in its cache lines ([`Store::cache_line`]).
+  /// steps within `copy` ([`Store::step_copy`]).
   pub fn new(
     index: &'a HgIndex,
     store: &'a ContentStore,
@@ -239,7 +239,7 @@ impl<'a> Indexed<'a> {
       census,
       lends,
       text_step: copy.bytes.max(1),
-      cache_line: copy.line.max(1),
+      copy,
       #[cfg(test)]
       from_texts: None,
       #[cfg(test)]
@@ -626,8 +626,8 @@ impl Store for Indexed<'_> {
     self.text_step
   }
 
-  fn cache_line(&self) -> u64 {
-    self.cache_line
+  fn step_copy(&self) -> crate::render::StepCopy {
+    self.copy
   }
 
   fn changeset_text(

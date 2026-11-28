@@ -1182,7 +1182,7 @@ fn t_a864_a_fetchs_look_ahead_brings_back_a_turns_windows_never_its_pack() {
         len,
         offset,
       };
-      let mut resident = Vec::new();
+      let mut resident = crate::vcs_http::git::upload::Resident::new();
       super::read_ahead(
         crate::vcs_http::git::upload::PackReads {
           next: Some(at(0)),
@@ -1254,7 +1254,7 @@ fn a864_a_turns_look_ahead_lets_go_what_its_cursor_passed_before_it_brings_back_
         len,
         offset,
       };
-      let mut resident = Vec::new();
+      let mut resident = crate::vcs_http::git::upload::Resident::new();
       let first = crate::vcs_http::git::upload::PackReads {
         next: Some(at(0)),
         stopped: None,
@@ -1307,7 +1307,7 @@ fn t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed() {
         len,
         offset,
       };
-      let mut resident = Vec::new();
+      let mut resident = crate::vcs_http::git::upload::Resident::new();
       super::read_ahead(
         crate::vcs_http::git::upload::PackReads {
           next: Some(at(0)),
