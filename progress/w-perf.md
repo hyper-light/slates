@@ -947,3 +947,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     cut began (fresh_held), read on the borrow and intake-slice lines. Main's 57k on it started 23:33.
   - BUILT, red, tests only: agents/w-perf-uncapture at f664eb84c: the oracle asserts no fresh free is held (327,680 B
     now). The uncapture (Buddy::free_unnamed) waits for the 57k's F-of-N share.
+- 2026-11-28 01:09 PST (written then):
+  - Uncapture measured and rejected (main's 57k on 3d24ec5b3: F 0 at every large borrow). Part 2's red kept on
+    agents/w-perf-uncapture as a record.
+  - BUILT, not on main: agents/w-perf-held-bytes at 0ecf4882f (on 3d24ec5b3): the gauge counts a trimmed chunk's
+    every piece (red 32,768 vs 49,152), the borrow line's held split, and the catch-up state at each held doubling at
+    a borrow's end. Main runs the 57k on it, two runs loaded on purpose.
+  - Worktrees: w-perf-held (current) and w-perf-land share my target; check "Compiling slates-server" on a switch.
