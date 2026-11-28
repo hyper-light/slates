@@ -754,3 +754,11 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   - 5974f9462: (C) server and vfs.
 - TLC on sha256 61b68654ea2e1e31: _floor_bounded holds (50.0M, bounded); _forget and the base config hold; all four non-vacuity configs fail as required; the full _floor is still running; _3 partial.
 - Owed (main): the wall; a914 x16 (does (C) clear runs 5/13's shape?); the full _floor's verdict.
+
+## 2026-11-27 16:03 PST: a914 shape 1 is f = 1's repair window; A-934 claimed
+- Main's rulings (15:51): §4.8 is implemented, and the owner counts itself among f + 1 (fleet.rs:8987, register.rs:3078, cluster/src/lib.rs:1040). In run 7, c's death fell inside the first death's repair window.
+- Written, not pushed (main: lands on the tree after w-perf's 43a8563a2 is fixed or reverted):
+  - a914's repair-window precondition (Daemon::repair_window_holders);
+  - the past-tolerance log line now names the reader and who answered;
+  - A-934's red, a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_cohort;
+  - GAPS: shape 1, A-934 OPEN, and the design question (adopting a live owner's word) OPEN.
