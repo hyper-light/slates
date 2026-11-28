@@ -844,3 +844,7 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - The live-ship admission test waits until a's placement names the filled candidate (a test premise; Windows arm64 set in 2 ms, inferred).
 - Sent main the 93-shared statuses: family three landed c5051eb51 (Linux run owed); lane/frames/A-B closed (35c740150, 3bc841699); inputs at B closed (A-826); A-658 3c open (maybe unblocked by A-767 C5).
 - Free; waiting for main's order.
+
+## 2026-11-27 22:58 PST: A-658 3c measure first (slates 36bd21cad, 7f6af7ae4)
+- git_push.judge_ns / judge_ns_most timed on the owner (unit red), takeover_round GAPS evidence; multi_repo_load prints them and the summed push times.
+- Sent main the bench command; 3c waits on its figures. Main's diags: winfleet-4 32/32 both lanes (a935, a921 fixes hold); fuse-1 green (family three closed).
