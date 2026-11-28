@@ -482,7 +482,7 @@ fn judged_spent_every(green: &mut Green, inc: &mut super::Increment, every: u64)
   for _ in 0..R593_STEP_BOUND {
     let mut spent = || {
       checks += 1;
-      checks % every == 0
+      checks.is_multiple_of(every)
     };
     if let Some(judgment) = green.judging_step(inc, &mut judging, &mut spent) {
       return judgment;

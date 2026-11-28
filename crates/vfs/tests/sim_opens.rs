@@ -6,8 +6,16 @@
 //! which is that copy of the test's dump: an oracle's cost inside the product's poll. A real open copies nothing and
 //! keeps the old inode alive only once a rename or an unlink displaces it.
 
-use slates_vfs::host::{HostFs, LandFs};
+// Test harness code: an unwrap here is a failed test, which is what it should be.
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
+
 use slates_vfs::host::sim::SimHost;
+use slates_vfs::host::{HostFs, LandFs};
 
 /// Shape: a file of a mebibyte, so a copy at the open shows in the bytes the opens hold.
 const LARGE: usize = 1 << 20;
