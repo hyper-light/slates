@@ -418,8 +418,12 @@
 >   leftovers: a refused attempt lets go of every hold it made at every home (`homes::Attempt::released`), and nothing
 >   homes them again. Now logged: the build's wait on the replay as it begins and ends; each home a region read got
 >   nothing from, with its share and its wait, and a read that ended with none, or found no home besides this node;
->   each names a rebuild could not fetch. Unproven guess: an object of an earlier landed record whose homes were the two
->   dead (d and c), the healer not yet re-homing it before c died.
+>   each names a rebuild could not fetch; and each merge record a holder does not accept, with its green, version, sender
+>   and reason (the counter it counts), once per green, version and reason (`merge_service::note_unaccepted`, main's
+>   ruling of 18:33), for the first-death barrier red where a candidate holding v1 never acknowledged v2 (A-935's kept
+>   v1 retargeted to the newcomer meanwhile: not yet A-935's, one red against none in 16). Unproven guess for the stall:
+>   an object of an earlier landed record whose homes were the two dead (d and c), the healer not yet re-homing it before
+>   c died.
 > - **OPEN, being logged (w-shared; main 01a20182's ruling of 2026-11-27 17:05): a live node's own HTTP edge refused a
 >   connect at 0 ms.** 2816da877's a914 run 3: the first death's push failed "Failed to connect to 127.0.0.1 port 55009
 >   after 0 ms: Couldn't connect to server" on a's own `vcs_http_port` while a was alive, and no "the HTTP edge
