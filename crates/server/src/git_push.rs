@@ -290,6 +290,10 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   /// ([`ReceivePack::take_waited`]; B1's second cause under load, main's lines of agents/w-git-b1-debug: on the
   /// repository's one slot, a derivation's turn cleared the note before the push's driver looked).
   waits: slates_git::away::Waits,
+  /// The buffer its intake's queue copies a call's objects into, kept from call to call so no object makes a buffer of
+  /// its own (`slates_git::unpack::Queued`; main 01a20182's ruling of 2026-11-28 01:23): at most one call's objects'
+  /// room, which their holds charge while queued.
+  queue_bytes: Vec<u8>,
 }
 
 /// Counter: a member green checkpointed in a push's turn before its append, making the chains room for the append's
@@ -662,6 +666,7 @@ impl<P> ReceivePack<P> {
       unadmitted: None,
       refusal_names: None,
       waits: slates_git::away::Waits::default(),
+      queue_bytes: Vec::new(),
       #[cfg(unix)]
       presenter,
       #[cfg(not(unix))]
@@ -804,8 +809,10 @@ impl<P> ReceivePack<P> {
       admission,
       quarantine,
       waits,
+      queue_bytes,
       ..
     } = self;
+    let reused = core::mem::take(queue_bytes);
     let (called, queue) = with_room(state, |state| {
       let (content, git) = state
         .vcs_stores
@@ -818,7 +825,7 @@ impl<P> ReceivePack<P> {
           content,
           (&git.repository, Some(waits)),
         ),
-        queue: BTreeMap::new(),
+        queue: slates_git::unpack::Queued::reusing(reused),
       };
       let called = call(session, &mut site, admission);
       Ok::<_, PushFailed>((called, site.queue))
@@ -826,11 +833,13 @@ impl<P> ReceivePack<P> {
     match (quarantine.as_mut(), self.unadmitted.is_some()) {
       (Some(quarantine), false) => {
         let admitted = match quarantine.keep_pack_to(state, session.pack_len(), input) {
-          Ok(()) => intake::admit_queued(state, quarantine, queue, admission),
+          Ok(()) => {
+            let (admitted, bytes) = intake::admit_queued(state, quarantine, queue, admission);
+            *queue_bytes = bytes;
+            admitted
+          }
           Err(refused) => {
-            for (_, hold) in queue.into_values() {
-              admission.release(hold);
-            }
+            *queue_bytes = intake::released(queue, admission);
             Err(refused)
           }
         };
@@ -838,11 +847,7 @@ impl<P> ReceivePack<P> {
           self.unadmitted = Some(refused);
         }
       }
-      _ => {
-        for (_, hold) in queue.into_values() {
-          admission.release(hold);
-        }
-      }
+      _ => *queue_bytes = intake::released(queue, admission),
     }
     called.map_err(PushFailed::Exchange)
   }

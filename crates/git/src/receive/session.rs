@@ -523,12 +523,12 @@ impl<S: Keep + ?Sized> Keep for Fscking<'_, S> {
   fn keep(
     &mut self,
     at: usize,
-    object: unpack::Object,
+    object: unpack::ObjectRef<'_>,
     hold: crate::Hold,
     admission: &mut Admission,
   ) -> Result<(), unpack::Refusal> {
     if self.refused.is_none()
-      && let Some(finding) = super::fsck::refusal_of(object.kind, &object.content, self.format)
+      && let Some(finding) = super::fsck::refusal_of(object.kind, object.content, self.format)
     {
       *self.refused = Some((object.id, finding));
     }

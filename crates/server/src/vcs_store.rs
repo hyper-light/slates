@@ -2432,21 +2432,26 @@ impl GitPush {
     );
   }
 
-  /// Admits `objects`, a pack's as its reader resolved them, each held where its entry lies in the push's pack
-  /// ([`GitPush::keep_pack_to`]): its bytes named and checked, then kept only as read lately (`Push::keep_read`, taken
-  /// whole). Refused at the first object refused; the push keeps what it admitted before, for its caller to abandon.
+  /// Admits `objects`, a pack's as its reader resolved them, queued with their bytes in `bytes`, each held where its
+  /// entry lies in the push's pack ([`GitPush::keep_pack_to`]): its bytes named and checked, then kept only as read
+  /// lately (`Push::keep_read_lent`, copied where they are kept). Refused at the first object refused; the push keeps
+  /// what it admitted before, for its caller to abandon.
   pub(crate) fn admit_placed_all(
     &mut self,
     state: &mut ShardState,
-    objects: Vec<slates_git::unpack::Object>,
+    (objects, bytes): (
+      &[(slates_git::unpack::QueuedObject, slates_git::Hold)],
+      &[u8],
+    ),
   ) -> Result<(), GitRefused> {
     within_budget(state, 0, |stores| {
       let (content, store) = stores.git(self.repository).ok_or(GitRefused::NoStore)?;
-      for object in objects {
+      for (queued, _) in objects {
+        let object = queued.object(bytes);
         let incoming = Incoming {
           kind: object.kind,
           claimed: Some(object.id),
-          content: &object.content,
+          content: object.content,
           depth: object.chain.as_ref().map_or(0, |chain| chain.depth),
         };
         admit_object(
@@ -2457,7 +2462,7 @@ impl GitPush {
         )?;
         self
           .push
-          .keep_read(object.offset, object.kind, object.content);
+          .keep_read_lent(object.offset, object.kind, object.content);
       }
       // What it keeps read lately is charged on the store's room (A-861).
       self.push.true_up_recent(content);
