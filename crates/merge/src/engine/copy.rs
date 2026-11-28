@@ -657,17 +657,21 @@ fn outer_of<'a>(
 }
 
 impl Green {
-  /// The latest copy whose tree holds `path` (its destination is `path` or an ancestor), with its destination: one
-  /// lookup a level of the path's depth, and none on a green that never copied. Of copies one version made, the nearest
-  /// is the latest: copies nest in their destinations' order, an inner one landing in an outer one's tree (A-626).
-  pub(super) fn copy_above(&self, path: &str) -> Option<(&str, &Appearance)> {
+  /// The latest copy made at or before `at` whose tree holds `path` (its destination is `path` or an ancestor), with its
+  /// destination: one lookup a level of the path's depth, and none on a green that never copied. Of copies one version
+  /// made, the nearest is the latest: copies nest in their destinations' order, an inner one landing in an outer one's
+  /// tree (A-626). A reader names its version, the head (A-752 part 3c U0): a copy a commit records before it publishes
+  /// is above the head, and no reader at the head sees it; the commit's own reads name its version.
+  pub(super) fn copy_above(&self, path: &str, at: u64) -> Option<(&str, &Appearance)> {
     if self.copies.is_empty() {
       return None;
     }
     let mut latest: Option<(&str, &Appearance)> = None;
     for prefix in ancestors(path) {
       if let Some((dst, records)) = self.copies.get_key_value(prefix)
-        && let Some(record) = records.last()
+        && let Some(record) = records
+          .get(..records.partition_point(|record| record.version <= at))
+          .and_then(<[_]>::last)
         && latest.is_none_or(|(_, best)| record.version > best.version)
       {
         latest = Some((dst.as_str(), record));
@@ -695,8 +699,13 @@ impl Green {
   /// The version since which `path` has held what a copy gave it (module docs): the latest copy above it, when the
   /// path has no history, or its own last recorded change (`own_last`: its version, and whether it removed the key) is
   /// older, or is a removal at the copy's own version, which a replace makes before the copy lands (A-626).
-  pub(super) fn covered_since(&self, path: &str, own_last: Option<(u64, bool)>) -> Option<u64> {
-    let (_, record) = self.copy_above(path)?;
+  pub(super) fn covered_since(
+    &self,
+    path: &str,
+    own_last: Option<(u64, bool)>,
+    at: u64,
+  ) -> Option<u64> {
+    let (_, record) = self.copy_above(path, at)?;
     own_last
       .is_none_or(|(last, removed)| last < record.version || (last == record.version && removed))
       .then_some(record.version)
@@ -705,9 +714,14 @@ impl Green {
   /// The version a key's held value dates from, recorded before its change (`super::seed`): the copy's that gave it,
   /// while it holds that copy's value; 0 for a key with no history (A-534's one history rule); none when its history
   /// already holds it.
-  pub(super) fn seed_since(&self, path: &str, own_last: Option<(u64, bool)>) -> Option<u64> {
+  pub(super) fn seed_since(
+    &self,
+    path: &str,
+    own_last: Option<(u64, bool)>,
+    at: u64,
+  ) -> Option<u64> {
     self
-      .covered_since(path, own_last)
+      .covered_since(path, own_last, at)
       .or_else(|| own_last.is_none().then_some(0))
   }
 
@@ -715,7 +729,7 @@ impl Green {
   pub(super) fn changed_last(&self, own: Option<&u64>, path: &str) -> u64 {
     let own = own.copied().unwrap_or(0);
     self
-      .copy_above(path)
+      .copy_above(path, self.head())
       .map_or(own, |(_, record)| own.max(record.version))
   }
 
@@ -723,7 +737,7 @@ impl Green {
   /// own increment at most.
   pub(super) fn copied_in(&self, path: &str, version: u64) -> bool {
     self
-      .copy_above(path)
+      .copy_above(path, version)
       .is_some_and(|(_, record)| record.version == version)
   }
 
@@ -731,7 +745,7 @@ impl Green {
   /// bytes the copy brought whole.
   pub(super) fn replaced_after(&self, path: &str, base: u64) -> bool {
     self
-      .copy_above(path)
+      .copy_above(path, self.head())
       .is_some_and(|(_, record)| record.version > base)
   }
 
@@ -753,9 +767,12 @@ impl Green {
     if self.replaced_after(path, version) {
       return true;
     }
+    // At or below the head (A-752 part 3c U0): a version a commit records before it publishes is above it.
+    let head = self.head();
     self
       .changes
       .range(version.saturating_add(1)..)
+      .take_while(|(at, _)| **at <= head)
       .flat_map(|(_, entries)| entries)
       .any(|entry| in_tree(&entry.path, path))
   }
@@ -1006,9 +1023,11 @@ impl Green {
     if version < self.folded_below.max(self.deltas_from) {
       return Err(CopyRefusal::VersionFolded);
     }
+    let head = self.head();
     let named: BTreeSet<&str> = self
       .changes
       .range(version.saturating_add(1)..)
+      .take_while(|(at, _)| **at <= head)
       .flat_map(|(_, entries)| entries)
       .map(|entry| entry.path.as_str())
       .filter(|path| in_tree(path, source))
