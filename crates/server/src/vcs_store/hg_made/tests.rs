@@ -77,6 +77,7 @@ fn pushed_made(state: &mut ShardState, repository: RepositoryId, parent: Node) -
     text: changeset.text.clone(),
     manifest: (manifest.node, manifest.p1, manifest.text.clone()),
     file: (path.clone(), files[0].node, files[0].text.clone()),
+    file_base: None,
   }
 }
 

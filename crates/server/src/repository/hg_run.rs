@@ -378,6 +378,10 @@ pub(crate) const TEXTS_PINNED: &str = "vcs.hg.push_texts_pinned";
 /// Lets go of `contents`, a landed segment's file revisions' windows (module docs, "Let go"), each noted for a home as
 /// [`let_go_windows`] notes it where `noting` names its committed repository; counted with its bytes, and the windows
 /// kept pinned.
+///
+/// The tests' one-shot form of the let-go: a landing lets its segment's texts go a slice a borrow
+/// (`hg_push::segment_let_go`, `let_go_landed_slice`), never whole in one borrow.
+#[cfg(test)]
 pub(crate) fn let_go_landed(
   state: &mut ShardState,
   noting: Option<RepositoryId>,
