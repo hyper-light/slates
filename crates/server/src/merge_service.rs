@@ -2889,6 +2889,14 @@ impl PendingGreen {
 
   /// One first missing position per remote holder, grouped into the record dispatches that may
   /// share a quorum. A holder cannot skip its own prefix to follow a faster holder.
+  ///
+  /// The bound on reships (main 01a20182's ruling of 2026-11-27 20:19, §2 item 8): a target is sent at most one version a
+  /// pass of the record plane, its first owed, and is owed it until it acknowledges it. So a holder that answers
+  /// `Behind`, such as a candidate a death brought in, or one whose replica owes its push and holds a kept version's
+  /// record but no replica of it (A-935), is reshipped once a pass while it catches up, and no longer once it holds the
+  /// version: single digits a run in the stall red (3 and 9 `Behind` heard). Not once per install of this node: a holder
+  /// that answered `Behind` reads the chain (A-918 B) and is accepted only at the owner's next shipment, so holding that
+  /// shipment until an install would leave a quiet stretch's newcomer behind for good, the gap A-935 closed.
   fn next(&self, local: HostId) -> BTreeMap<u64, Vec<HostId>> {
     let mut selected = BTreeMap::<u64, Vec<HostId>>::new();
     for (host, versions) in &self.owed {

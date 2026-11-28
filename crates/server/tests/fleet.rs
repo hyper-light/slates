@@ -39934,17 +39934,20 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
   );
 }
 
+/// Shape: the coordinator periods A-921's warm-restart test watches the restarted node's direct route not name a: past
+/// its restart's own settling and the readmitted a's eligibility, in which the route named a before the skip kept its fact
+/// (3 of 3 runs), many times over, and inside CI's per-test cap.
+const ROUTE_WATCH_PERIODS: u64 = 100;
+
 /// A-921 part 2 (main 01a20182's ruling of 2026-11-25: the one case the stale-creator skip exists for). Do: on a
 /// four-node anchored fleet, a volume on a, held by two of its peers; cut a off until the survivors take it over, heal it
 /// until every node names a a member again; restart the fourth node (which holds none of the volume) warm, so it comes
 /// back knowing nothing of the volume's owner (its routing is not persisted); ask what its direct route names, then the
-/// volume's status from its client. Expect the status served. Recorded, not asserted (main 01a20182's ruling of
-/// 2026-11-27): whether the direct route named a, and the location round's claims. A readmission drops a's completed
-/// takeover (`RegionalConfiguration::admit`, A-309), and its retirement is gone once that completes, so the creator skip
-/// has nothing to read: the direct route names a once a is eligible again and before the restarted node's own routing
-/// learns the adopter (3 of 3 runs on main past 03c736286; green at A-921 part 2's landing, its routing first). That
-/// costs a forward a redirect, never a wrong answer (GAPS: a known limit). The skip's own case, a retirement kept, is its
-/// unit red's (`the_direct_route_never_names_a_creator_a_kept_takeover_retired`).
+/// volume's status from its client. Expect its direct route never to name a over [`ROUTE_WATCH_PERIODS`], and the status
+/// served. A readmission drops a's completed takeover (`RegionalConfiguration::admit`, A-309) and keeps its fact for
+/// routing (`superseded`, bd92839b7), so the creator skip still holds: before, the direct route named a once a was
+/// eligible again and before the restarted node's own routing learned the adopter (3 of 3 runs on main past 03c736286),
+/// which was recorded, not asserted, as a known limit. The claims are recorded, not asserted.
 #[test]
 fn a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume() {
   let _serial = serialize_fleet_tests();
@@ -39985,17 +39988,20 @@ fn a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume() {
       all_council(&fleet.daemons, |members| members.contains(&owner))
     });
   let restarted = fleet.restart_warm(stranger);
-  // Watched until it names an owner or the placement deadline passes: just after its restart the node may not yet hold a
-  // eligible, and only once it does would its direct route fall to the creator (the skip's case).
+  // Watched for [`ROUTE_WATCH_PERIODS`], ended at once should the direct route name a: since a's readmission keeps the
+  // skip's fact (`RegionalConfiguration::superseded`), a node with no route of its own names none, and its routing names
+  // the adopter once it learns it. Before, the watch waited for any owner to be named, which on a slow lane after the
+  // fix never came (winfleet-3's x86_64, two runs at the 300 s cap).
   let mut named_a = false;
   let mut tried_first: Result<Option<HostId>, ObserveError> = Ok(None);
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
-  let _ = poll_until(&observed, PLACEMENT_DEADLINE, || {
+  let _ = poll_for_periods(&observed, RETIREMENT_DEADLINE, ROUTE_WATCH_PERIODS, || {
     let named = fleet.daemons[stranger].known_owner(object)?;
     named_a |= named == Some(owner);
     tried_first = Ok(named);
-    Ok(named.is_some())
+    Ok(named_a)
   });
+  let route_view = fleet.daemons[stranger].route_view(object);
   let claims_before = summed_count(&fleet.daemons[stranger], "fleet.owner_location.claim");
   let mut forwarded = Client::connect(fleet.daemons[stranger].instance());
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
@@ -40012,11 +40018,17 @@ fn a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume() {
   fleet.stop();
   eprintln!(
     "restarted-stranger: holders {holders:?}, stranger {stranger}; cut {cut} taken {taken} healed {healed} readmitted \
-     {readmitted} restarted {restarted}; tried first {tried_first:?}, named a {named_a} (a {owner:?}); served {served}; claims {claims}"
+     {readmitted} restarted {restarted}; tried first {tried_first:?}, named a {named_a} (a {owner:?}); the route view \
+     {route_view:?}; served {served}; claims {claims}"
   );
   assert!(
     placed && taken && readmitted && restarted,
     "the scene formed"
+  );
+  assert!(
+    !named_a,
+    "the restarted node's direct route never named a, the readmitted creator: {tried_first:?}, its route view \
+     {route_view:?}"
   );
   assert!(served, "the volume's status served from the restarted node");
   // Claims are recorded, not asserted: the restarted node's routing, learned again, may name the adopter before a round.
