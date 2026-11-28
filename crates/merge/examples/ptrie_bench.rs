@@ -9,7 +9,8 @@
 //! - remove: every key taken out of the full map.
 //!
 //! Keys are paths of a source tree: a few hundred directories, files under each, so edges split and share prefixes as
-//! a repository's do. Every round of every point is printed, then the fastest, in nanoseconds a key.
+//! a repository's do. The thread is spun busy first, so it is placed before timing ([`WARM_UP_MS`]). Every round of
+//! every point is printed, then the fastest, in nanoseconds a key.
 //!
 //! usage: `cargo run --release -p slates-merge --example ptrie_bench`
 // A benchmark: an unexpected outcome is a failed run, which is what it should be.
@@ -28,8 +29,15 @@ use slates_merge::ptrie::{Nodes, Plain, Ptrie};
 
 /// Shape: the map sizes timed: a wide import's revision (A-920's 9,000 files) and a large repository's tree.
 const SIZES: [usize; 2] = [9_000, 100_000];
-/// Shape: rounds a point; the fastest is reported, every round printed.
-const ROUNDS: usize = 7;
+/// Shape: rounds a point; the fastest is reported, every round printed. Fifty, so a point's best is taken over long
+/// enough that the scheduler's placement settles (w-svn's 20-run table of 2026-11-28: best of 7 left the slow mode in
+/// both arms).
+const ROUNDS: usize = 50;
+/// Shape: the busy warm-up before anything is timed, in milliseconds: long enough that the scheduler places the thread
+/// on a performance core before timing. Chosen by w-svn's 20-run table of 2026-11-28 (get at 9,000 keys, a loaded Apple
+/// Silicon Mac): without it each short run kept the core it began on, and both arms were bimodal (A's fast runs 43.6-49.2
+/// ns, the rest 103.7-186.4); with 50 ms and best of 50, A ran fast in 14 of 20 (median 45.6 ns), B in 17 of 20.
+const WARM_UP_MS: u128 = 50;
 /// Shape: the files a directory holds, so a key's directory prefix is shared by that many keys.
 const FILES_A_DIR: usize = 30;
 
@@ -132,7 +140,18 @@ fn measured(n: usize) {
   }
 }
 
+/// Spins the thread busy for [`WARM_UP_MS`], so the scheduler places it before anything is timed.
+fn warmed_up() {
+  let began = Instant::now();
+  let mut spins = 0u64;
+  while began.elapsed().as_millis() < WARM_UP_MS {
+    spins = spins.wrapping_add(1);
+  }
+  assert!(spins > 0, "the warm-up spun");
+}
+
 fn main() {
+  warmed_up();
   for n in SIZES {
     measured(n);
   }
