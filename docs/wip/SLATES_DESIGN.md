@@ -58379,6 +58379,17 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
     reads at the twin's (red, marks in place: a reader's fold saw the stage at unit 8; red, marks aside but no drain:
     the same at unit 8 and after a refusal at 8 turns); and main's move case, `a` renamed onto `e` unfolded and `a`
     made again (holds with or without the drain: that key's fold reads no partner the stage wrote).
+  - **U6, the seven chunk-free current maps forked into the stage** (main 01a20182's ruling of 03:10). The IPC
+    nodes', directories', modes', symbolic and hard links', attributes' and links-to maps are forked at the stage's
+    begin (`staging::Forks`, one count each, no arena of their own); each staging step swaps them in with the
+    green's arenas lent to them (`Dim::swap_with_fork`, twice is none), runs its unit, and swaps them back, so the
+    commit reads and writes only its forks and every reader between steps the published maps. A publish swaps them in
+    for good and gives the published roots back (`Dim::release_fork`), a refusal gives the forks back: either frees
+    only the nodes the stage copied, O(the paths it changed × their depth). Red first (`engine::publish_tests`):
+    between every two steps the seven maps read as before (red, and red with the swap a no-op: a reader saw the
+    stage's current maps at unit 10), and a stage given up after any turn leaves them and their arenas' live nodes
+    as they were (red with the release a no-op: given up after 10 turns, nodes [0, 0, 2, 0, 0, 0, 0] from all 0).
+    The content map is U7's (hold-on-copy holders), and U5's drain-first rule stays until it: the fold reads it.
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;

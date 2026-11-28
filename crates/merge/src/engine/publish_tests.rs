@@ -502,6 +502,91 @@ fn identity_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String
   Ok(false)
 }
 
+/// The seven chunk-free current maps as every reader reads them at the head: each one's keys and values, in order.
+fn current_maps_read(green: &Green) -> String {
+  format!(
+    "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
+    green.specials.iter().collect::<Vec<_>>(),
+    green.dirs.iter().collect::<Vec<_>>(),
+    green.modes.iter().collect::<Vec<_>>(),
+    green.symlinks.iter().collect::<Vec<_>>(),
+    green.hardlinks.iter().collect::<Vec<_>>(),
+    green.xattrs.iter().collect::<Vec<_>>(),
+    green.links_to.iter().collect::<Vec<_>>(),
+  )
+}
+
+/// The seven maps' arenas' live nodes: what a stage given up must leave as it found (no copy of a node kept).
+fn current_maps_held(green: &Green) -> [usize; 7] {
+  [
+    green.specials.live_nodes(),
+    green.dirs.live_nodes(),
+    green.modes.live_nodes(),
+    green.symlinks.live_nodes(),
+    green.hardlinks.live_nodes(),
+    green.xattrs.live_nodes(),
+    green.links_to.live_nodes(),
+  ]
+}
+
+/// [`changes_unseen`] with the seven current maps read between the steps ([`current_maps_read`]).
+fn current_maps_unseen(green: &mut Green, inc: &Increment) -> Result<Option<u64>, String> {
+  let Judgment::Accepted(held) = green.judge(inc) else {
+    return Ok(None);
+  };
+  let before = current_maps_read(green);
+  let mut staging = green.begin_staging(held);
+  loop {
+    let stepped = green.staging_step(&mut staging, &mut || true);
+    if current_maps_read(green) != before {
+      return Err(format!(
+        "a reader saw the stage's current maps at unit {}",
+        staging.units()
+      ));
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  Ok(green.publish(staging).map(|(version, _)| version))
+}
+
+/// [`changes_given_up_after`] with the seven current maps and their arenas' live nodes the guard.
+fn current_maps_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let mut green = submitted_in_every_dimension(before);
+  let inc = work_in_every_dimension(&green, last, u64::MAX);
+  let Judgment::Accepted(held) = green.judge(&inc) else {
+    return Ok(true);
+  };
+  let (read, nodes) = (current_maps_read(&green), current_maps_held(&green));
+  let mut staging = green.begin_staging(held);
+  let mut staged = false;
+  for _ in 0..turns {
+    if let StagingStep::Staged = green.staging_step(&mut staging, &mut || true) {
+      staged = true;
+      break;
+    }
+  }
+  green.abandon_staging(staging);
+  if current_maps_read(&green) != read {
+    return Err(format!(
+      "a stage given up after {turns} turns left a current map changed"
+    ));
+  }
+  let left = current_maps_held(&green);
+  if left != nodes {
+    return Err(format!(
+      "a stage given up after {turns} turns left nodes {left:?}, from {nodes:?}"
+    ));
+  }
+  Ok(staged)
+}
+
 /// The works [`proptest`] generates: one to eight, each of one to four changes.
 fn works() -> impl Strategy<Value = Vec<Changes>> {
   prop::collection::vec(
@@ -687,6 +772,40 @@ proptest! {
       let prefix = steps.get(..end).unwrap_or_default();
       for turns in 0u64.. {
         if identity_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+
+  /// A-752 part 3c U6 (the seven chunk-free current maps forked into the stage; main 01a20182's ruling of 2026-11-28
+  /// 03:10). Do: as U2's, the IPC nodes', directories', modes', symbolic and hard links', attributes' and links-to
+  /// maps read between every two steps. Expect them as before the stage, and the same version and maps as the
+  /// twin's after each work. Red before: the commit wrote them in place.
+  #[test]
+  fn a_staged_verdicts_current_maps_move_only_at_its_publish(steps in works()) {
+    let (mut whole, mut staged) = (submitted_in_every_dimension(&[]), submitted_in_every_dimension(&[]));
+    for (id, changes) in (1u64..).zip(&steps) {
+      let inc = work_in_every_dimension(&whole, changes, id);
+      let (outcome, _) = whole.submit_resolved(&inc);
+      let version = current_maps_unseen(&mut staged, &inc).map_err(TestCaseError::fail)?;
+      let accepted = match outcome {
+        super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+        _ => None,
+      };
+      prop_assert_eq!(version, accepted);
+      prop_assert_eq!(current_maps_read(&staged), current_maps_read(&whole));
+    }
+  }
+
+  /// A-752 part 3c U6 (a refusal at every turn, its last too). Expect the seven maps as before, and their arenas'
+  /// live nodes as before: the stage's copies of nodes freed with it. Red before: a refusal left the maps changed.
+  #[test]
+  fn a_stage_given_up_at_any_turn_leaves_the_current_maps_and_their_nodes_as_they_were(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if current_maps_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
           break;
         }
       }

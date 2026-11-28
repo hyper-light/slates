@@ -4321,11 +4321,10 @@
 > 2026-11-28 00:42 to 01:42): U0 BUILT, every read names its version; U1 BUILT, the head bump and `accepted` at the
 > publish, last, and the mode history appended in place and taken back at a refusal; U2 BUILT, every value history
 > alike; U3 BUILT, the change index; U4 BUILT, `file_removed` and the `*_changed` maps written aside; U5 BUILT, the
-> identity's marks aside and its published backlog drained first (design's part 3c); owed: the current maps forked
-> into the stage (the eight Dims, and w-svn's arena conversions of the deltas, the identity's sets, `latest_change`,
-> `last_changed` and the change index, keeping U0's bounded reads), deleting U5's drain-first rule with them; the
-> commit's scalars written back at the publish; and the content history (A-920 arena unit 1 landed), its stage
-> copies holding their chunks. Found by reading (2026-11-28, not worked): `file_removed` keeps only a
+> identity's marks aside and its published backlog drained first; U6 BUILT, the seven chunk-free current maps forked
+> into the stage (design's part 3c); owed, in main's order of 03:10: the content map forked with hold-on-copy
+> holders (deleting U5's drain-first rule), the content history alike, the commit's scalars written back at the
+> publish, and the staged commit wired into `repository::push`'s landing (t_a752's 14 ms the bar). Found by reading (2026-11-28, not worked): `file_removed` keeps only a
 > path's latest removal, so `stack::levels`'s `== version` read (`levels.rs`:293) and its span read (:326) miss an
 > earlier removal that a later one overwrote.
 >
