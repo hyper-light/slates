@@ -235,7 +235,7 @@ fn a_push_is_held_until_every_green_it_moved_is_placed_through_its_version() {
   });
   logs.note_greens(&third);
   let placed = |main_at: u64, topic_at: u64| {
-    move |green: VolumeId| if green == main { main_at } else { topic_at }
+    move |green: VolumeId| Some(if green == main { main_at } else { topic_at })
   };
   assert!(
     !logs.greens_placed(pushed, placed(1, 0)),
@@ -257,6 +257,19 @@ fn a_push_is_held_until_every_green_it_moved_is_placed_through_its_version() {
     logs.greens_placed(repository(2), placed(0, 0)),
     "nothing noted"
   );
+}
+
+/// Never placed is not placed at version 0 (main 01a20182's ruling of 2026-11-27 21:11): a green owed at version 0 none
+/// of whose versions placed stays owed, and is placed once version 0 is. Do: note a part moving a green to version 0;
+/// judge it never placed, then placed at 0. Expect owed, then placed. Before, a never-placed green read as placed at 0.
+#[test]
+fn a_green_never_placed_is_owed_even_at_version_zero() {
+  let pushed = repository(3);
+  let root = green(3);
+  let mut logs = StateLogs::default();
+  logs.note_greens(&push_part(pushed, (0, 1), (root, 0, 0)));
+  assert!(!logs.greens_placed(pushed, |_| None), "never placed: owed");
+  assert!(logs.greens_placed(pushed, |_| Some(0)), "placed at 0");
 }
 
 /// A-921's second mode (main 01a20182's ruling of 2026-11-26): an owner's parts ride its shard's recovery image and are

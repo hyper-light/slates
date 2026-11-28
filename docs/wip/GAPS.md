@@ -435,6 +435,12 @@
 >   v1 retargeted to the newcomer meanwhile: not yet A-935's, one red against none in 16). Unproven guess for the stall:
 >   an object of an earlier landed record whose homes were the two dead (d and c), the healer not yet re-homing it before
 >   c died.
+> - **Not recurred since A-936 (main 01a20182's ruling of 2026-11-27 21:08): a superseded owner's write answered
+>   `FsDone` on Windows** (`a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost`, diag 12 at a0d39a8c1,
+>   both lanes). Suspected: a holder whose install walk had not reached the volume's copy still named the old owner and
+>   took its live entry. At 3b0015fa6 (A-936 in, its copy installed ahead of the walk) 8 of 8 on both lanes, and the
+>   log that would show it, `fleet.live.admitted_under_lagging_copy`, fired 0 times. No fix written; the log stays, and
+>   if it ever fires that run is the red.
 > - **OPEN, being logged (w-shared; main 01a20182's ruling of 2026-11-27 17:05): a live node's own HTTP edge refused a
 >   connect at 0 ms.** 2816da877's a914 run 3: the first death's push failed "Failed to connect to 127.0.0.1 port 55009
 >   after 0 ms: Couldn't connect to server" on a's own `vcs_http_port` while a was alive, and no "the HTTP edge

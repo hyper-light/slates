@@ -257,12 +257,14 @@ impl StateLogs {
   pub(crate) fn greens_placed(
     &mut self,
     repository: slates_db::catalog::RepositoryId,
-    placed: impl Fn(slates_db::catalog::VolumeId) -> u64,
+    placed: impl Fn(slates_db::catalog::VolumeId) -> Option<u64>,
   ) -> bool {
     let Some(owed) = self.greens_owed.get_mut(&repository) else {
       return true;
     };
-    owed.retain(|green, version| placed(*green) < *version);
+    // Never placed (`None`) is not placed at version 0 (main 01a20182's ruling of 2026-11-27 21:11): a version owed of a
+    // green none of whose versions placed stays owed, version 0 included.
+    owed.retain(|green, version| placed(*green).is_none_or(|placed| placed < *version));
     if owed.is_empty() {
       self.greens_owed.remove(&repository);
       return true;
@@ -592,13 +594,9 @@ pub(crate) fn names_committed(
   } = state;
   let greens_placed = state_logs.greens_placed(repository, |green| {
     if !greens.contains_key(&green) {
-      return u64::MAX;
+      return Some(u64::MAX);
     }
-    merge
-      .placed
-      .get(&ObjectId(green.bytes))
-      .copied()
-      .unwrap_or(0)
+    merge.placed.get(&ObjectId(green.bytes)).copied()
   });
   if !greens_placed {
     return false;
