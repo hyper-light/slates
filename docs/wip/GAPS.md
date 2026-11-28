@@ -1269,14 +1269,24 @@
 > `buffer.drain(..consumed)`, the rest moved each time) and a landing's pending section drained a store piece at a
 > time (`landing::sent_piece`, `pending.drain(..take)`).
 
+> **Finding, not worked under the freeze (w-svn, 2026-11-28; main's ruling of 00:03): the shard's budget does not count
+> a green's current maps.** `Green::retention_charge` (`crates/merge/src/engine.rs`), which
+> `merge_service::settle_green_retention` charges against the shard's budget, is the content and IPC histories beyond
+> the current values, the change index and the rejected cache; its doc and the settle's say it charges what the green
+> holds beyond its current files. No accounting charges the current maps' structure (content's `Files`, dirs, modes,
+> symlinks, hardlinks, specials, `links_to`, xattrs): about 0.5-1 MB at 9,000 paths (the retired member's measured
+> 9,002 labels in 402 KB and 903 child lists in 255 KB, debug), before A-920 arena unit 0 and after. They are bounded
+> by the paths a verdict's reservation, an import batch's room and the repository's chain caps admit, each refusing
+> typed (stated on `ptrie::Nodes`). The honest charge, when taken: a structure term in `retention_charge` from each
+> `Dim`'s exact run bytes, a verdict's reservation admitting its growth; it moves every green's retention and the caps.
+
 > **A-920 arena unit 0 BUILT (w-svn, 2026-11-27; main's rulings of 23:06, 23:08 and 23:25): a radix tree's labels and
 > child lists are runs in its arena.** `ptrie::store::Store` (chunks never reallocated, power-of-two classes with free
 > lists; under 2 × Σ peak live + classes × chunk, Wilson et al. 1995; runs reused, bumped and chunks added counted) holds
 > every node's label and child list, so a release gives them back to the arena, never to the heap: a 9,000-path map's
 > release freed 11,485 heap blocks for its 10,235 nodes before, at most its walk stack's 64 doublings after; the ptrie
-> oracle unchanged. Owed, in order: (a) its bytes charged to the green's retention accounting, exactly and admitted
-> before the arena grows, with an oracle-histories test that they never pass what was admitted and each Dim user
-> (content, dirs, modes, symlinks, hardlinks, specials, links_to, the verdict's) named with what admits it; (b) a dead
+> oracle unchanged. Its bound is stated on `ptrie::Nodes` (main's ruling of 00:03: no accounting charges the current
+> maps, the finding above, so (a) the retention charge is not owed under the freeze). Owed: (b) a dead
 > arena's chunks freed on its own shard a chunk at a time in the release step, the reaper handed only the rest. Until
 > (b), a dead arena's chunks still go to the reaper, as a few dozen 4 KiB frees, not thousands. Then unit 1:
 > `Green::content_history` onto `Dim`, and the remains' other fields by bytes.

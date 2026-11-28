@@ -88,6 +88,17 @@ const CHILD_CHUNK: usize = MOST_CHILDREN;
 const LABEL_CHUNK: usize = CHILD_CHUNK * size_of::<(u8, Slot)>();
 
 /// The arena of nodes the maps made from one another share, and the runs their labels and child lists are kept in.
+///
+/// **Its bound, uncharged and why** (main's ruling of 2026-11-28 00:03). No accounting charges a green's current maps'
+/// structure (a green's retention charge is its histories, its change index and its rejected cache, beyond its current
+/// files; GAPS records it as a finding), so the arena's bound is stated here. Each live entry costs at most one node, one
+/// label run of its key's tail's class and one step up a class of its parent's child list; the stores hold under twice
+/// their peak live items plus a part-used chunk a class (`store`, "Its bound"). The live entries are the paths a green
+/// holds, and each path is admitted by a bound that refuses typed: a verdict's reservation (`Green::begin_reserving`,
+/// `Green::reservation_shares`, secured by the service's `secure_green_retention`, refused `BudgetExceeded`), an import
+/// batch's room (the server's `ImportBatch::judge_reserved`, refused `PastRoom`, a landing's `PastRetention`), and the
+/// repository's caps (the partition's `green_chain_room`, refused `TableAtCapacity { table: "green_chains" }`). So the
+/// arena is bounded by the paths those admit, times an entry's structure, within the stores' waste bound.
 #[derive(Debug)]
 pub struct Nodes<V> {
   slots: Vec<Option<Node<V>>>,
