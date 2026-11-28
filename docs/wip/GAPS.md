@@ -8103,8 +8103,9 @@
 > slicing the encode poll (`git_encode.rs:345`).
 > Taken by w-git (2026-11-28, main's ruling of 00:33): that spin's site, `settle_encodings`, was deleted in 262d21ff5
 > and the turn is paced (A-783); the encoding's last whole unit, its parts' records, is sliced a placed entry a unit
-> ("The encode keep's slice", 152 and 454 entries in one unit before). Owed: the encoding's start (`Encoding::fragments`
-> reading D(k) whole); main's v2.0.0 run under load (run-requests.md). The same hazard in every other default
+> ("The encode keep's slice", 152 and 454 entries in one unit before). The encoding's start is sliced too, its D(k) read
+> a node a unit (113 runs in one unit before). Owed: main's v2.0.0 run under load (run-requests.md). The same hazard in
+> every other default
 > observation since 2026-11-20 (g226, main's ruling): `Daemon::observe` had the observe budget, ten liveness windows,
 > and a shard that stepped busy past that budget's CPU without reaching the question refused it; a default observation
 > now waits while its shard lives (`Observation::patient`, looked at every liveness window, ended only by the shard's

@@ -509,6 +509,106 @@ fn read_tree(store: &ContentStore, root: ContentId, shape: Shape) -> Option<Posi
   Positions::from_runs(runs)
 }
 
+/// One of a value's two sets read from its tree a node a unit (the encoding's start, CLAUDE.md §3: `Encoding::fragments`
+/// read a version's D(k) whole, and a base pack's start its reached set, each in one call): the nodes still to read,
+/// each with the position its slot begins at and the level it must be, the nearest last; and the runs read so far,
+/// ascending. A unit reads one node, at most a window of the store's: a leaf's runs, or an inner node's children named.
+#[derive(Clone, Debug)]
+pub(crate) struct SetReading {
+  shape: Shape,
+  pending: Vec<(ContentId, u64, Option<u32>)>,
+  runs: Vec<(u64, u64)>,
+  /// The root's level, once its node is read: what the set's last block must sit under.
+  root_level: Option<u32>,
+}
+
+impl SetReading {
+  /// The reading of value `root`'s set `reached` (else its D(k)): none where the value is not one, or names no such
+  /// set (an empty set, read at once).
+  pub(crate) fn of(store: &ContentStore, root: &ContentId, reached: bool) -> Option<SetReading> {
+    let node = store.derived(root)?;
+    let (&VALUE, rest) = node.payload().split_first()? else {
+      return None;
+    };
+    let (&present, rest) = rest.split_first()?;
+    let (block, rest) = rest.split_first_chunk::<WORD_BYTES>()?;
+    let fanout = <[u8; WORD_BYTES]>::try_from(rest).ok()?;
+    let shape = Shape::recorded(u64::from_le_bytes(*block), u64::from_le_bytes(fanout))?;
+    if present & !(REACHED | BROUGHT) != 0 {
+      return None;
+    }
+    let mut names = node.names();
+    let reached_root = (present & REACHED != 0).then(|| names.next()).flatten();
+    let brought_root = (present & BROUGHT != 0).then(|| names.next()).flatten();
+    let wanted = if reached { reached_root } else { brought_root };
+    Some(SetReading {
+      shape,
+      pending: wanted.map(|id| (id, 0, None)).into_iter().collect(),
+      runs: Vec::new(),
+      root_level: None,
+    })
+  }
+
+  /// One node read: whether the set is read whole, and the runs the node gave. None for a node not of the set's shape.
+  pub(crate) fn step(&mut self, store: &ContentStore) -> Option<(bool, usize)> {
+    let Some((id, offset, level)) = self.pending.pop() else {
+      return Some((true, 0));
+    };
+    let node = store.derived(&id)?;
+    let (read_level, runs) = match node.payload().split_first()? {
+      (&LEAF, runs) => {
+        let runs = leaf_runs(runs, self.shape.block, node.names().next().is_none())?;
+        (0, runs)
+      }
+      (&INNER, rest) => {
+        let (&inner, bitmap) = rest.split_first()?;
+        let inner = u32::from(inner);
+        let below = inner.checked_sub(1)?;
+        let span = self.shape.span(below)?;
+        let slots = marked_slots(bitmap, self.shape)?;
+        let names: Vec<ContentId> = node.names().collect();
+        if slots.is_empty() || slots.len() != names.len() {
+          return None;
+        }
+        // The nearest child read next: pushed last.
+        for (slot, name) in slots.into_iter().zip(names).rev() {
+          self.pending.push((
+            name,
+            offset.checked_add(slot.checked_mul(span)?)?,
+            Some(below),
+          ));
+        }
+        (inner, Vec::new())
+      }
+      _ => return None,
+    };
+    if level.is_some_and(|level| level != read_level) {
+      return None;
+    }
+    if level.is_none() {
+      self.root_level = Some(read_level);
+    }
+    let given = runs.len();
+    append_shifted(&mut self.runs, runs, offset)?;
+    Some((self.pending.is_empty(), given))
+  }
+
+  /// The set read ([`SetReading::step`] answered whole), its runs as read; none where its root's level is not the one
+  /// its last block sits under, as [`read_tree`] refuses one.
+  pub(crate) fn finish(self) -> Option<Positions> {
+    let Some(root_level) = self.root_level else {
+      return Some(Positions::new());
+    };
+    let last = self
+      .runs
+      .last()?
+      .1
+      .checked_sub(1)?
+      .checked_div(self.shape.block)?;
+    (root_level == self.shape.level_of(last)).then(|| Positions::of_ascending_runs(self.runs))
+  }
+}
+
 /// A node's level and runs (each relative to the node's first position), read once a node.
 type Read = (u32, Vec<(u64, u64)>);
 

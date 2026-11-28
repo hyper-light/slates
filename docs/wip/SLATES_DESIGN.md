@@ -61679,8 +61679,17 @@ Applied in the same change to:
 - **Tests.** `slates-git` `store::tests::encoding`: every unit of a version's and a base pack's encoding takes one
   placed entry at most (`one_unit`, red 152 and 454), and their fragments are the one-pass encoding's byte for byte;
   `slates-git --lib -- store::` 141 passed, 4 ignored.
-- **Owed.** The encoding's start: `Encoding::fragments` reads the version's D(k) whole (`Repository::unencoded`), its
-  own piece. Main's run: git/git v2.0.0's push encoded under load, the watchdog's spinning lines and
+- **The encoding's start, sliced the same way (2026-11-28, main's ruling of 00:50).** `Encoding::fragments` read the
+  version's D(k) whole from its value (`Repository::unencoded`, `Sets::read`, both of the value's sets), and a base
+  pack's start its head's reached set (`head_reach`): O(the set's runs) in one call, and a version that brings objects
+  other pushes indexed has a D(k) of as many runs as those objects lie apart. The encoding now begins at `Stage::Read`:
+  the set it sends read from its value's tree a node a unit (`reach::SetReading`: a leaf's runs, or an inner node's
+  children named), the D(k) alone for a version, then the stage it began with. The set is kept as the runs read, with
+  no pass to settle its form, since it is the encoding's own for its turns (`Positions::of_ascending_runs`). Counted
+  `EncodingCounters::most_runs_a_unit`. Test: `an_encodings_start_reads_its_versions_d_k_a_node_a_unit` (a D(k) of 113
+  runs, 150 blobs scattered among another green's 600, against a leaf's 64: 113 runs in one unit before, at most a
+  leaf's now; the fragments the one-pass encoding's, byte for byte). `slates-git --lib -- store::` 142 passed.
+- **Owed.** Main's run: git/git v2.0.0's push encoded under load, the watchdog's spinning lines and
   `vcs_store.git_encode.units_past_budget` by stage (run-requests.md, 2026-11-28).
 
 ### A-859 — A git object received in a pack is sent on as its entry lies there: git's pack reuse (bug, 2026-11-22, w-git for UI goal 93; main 01a20182's ruling of 03:38 PST; part B; §4.17.2 items 4 and "A fetch", A-639, A-718, A-722)
