@@ -1972,6 +1972,31 @@ async fn bring_back_named(
 /// its windows let go once its segment was durable (A-887). Format: a counter name in the status report.
 pub(crate) const PUSHED_TEXTS_BROUGHT_BACK: &str = "vcs.hg.pushed_texts_brought_back";
 
+/// The shard's content arena and repository content store as a push's planning reads them ([`built_works`]): the
+/// arena's held frees, capacity, mapped, allocated bytes and allocations, then the content store's used bytes, objects
+/// and windows kept, for a log line.
+fn planning_reading(state: &ShardState) -> String {
+  // Inside a lend the shard's chunk store is the windows' (`vcs_store::lent_state`), the shard's a placeholder.
+  let arena = vcs_store::chunk_windows(&state.vcs_stores)
+    .map(vcs_store::arena_windows::ChunkWindows::lent_chunks)
+    .filter(|chunks| chunks.arena().capacity() > 0)
+    .unwrap_or(&state.store.content)
+    .arena();
+  let census = state
+    .vcs_stores
+    .content()
+    .map(slates_vcs::ContentStore::census);
+  format!(
+    "(arena held {} capacity {} mapped {} allocated {} allocations {}; content {:?})",
+    arena.deferred_bytes(),
+    arena.capacity(),
+    arena.mapped_bytes(),
+    arena.allocated_bytes(),
+    arena.allocations(),
+    census.map(|census| (census.used, census.objects, census.stored)),
+  )
+}
+
 /// The works `forked`'s push makes, built before its landing a unit a turn (A-767 C1, the push spin; main's ruling (1)
 /// of 2026-11-21 13:26): its moves planned as the landing will judge them ([`Works::Planning`], within a copy of
 /// `room`), each one's trees laid out in a turn of its own (`tree::begin_work`), then its builder advanced a turn at a
@@ -1990,16 +2015,30 @@ async fn built_works(
   let mut plan = Vec::new();
   let mut planning_room = *room;
   let planned = crate::state::with_state(|state| {
-    vcs_store::lent_state(state, |state| {
-      judged_over(
+    // What the planning holds and frees, read at its four points (main's 57k of 2026-11-27 19:57: one planning borrow
+    // freed 4,708,360,192 bytes into the frees held for the committed image, the arena's capacity and allocations
+    // unchanged across it): a line a push.
+    let before = planning_reading(state);
+    let (planned, (lent, judged)) = vcs_store::lent_state(state, |state| {
+      let lent = planning_reading(state);
+      let planned = judged_over(
         state,
         repository,
         (principal, name),
         unbundle,
         forked,
         (&mut Works::Planning(&mut plan), &mut planning_room),
-      )
-    })
+      );
+      (planned, (lent, planning_reading(state)))
+    });
+    slates_machine::log_line!(
+      "slates-server: partition {}: a push's planning ({} moves planned): before the lend {before}; lent {lent}; \
+       judged {judged}; handed back {}",
+      state.partition,
+      plan.len(),
+      planning_reading(state)
+    );
+    planned
   })
   .flatten()?;
   if let Err(outcome) = planned {

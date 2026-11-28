@@ -386,6 +386,12 @@ pub(crate) fn piece_block(bytes: &[u8]) -> Option<(ContentId, u16, u64, u64)> {
 type SlabPieces = Vec<(u64, ContentId, usize, PieceChunk)>;
 
 impl ChunkWindows {
+  /// The chunk store these windows hold while it is lent, a placeholder otherwise: what a reading of the shard's arena
+  /// inside a lend reads (`hg_push`'s planning log).
+  pub(crate) fn lent_chunks(&self) -> &ChunkStore {
+    &self.chunks
+  }
+
   /// Windows kept as chunks of a chunk store lent to them a step at a time; `page` the placeholder's page.
   pub(crate) fn new(page: usize) -> ChunkWindows {
     ChunkWindows {
