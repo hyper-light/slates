@@ -37251,6 +37251,69 @@ fn a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet() {
   assert_eq!(branch, Ok(()), "the new branch's push landed");
 }
 
+/// The landed-pack let-go bytes node `node` counted: a commit's and a rebuild's let-go of a landed pack and a read's
+/// let-go of a window it brought back (`vcs_store.landed.let_go_bytes`), and its homes' of a landed pack's windows
+/// (`vcs_store.homes.landed_let_go_bytes`).
+fn landed_let_go_bytes(fleet: &GitFleet, node: usize) -> u64 {
+  [
+    "vcs_store.landed.let_go_bytes",
+    "vcs_store.homes.landed_let_go_bytes",
+  ]
+  .iter()
+  .map(|name| refusal_count(&fleet.daemons[node], name).unwrap_or(0))
+  .sum()
+}
+
+/// (d) of the landed let-go's lift, its rule checked (main 01a20182's ruling of 2026-11-27 06:00; GAPS, (d)): a holder
+/// holds no changeset row for its owner's pushes, so nothing lets a holder's pack go, and its replica builds read what
+/// it holds. Do: on a three-node `f = 1` fleet with a git repository on a and the landed let-go on, nothing let go by
+/// hand, push `main`, then the new branches `first` and `second`, then a commit on top of each (each holder building
+/// its replica of each branch); wait for a's let-go. Expect: every push lands; a let go of landed packs (more than
+/// nothing, so the rule is not vacuous); b and c let go nothing. A change that lets a holder's pack go fails this, and
+/// (d) reopens with a real red.
+#[test]
+fn a_holder_lets_no_landed_pack_go_while_its_owner_does() {
+  let _serial = serialize_fleet_tests();
+  let fleet = git_fleet("holder-let-go");
+  let pushes = [
+    fleet.push(0, ("main.txt", b"main's first history\n")),
+    fleet.push_to(0, ("first.txt", b"a first branch's own history\n"), "first"),
+    fleet.push_to(
+      0,
+      ("second.txt", b"a second branch's own history\n"),
+      "second",
+    ),
+    fleet.push_on_top_of(
+      0,
+      ("first-2.txt", b"the first branch's second version\n"),
+      "first",
+    ),
+    fleet.push_on_top_of(
+      0,
+      ("second-2.txt", b"the second branch's second version\n"),
+      "second",
+    ),
+  ];
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let _ = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    Ok(landed_let_go_bytes(&fleet, 0) > 0)
+  });
+  let let_go: Vec<u64> = (0..3)
+    .map(|node| landed_let_go_bytes(&fleet, node))
+    .collect();
+  fleet.stop();
+  eprintln!("landed let-go bytes by node: {let_go:?}");
+  assert!(
+    pushes.iter().all(Result::is_ok),
+    "every push landed: {pushes:?}"
+  );
+  assert!(
+    let_go[0] > 0,
+    "the owner let its landed packs go: {let_go:?}"
+  );
+  assert_eq!(&let_go[1..], &[0, 0], "no holder let a landed pack go");
+}
+
 /// A-908 (the successor's half) and A-909 (an owner's own hold fenced per object). Do: on a three-node `f = 1` fleet
 /// with a git repository on a, push a history to `main`; kill a; once a survivor has taken the repository over, push a
 /// fresh history to a new branch through that successor's edge. Expect the branch's push to land: the successor

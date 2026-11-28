@@ -622,6 +622,56 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
+> **LIFTED (w-git, 2026-11-27, main 01a20182's order of 2026-11-26):** `vcs_store::LANDED_LET_GO` on again, once every
+> reader that meets a let-go window stops and has it brought back, each precondition landed alone, red first through
+> the store's own let-go, through main's 16: (a) the tag-of-a-tag peel (6eae9f8bb); (b) the shallow fetch (050ef43c2);
+> the read sweep's B1 (92f5189db) and B1b (3e98db372), B2 (8987e6f6a), B3 (a9c8aeaec), B4 (c6d97a069), B5 (aaa27b376),
+> B6 and B7 closed on the server path (65f664d87), B8 (fa73e2322), each reader keyed by the let-go's number
+> (`slates_git::away::WaitOnce`) with its waits in its owner's own slot (`Waits`); (d) found unreachable on holders
+> (62c389858), its loop bounded (a05f07e5f); and the two the flip's first focused run found, B9, a hook's view
+> (3b889f115), and B10, an unlanded push's windows pinned against another push's let-go of the same bytes. Kept: the
+> let-go waits while a fetch, an encoding or another intake of the repository is under way (`landed_let_go_may`; red
+> `read_through::tests::a_landed_pack_owed_its_let_go_stays_whole_while_a_push_of_it_is_under_way`). Checked with the
+> flip: C5's held bound (`2N + O × R + W`, its entry below) and (d)'s rule
+> (`fleet::a_holder_lets_no_landed_pack_go_while_its_owner_does`: a holder's landed let-go stays 0 while its owner's
+> moves). Each red the flip's first run produced was classed by main's rule of 2026-11-27 10:33: a test judging
+> resident bytes where the design promises whole by identity has its measure changed
+> (`t_a662_a_refused_ref_leaves_the_push_whole_for_the_next`: the refused push's objects read whole by id, the store
+> holding no more); the two made-again compares whose rebuild a let-go pack's fill needs await its task
+> (`assert_made_again_whole_awaited`); only a test whose own point needs a landed-and-held scene keeps its landed packs
+> resident (`test_store::keep_landed`, `keep_landed_here`: ten sites, one-step clones, fetches, builds, settled
+> rebuilds, counted turns and hand-sealed views), each naming at the site the test that covers the same path with its
+> windows let go. A git commit the server makes over let-go content, live with the flip (main's rulings of 10:37 and
+> 16:07): a made commit reads a file's bytes from its green's map only for a blob the repository lacks
+> (`commits::Lacked`), so the let-go it can meet is a lacked blob whose bytes another repository holds let go, over
+> several windows (a one-window put brings its window back, A-724 piece 4; a multi-window put under a held root keeps
+> it away, A-767 C1 2b). FIXED in the flip with w-svn's draft (one helper for every put of a file whose bytes are in
+> hand, `paths::put_object_bringing_back`: `ContentStore::aways_of`, `put_object_whole`, then
+> `let_go_again_after_build` at each window's own number, counted `vcs_paths.build_brought_back`, a refusal
+> `vcs_paths.build_kept` and logged; d4e851d61's remake folded into it), threaded through `put_file`, the made map
+> (`made_holding`), the live whole builds (`whole_build`'s slices, `finish`, `retire`) and the made commit's preview
+> change, whose let-go again waits until the commit has read its files (`commits::made_before_step`, after
+> `sealed_made`). Reds: `commits::tests::a_git_commit_made_of_bytes_another_repository_let_go_brings_them_back_and_
+> reads_whole` (B's make over A's let-go file: refused `NoTrees`, then `Unread` with the put alone fixed; made, read
+> back whole and its bring-backs counted after) and w-svn's `paths::tests::a_live_whole_build_over_a_file_whose_windows_
+> are_let_go_reads_it_whole_and_lets_them_go_again` (a copy's whole build over a head file every other window of
+> which a warm restart left let go: the submit refused `NoTrees` before; kept, the windows let go again at their
+> numbers, after). A warm restart keeps every window's published let-go number, a landed pack's included (main's ruling
+> of 17:22; A-923: the number is the Aways family's page coordinate): a recovery's replay reads a landed pack the image
+> holds let go back from the node's store, since its seal reads the pushed objects through the push's own copy
+> (`Repository::bytes_of`), so it brings the windows back; `put_changeset` notes their aways (`VcsStores::
+> replay_aways`) and the owed let-go lets each go again at its number first (`ContentStore::let_go_landed_again`, the
+> landed let-go's rule at the image's number; the home's record of where each lies came back with the image,
+> `homes::restore_landed`, so homes need nothing new), counted `vcs_store.replay_let_go_again`. A pin only delays it
+> (main's ruling of 17:55): an unlanded push of the same bytes, or a home holding the window without its record, leaves
+> it owed at its image number, still free (numbers are never reused), counted `vcs_store.replay_let_go_waited`, and the
+> repository's next owed let-go lets it go there, the sliced let-go leaving it alone meanwhile; any other refusal is a
+> bug signal, counted `vcs_store.replay_kept_again` (renumbered) and logged, held to 0 by t_c1. Red of the wait:
+> `vcs_store::tests::a_replays_owed_window_a_push_pins_waits_and_is_let_go_at_its_image_number`. Red:
+> `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes` with the let-go on (the
+> pack's window renumbered 0 to 2, the store not as published,
+> before; as published, the replay's let-go again counted, after) and
+> `content::tests::a_landed_shared_window_is_let_go_again_at_its_number_by_the_landed_rule`.
 > **LIFT WITHDRAWN (w-git, 2026-11-23, main 01a20182's order after r18):** `vcs_store::LANDED_LET_GO` false again, every
 > landed let-go held (a commit's, a recovery's and a rebuild's). The lift surfaced a reader on main four times: the fetch
 > stream's choice and object reads (fixed, 0c3f42cea, 7f7793c58), the SSH edge's held answer (fixed, 56fbf0381), the
@@ -2966,10 +3016,15 @@
 > `a_landing_crashed_at_each_piece_recovers_to_the_changeset_before_and_lands_again_whole` (a crash after every count of
 > pieces: the changeset before alone, then landed again to the reference's log). The C5 test prints the daemon's gauges
 > beside its resident figure at each settled point, and since d350346f5 the bytes it holds by them (`held_of`: the
-> live heap, the mapped blocks, each shard's stored windows, no overlap), judged in the landed let-go's flip by
-> `2N + O × R + W` (O the push's objects, R a row's held cost from the index's own layout; main's ruling B of
-> 2026-11-26), the resident bound until then. Owed: the names' rows still one buffer per landing (about 40 B an
-> object); and the Mac's footprint and Linux's RSS readings after b2b (main's). Unmeasured, owed (w-git) once a fleet
+> live heap, the mapped blocks, each shard's stored windows, no overlap), judged since the landed let-go's flip
+> by `2N + O × R + W` (main's ruling B of 2026-11-26 and of 2026-11-27 07:02): O the objects the pack's header counts,
+> at least those the push admitted, so the bound is safe rather than exact; R an object's rows held, 246 bytes for
+> SHA-1 and 270 for SHA-256 (`slates_server::git_held_bytes_per_object`): its object and position rows in the index by
+> the index's own layout, 205 and 229 (`slates_git::store::rows::held_bytes_per_object`, held to a real index, 20,000
+> objects' rows holding 171 bytes an object), and its names row, 41 (`record_names::NAME_BYTES`); W the warm-up's held
+> range; the settled readings alone, the peak staying on the resident bound. Owed: the names' rows still one buffer
+> per landing (41 bytes an object); and the Mac's footprint and Linux's RSS readings after b2b (main's). Unmeasured,
+> owed (w-git) once a fleet
 > RSS round measures it: `put_remote` ships the whole pack in one buffer to each remote home (f ≥ 1); another shard of
 > this node as the pack's home is handed its bytes too. Owed (w-git): a node whose store lacks a record's changeset
 > reading its names from their region homes, held by a test of its own (the rebuild test now reads the node's store).
@@ -6249,8 +6304,9 @@
 > `vcs_store.hg_brought_back_let_go`, equal to the texts asked
 > (`a_successors_rebuild_lets_go_the_texts_it_brought_back_once_it_lands`, `a_restarts_replay_lets_go_the_texts_it_brought_back`;
 > w-perf, w-hg's review note (c)). Not owed by the other tools (main's ruling of 13:22): a git rebuild keeps the pack it reads whole
-> (`put_changeset`), as a live commit keeps its landed pack while `LANDED_LET_GO` is held (whether a landed pack goes
-> at all is w-git's); a Subversion rebuild keeps none, its texts read through the node's store. (c) a Mercurial
+> (`put_changeset`), as a live commit kept its landed pack while `LANDED_LET_GO` was held (lifted 2026-11-27; whether a
+> landed pack goes at all is w-git's); a Subversion rebuild keeps none, its texts read through the node's store. (c) a
+> Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,

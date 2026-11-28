@@ -641,6 +641,10 @@ fn t_a664_p3_a_plain_greens_versions_keep_no_map() {
 #[test]
 fn t_a664_p3_a_store_made_again_holds_each_greens_map_again() {
   let counts = crate::test_store::run_on_stored_shard(|| async {
+    // Kind (3) (main's rule of 2026-11-27 10:33): its store is made again settled in one step, which cannot await the
+    // fill of a let-go pack, and its point is the greens' maps; made again over let-go windows:
+    // `vcs_store::tests::t_a664_a_store_made_again_compares_its_index_tables_merged_whole_on_both_sides`.
+    crate::test_store::keep_landed_here();
     let at = git_made("again").await;
     let mut model = Model::new();
     version_awaited(at.1, 1, vec![create("/f", b"one")]).await;
@@ -825,6 +829,10 @@ fn t_a664_p3_a_branchs_first_version_derives_from_its_sources_map() {
 #[test]
 fn t_a664_p3_a_destroyed_branch_takes_its_map_with_it() {
   crate::test_store::run_on_stored_shard(|| async {
+    // Kind (3) (main's rule of 2026-11-27 10:33): its store is made again settled in one step, which cannot await the
+    // fill of a let-go pack, and its point is the greens' maps; made again over let-go windows:
+    // `vcs_store::tests::t_a664_a_store_made_again_compares_its_index_tables_merged_whole_on_both_sides`.
+    crate::test_store::keep_landed_here();
     let (repository, root) = git_made("pruned").await;
     let head = version_awaited(root, 1, vec![create("/f", b"root")]).await;
     let topic = on_state(|state| branch(state, "pruned", "topic"));
@@ -887,6 +895,92 @@ fn t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it() {
     seen,
     (2, (Some(b"alpha".to_vec()), Some(b"alpha".to_vec())), 1)
   );
+}
+
+/// The live whole builds' let-go sibling of t_c1's fix (GAPS beside d4e851d61; main's order of 2026-11-27): a live
+/// build put each head file as a plain object (`ContentStore::put_object`), which keeps a window the store holds let
+/// go, so a build over a file whose window is let go hashed it short and was refused `Content(Missed)`. A warm restart
+/// leaves the head files so: its remake brings their windows back to read them whole and lets them go again at their
+/// numbers. Do: submit `/big` (four windows and some) and `/d/a` to a git green; let every other window of `/big` go,
+/// landed; then submit a work copying `/d` to `/e`, whose version's map is built whole (the copy names a tree at its
+/// destination alone). Expect: the second version's map kept and equal to `big`, `d/a` and `e/a`, no step refused, the
+/// build's bring-backs counted (`vcs_paths.build_brought_back`) as many as the windows let go, and the same windows let
+/// go at the same numbers after the build as before it.
+#[test]
+fn a_live_whole_build_over_a_file_whose_windows_are_let_go_reads_it_whole_and_lets_them_go_again() {
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let at = git_made("let-go-whole").await;
+    let big =
+      on_state(|state| big_file(state.vcs_stores.content().map_or(1, ContentStore::window)));
+    version_awaited(at.1, 1, vec![create("/big", big), create("/d/a", b"alpha")]).await;
+    let away = on_state(|state| every_other_window_let_go(state, big));
+    let copy = Op::Declare(WorkOp::Copy {
+      from: "/d".to_owned(),
+      to: "/e".to_owned(),
+      version: None,
+      replace: false,
+    });
+    let second = version_awaited(at.1, 2, vec![copy]).await;
+    on_state(|state| {
+      let mut model = Model::new();
+      set(&mut model, "big", FileClass::File, big);
+      set(&mut model, "d/a", FileClass::File, b"alpha");
+      set(&mut model, "e/a", FileClass::File, b"alpha");
+      assert_kept(state, at, second, &model);
+      (
+        count(state, REFUSED),
+        count(state, "vcs_paths.build_brought_back"),
+        away.len(),
+        aways(state, big) == away,
+      )
+    })
+  });
+  let (refused, brought, away, same) = seen;
+  assert_eq!(
+    (refused, same),
+    (0, true),
+    "no step refused, the windows let go as before"
+  );
+  assert!(away > 0, "some window let go");
+  assert_eq!(brought, u64::try_from(away).unwrap_or(u64::MAX));
+}
+
+/// A file of four windows of `window` bytes and seven more, each byte its offset's residue mod 251, so no two windows
+/// share an identity; kept for the test's life, as a work's edit takes static bytes.
+fn big_file(window: usize) -> &'static [u8] {
+  let len = window.saturating_mul(4).saturating_add(7);
+  Vec::leak(
+    (0..len)
+      .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
+      .collect(),
+  )
+}
+
+/// Lets every other window of `bytes`, the shard's content store holds, go, marked landed as a changeset carrying it
+/// would mark it: the windows let go, as [`aways`] lists them.
+fn every_other_window_let_go(state: &mut ShardState, bytes: &[u8]) -> Vec<slates_vcs::AwayAt> {
+  let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+  if let Some(content) = lent.stores.content_mut() {
+    let window = content.window();
+    for chunk in bytes.chunks(window).step_by(2) {
+      let id = ContentId::of(chunk);
+      if content.mark_landed(&id) {
+        let _ = content.let_go(&id);
+      }
+    }
+  }
+  drop(lent);
+  aways(state, bytes)
+}
+
+/// The windows of the content `bytes` name that the shard's content store holds let go, at their numbers
+/// (`ContentStore::aways_of`): the file's own, so a landed pack the flip lets go beside it is not counted.
+fn aways(state: &ShardState, bytes: &[u8]) -> Vec<slates_vcs::AwayAt> {
+  state
+    .vcs_stores
+    .content()
+    .map(|content| content.aways_of(&ContentId::of(bytes)))
+    .unwrap_or_default()
 }
 
 /// Main's ruling of 2026-11-20 (a copy through a work of a tree holding a hard link; found by use through MCP, refused

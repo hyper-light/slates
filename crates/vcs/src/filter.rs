@@ -70,6 +70,38 @@ impl KeyHash {
   }
 }
 
+/// Derived: the bits a key sets in a filter for a store of `budget` bytes ([`KeyFilter::sized`]): `k = ⌈log₂(2R)⌉`,
+/// `R` the runs a lookup may walk, [`OWN_AND_SHARED`] times ⌊log₃ budget⌋ + 1. None past the machine's words.
+fn probes_for(budget: u64) -> Option<u32> {
+  let own = budget
+    .checked_ilog(TIER_BASE)
+    .unwrap_or(0)
+    .saturating_add(1);
+  u64::from(own)
+    .saturating_mul(OWN_AND_SHARED)
+    .saturating_mul(FALSE_RESOLVES_PER_MISS_INVERSE)
+    .checked_next_power_of_two()
+    .map(u64::trailing_zeros)
+}
+
+/// Derived: the bits a filter of `rows` keys, `probes` a key, takes before its words' rounding: `rows · k · log₂ e`,
+/// rounded up.
+fn bits_for(rows: u64, probes: u32) -> u64 {
+  rows
+    .saturating_mul(u64::from(probes))
+    .saturating_mul(LOG2_E_THOUSANDTHS)
+    .div_ceil(THOUSANDTHS)
+}
+
+/// Derived: the most bytes a key takes in any filter, whatever the store's budget ([`KeyFilter::sized`] at the largest
+/// budget a `u64` holds: 82 runs walked, `k` = 8, 11.6 bits, two bytes): what a row's held cost counts for its key
+/// (`crate::index::held_bytes_per_row`). A filter's rounding to whole words is a word a run, not a key's.
+pub(crate) fn bytes_per_key_most() -> u64 {
+  probes_for(u64::MAX).map_or(0, |probes| {
+    bits_for(1, probes).div_ceil(u64::from(u8::BITS))
+  })
+}
+
 /// A run's key filter (module docs): its words and how many bits a key sets.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct KeyFilter {
@@ -86,22 +118,10 @@ impl KeyFilter {
   /// For the 64 GiB budget of the intake harness: `R` = 46, `k` = 7, 10.1 bits a key. A size past the machine's
   /// words is no filter: it says yes to every key.
   pub(crate) fn sized(rows: u64, budget: u64) -> KeyFilter {
-    let own = budget
-      .checked_ilog(TIER_BASE)
-      .unwrap_or(0)
-      .saturating_add(1);
-    let walked = u64::from(own).saturating_mul(OWN_AND_SHARED);
-    let Some(probes) = walked
-      .saturating_mul(FALSE_RESOLVES_PER_MISS_INVERSE)
-      .checked_next_power_of_two()
-      .map(u64::trailing_zeros)
-    else {
+    let Some(probes) = probes_for(budget) else {
       return KeyFilter::default();
     };
-    let bits = rows
-      .saturating_mul(u64::from(probes))
-      .saturating_mul(LOG2_E_THOUSANDTHS)
-      .div_ceil(THOUSANDTHS);
+    let bits = bits_for(rows, probes);
     let Ok(words) = usize::try_from(bits.div_ceil(WORD_BITS).max(1)) else {
       return KeyFilter::default();
     };

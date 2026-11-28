@@ -343,6 +343,13 @@ pub(crate) struct VcsStores {
   /// its encoding was under way, let go once it goes idle ([`let_go_owed`]); bounded by the repository's landed pushes
   /// since then.
   landed_owed: BTreeMap<RepositoryId, Vec<slates_vcs::ContentId>>,
+  /// The windows of those packs a recovery's or a rebuild's replay found let go before it read the pack back from the
+  /// node's store ([`put_changeset`]), at their let-go numbers: let go again at the same numbers when the owed let-go
+  /// runs ([`let_go_owed`]), so a warm restart's image keeps its aways as it published them (main 01a20182's rulings of
+  /// 2026-11-27 11:09 and 17:22; t_c1). Bounded: one entry a window of each pack a replay of the repository read back
+  /// whole from the node's store, at most the windows of the packs `landed_owed` names for it; taken whole by the owed
+  /// let-go, and forgotten with the repository ([`free`]).
+  replay_aways: BTreeMap<RepositoryId, Vec<slates_vcs::AwayAt>>,
   /// Landed packs being let go a slice of windows a turn ([`LettingGo`]), and whether the task that turns them runs:
   /// bounded by the packs owed a let-go.
   letting_go: (std::collections::VecDeque<LettingGo>, bool),
@@ -1118,7 +1125,7 @@ impl VcsStores {
 }
 
 /// The git format a repository's record names: SHA-1 or SHA-256; none for the revisions Subversion numbers.
-fn git_format(format: DbFormat) -> Option<ObjectFormat> {
+pub(crate) fn git_format(format: DbFormat) -> Option<ObjectFormat> {
   match format {
     DbFormat::Sha1 => Some(ObjectFormat::Sha1),
     DbFormat::Sha256 => Some(ObjectFormat::Sha256),
@@ -1257,6 +1264,7 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   }
   state.vcs_stores.unrecovered.remove(&id);
   state.vcs_stores.replica_begun.remove(&id);
+  state.vcs_stores.replay_aways.remove(&id);
   state.vcs_usage.forget(&id);
   keep_held_svn(&mut state.vcs_stores, id);
   if !release_charged(state, id) {
@@ -2843,11 +2851,86 @@ pub(crate) fn let_go_owed_as_push_ends(state: &mut ShardState, id: RepositoryId)
 /// [`let_go_owed`]'s let-go, its conditions met: each pack queued to be let go a slice a turn ([`let_go_sliced`]), never
 /// walked whole within the step that owes it (a push's drop, a repository's idle give-back).
 fn let_go_owed_now(state: &mut ShardState, id: RepositoryId) {
+  // The windows a replay found let go, at their numbers, first: let go again at the same numbers as the image
+  // published them ([`VcsStores::replay_aways`]); the owed packs' let-go then lets go what is still held.
+  let aways = state
+    .vcs_stores
+    .replay_aways
+    .remove(&id)
+    .unwrap_or_default();
+  let mut waiting = Vec::new();
+  for at in aways {
+    // A landed pack's window, let go whatever its holders by the landed let-go's own rule (`landed_pin`: a home
+    // holding it here without its record pins it); the home's record of where it lies came back with the image
+    // (`homes::restore_landed`), so the home needs nothing more.
+    let pin = landed_pin(&at.identity);
+    let again = within_budget(state, 0, |stores| match stores.content_mut() {
+      Some(content) => content.let_go_landed_again(at, pin),
+      None => Err(slates_vcs::LetGoRefused::NotHeld),
+    });
+    match again {
+      Ok(freed) => {
+        state.count(REPLAY_LET_GO_AGAIN, 1);
+        state.count(LANDED_LET_GO_BYTES, freed);
+      }
+      // Away already (the replay read it where it lay) is as it was published.
+      Err(slates_vcs::LetGoRefused::Away) => {}
+      // A pin delays it, never renumbers it (main 01a20182's ruling of 2026-11-27 17:55): an unlanded push of the same
+      // bytes (`ContentStore::pin_unlanded`), or a home holding the window here without its record, holds it now; it
+      // stays owed at its image number, which is still free (numbers are never reused, and the store's next starts
+      // past the image's), and the repository's next owed let-go lets it go there. The sliced let-go leaves it alone
+      // meanwhile ([`owed_at_its_number`]).
+      Err(slates_vcs::LetGoRefused::Unlanded | slates_vcs::LetGoRefused::Pinned { .. }) => {
+        state.count(REPLAY_LET_GO_WAITED, 1);
+        waiting.push(at);
+      }
+      // Any other refusal is a bug signal, not a case: numbers are never reused and restore keeps the image's, so the
+      // window is left to its pack's owed let-go, which renumbers it, and that is counted and logged for the oracle to
+      // fail on (t_c1 holds `REPLAY_KEPT_AGAIN` to 0; main 01a20182's ruling of 2026-11-27 17:54, CLAUDE.md §2 item 7).
+      Err(refused) => {
+        state.count(REPLAY_KEPT_AGAIN, 1);
+        slates_machine::log_line!(
+          "slates-server: partition {}: a window a replay brought back was not let go again at its number \
+           ({refused:?}): let go by its pack's owed let-go instead",
+          state.partition
+        );
+      }
+    }
+  }
+  if !waiting.is_empty() {
+    state.vcs_stores.replay_aways.insert(id, waiting);
+  }
   let owed = state.vcs_stores.landed_owed.remove(&id).unwrap_or_default();
   for pack in owed {
     let_go_sliced(state, pack);
   }
 }
+
+/// Whether `window` waits to be let go at the number a warm restart's image had it at ([`VcsStores::replay_aways`]):
+/// the sliced let-go leaves it alone, which would give it a new one.
+fn owed_at_its_number(state: &ShardState, window: &slates_vcs::ContentId) -> bool {
+  state
+    .vcs_stores
+    .replay_aways
+    .values()
+    .any(|aways| aways.iter().any(|at| at.identity == *window))
+}
+
+/// Counter: a window a replay brought back whose let-go again at its image number waited for a pin to go (an unlanded
+/// push of the same bytes, or a home holding it here without its record): a legitimate event, the window let go at the
+/// same number by the repository's next owed let-go ([`let_go_owed_now`]). Format: a counter name in the daemon's
+/// status report.
+pub(crate) const REPLAY_LET_GO_WAITED: &str = "vcs_store.replay_let_go_waited";
+
+/// Counter: a window a replay brought back let go again at the let-go number the image had it at ([`let_go_owed_now`],
+/// `ContentStore::let_go_landed_again`): the rule's non-vacuity count (t_c1). Format: a counter name in the daemon's
+/// status report.
+pub(crate) const REPLAY_LET_GO_AGAIN: &str = "vcs_store.replay_let_go_again";
+
+/// Counter: a window a replay brought back that was not let go again at its let-go number ([`let_go_owed_now`]),
+/// left to its pack's owed let-go, which gives it a new one: zero in every correct use, each logged. Format: a counter
+/// name in the daemon's status report.
+pub(crate) const REPLAY_KEPT_AGAIN: &str = "vcs_store.replay_kept_again";
 
 /// A landed pack's let-go under way on this shard (goal 93 item 2b; main 01a20182's order of 2026-11-23: one walk over
 /// a 600 MB pack inside a push's step is a bounded-work breach): its windows listed on its first slice, then let go a
@@ -3046,6 +3129,10 @@ fn let_go_window(
   letting: &LettingGo,
   (window, offset, len): (slates_vcs::ContentId, u64, u64),
 ) {
+  // A window owed at its image number is the owed let-go's to let go there ([`owed_at_its_number`]).
+  if owed_at_its_number(state, &window) {
+    return;
+  }
   if letting.home {
     let at = homes::LandedAt {
       pack: letting.pack,
@@ -4079,12 +4166,17 @@ async fn filled(mut pack: ReplayPack) -> (ReplayPack, Result<(), ReplayRefused>)
   (pack, fill.map_err(|_| ReplayRefused::Unlanded))
 }
 
-/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): held again (main 01a20182's order of
-/// 2026-11-23 after r18: with it on, a push of a tag of a let-go tag was declined by its peel's read, a shallow fetch
-/// over HTTP refused `Pack(Store(Unreadable))`, and git/git's HTTP mirror clone stalled; GAPS). One switch for every
-/// path that lets a landed pack go: a commit's ([`commit`]) and a recovery's or a rebuild's of the pack it read whole
-/// ([`put_changeset`]).
-pub(crate) const LANDED_LET_GO: bool = false;
+/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): lifted (main 01a20182's order of
+/// 2026-11-26, w-git). Held from 2026-11-23 after r18, when with it on a push of a tag of a let-go tag was declined by
+/// its peel's read, a shallow fetch over HTTP refused `Pack(Store(Unreadable))`, and git/git's HTTP mirror clone
+/// stalled; lifted once every reader that meets a let-go window stops and has it brought back, each precondition
+/// landed alone, red first through the store's own let-go (GAPS, the landed let-go's lift): (a) the tag-of-a-tag peel,
+/// (b) the shallow fetch, B1 to B8 of the read sweep (each reader keyed by the let-go's number,
+/// `slates_git::away::WaitOnce`, its waits in its owner's own slot), and (d) found unreachable on holders. The let-go
+/// still waits while a fetch, an encoding or another intake of the repository is under way ([`landed_let_go_may`]).
+/// One switch for every path that lets a landed pack go: a commit's ([`commit`]) and a recovery's or a rebuild's of the
+/// pack it read whole ([`put_changeset`]).
+pub(crate) const LANDED_LET_GO: bool = true;
 
 /// Puts what [`read_changeset`] read into the shard's content store, each checked against the record's identity and
 /// held by its put as one fetched from the region is, and notes the changeset's sequence as landed, so the next push
@@ -4121,6 +4213,17 @@ fn put_changeset(
   #[cfg(test)]
   let pack_read = pack_read && !KEEP_LANDED.with(core::cell::Cell::get);
   if pack_read && LANDED_LET_GO {
+    let aways = state
+      .vcs_stores
+      .content()
+      .map(|content| content.aways_of(&wanted.packed.0))
+      .unwrap_or_default();
+    state
+      .vcs_stores
+      .replay_aways
+      .entry(id)
+      .or_default()
+      .extend(aways);
     state
       .vcs_stores
       .landed_owed

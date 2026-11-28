@@ -1626,6 +1626,44 @@ impl ContentStore {
     identity: &ContentId,
     pinned_by: Option<&'static str>,
   ) -> Result<u64, LetGoRefused> {
+    let (identity, window, len) = self.landed_lettable(identity, pinned_by)?;
+    Ok(self.released_away(identity, window, len))
+  }
+
+  /// Lets go again the landed window `at` names at its own let-go number, by [`ContentStore::let_go_landed`]'s rule
+  /// (whatever its holders, never one an unlanded object names or `pinned_by` names a pinning holder of): a warm
+  /// restart's replay read a landed pack whose windows the image held let go, so it lets each go again where the image
+  /// had it (A-923: the number is the Aways family's page coordinate; main 01a20182's ruling of 2026-11-27 17:22). The
+  /// bytes freed.
+  ///
+  /// # Errors
+  /// As [`ContentStore::let_go_landed`]; `Away` where another window holds the number now.
+  pub fn let_go_landed_again(
+    &mut self,
+    at: AwayAt,
+    pinned_by: Option<&'static str>,
+  ) -> Result<u64, LetGoRefused> {
+    if self.aways_by_number.contains_key(&at.number) {
+      return Err(LetGoRefused::Away);
+    }
+    let (identity, window, len) = self.landed_lettable(&at.identity, pinned_by)?;
+    Ok(self.released_away_at(
+      AwayAt {
+        number: at.number,
+        identity,
+      },
+      window,
+      len,
+    ))
+  }
+
+  /// The landed window `identity` names, where [`ContentStore::let_go_landed`]'s rule lets it go: its identity, where
+  /// it is kept and its length; the refusal otherwise.
+  fn landed_lettable(
+    &mut self,
+    identity: &ContentId,
+    pinned_by: Option<&'static str>,
+  ) -> Result<(ContentId, StoredWindow, usize), LetGoRefused> {
     let identity = self.resolve(identity);
     let held = self
       .entries
@@ -1650,7 +1688,7 @@ impl ContentStore {
     if let Some(by) = pinned_by {
       return Err(LetGoRefused::Pinned { by });
     }
-    Ok(self.released_away(identity, window, len))
+    Ok((identity, window, len))
   }
 
   /// Every window of the object `identity` names marked landed and let go ([`ContentStore::let_go_landed`]), each but
@@ -3735,6 +3773,49 @@ mod tests {
     assert!(
       second.is_some() && second != first,
       "{first:?} then {second:?}"
+    );
+  }
+
+  /// The landed let-go's flip, t_c1 (main 01a20182's ruling of 2026-11-27 17:22: every window keeps its published
+  /// let-go number across a warm restart, a landed pack's included; A-923, the number the Aways family's page
+  /// coordinate). Do: put a window and hold it twice (a pack's window another holder names too), mark it landed, let it
+  /// go as a landed pack's is (`let_go_landed`), note its number, bring it back; let it go again by the plain rule
+  /// (`let_go_again`), then by the landed rule (`let_go_landed_again`); then bring it back, take its number with
+  /// another window, and let it go again by the landed rule. Expect: the plain rule refused `Shared`; the landed rule
+  /// let it go at its first number; and refused `Away` where another window holds that number now.
+  #[test]
+  fn a_landed_shared_window_is_let_go_again_at_its_number_by_the_landed_rule() {
+    let mut store = ContentStore::new(1 << 20, 4096).unwrap();
+    let bytes = vec![9u8; 1000];
+    let id = store.put(&bytes).unwrap();
+    store.hold(&id).unwrap();
+    assert!(store.mark_landed(&id));
+    store.let_go_landed(&id, None).unwrap();
+    let at = *store.aways_of(&id).first().expect("let go at a number");
+    store.bring_back(&id, &bytes).unwrap();
+    assert_eq!(
+      store.let_go_again(at),
+      Err(LetGoRefused::Shared),
+      "the plain rule"
+    );
+    assert!(
+      store.let_go_landed_again(at, None).is_ok(),
+      "the landed rule"
+    );
+    assert_eq!(store.aways_of(&id), vec![at], "at its first number");
+    store.bring_back(&id, &bytes).unwrap();
+    let other = store.put(&[5u8; 700]).unwrap();
+    assert!(store.mark_landed(&other));
+    store
+      .let_go_again(AwayAt {
+        number: at.number,
+        identity: other,
+      })
+      .unwrap();
+    assert_eq!(
+      store.let_go_landed_again(at, None),
+      Err(LetGoRefused::Away),
+      "its number taken"
     );
   }
 

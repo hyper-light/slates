@@ -4241,6 +4241,10 @@ fn a_clone_of_git_gits_many_refs_is_answered_whole_over_the_daemons_edge() {
   let (daemon, _) = daemon_configured(Some(identity), |config| {
     config.region.bulk_bytes /= REGION_SHARE;
   });
+  // Kind (3) (main's rule of 2026-11-27 10:33): its room is measured by synchronous observations of the daemon, which
+  // cannot await a bring-back, and its point is the answer's room; the edge's fetch over let-go windows:
+  // `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+  crate::test_store::keep_landed_on(&daemon, REPOSITORY);
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = name_on_the_repositorys_partition();
   create(&daemon, &name);

@@ -257,6 +257,90 @@ fn t_a664_p3_a_submitted_version_is_a_commit_a_clone_fetches() {
   assert_eq!(made, (1, 0));
 }
 
+/// Lets go every window of the content `bytes` name in this shard's content store, as a landed let-go lets a window go
+/// whatever its holders (each marked landed, then `vcs_store::let_go_read`): what a warm restart's image or a landed
+/// pack's let-go leaves of a file another repository holds. The windows let go.
+fn let_go_content_here(state: &mut ShardState, bytes: &[u8]) -> usize {
+  let identity = slates_vcs::ContentId::of(bytes);
+  let windows: Vec<slates_vcs::ContentId> = state
+    .vcs_stores
+    .content()
+    .map(|content| {
+      content
+        .object_layout(&identity)
+        .into_iter()
+        .map(|(window, _)| window)
+        .collect()
+    })
+    .unwrap_or_default();
+  crate::vcs_store::within_budget(state, 0, |stores| {
+    if let Some(content) = stores.content_mut() {
+      for window in &windows {
+        content.mark_landed(window);
+      }
+    }
+  });
+  for window in &windows {
+    let _ = crate::vcs_store::let_go_read(state, window);
+  }
+  let content = state.vcs_stores.content();
+  windows
+    .iter()
+    .filter(|window| content.is_some_and(|content| content.is_away(window)))
+    .count()
+}
+
+/// The bytes of [`a_git_commit_made_of_bytes_another_repository_let_go_brings_them_back_and_reads_whole`]'s file: three
+/// windows of the shard's content store and a part, so its put under a root another repository holds keeps the let-go
+/// windows away (A-767 C1 step 2b), where a one-window put would bring its window back.
+fn multi_window_file(state: &ShardState) -> &'static [u8] {
+  let window = state
+    .vcs_stores
+    .content()
+    .map_or(1 << 16, slates_vcs::ContentStore::window);
+  let bytes: Vec<u8> = (0..window * 3 + 7)
+    .map(|at| u8::try_from((at * 31 + at / 251) % 251).unwrap())
+    .collect();
+  Box::leak(bytes.into_boxed_slice())
+}
+
+/// Goal 93 item 2b's flip (main 01a20182's rulings of 2026-11-27 10:37 and 16:07: a git commit the server makes over
+/// content let go, live once the landed let-go is lifted; Mercurial's is
+/// `hg_made::tests::a_changeset_made_over_a_parent_let_go_reads_its_texts_from_the_store`). A made commit reads a
+/// file's bytes from its green's map only for a blob the repository lacks (`Lacked::blob`), so the one let-go it can
+/// meet is a lacked blob whose bytes another repository holds let go. Do: make repository A's first version holding
+/// `/x`, a file of several windows; let go every window of `/x`'s content; make repository B's first version creating
+/// the same `/x`; then bring back what is let go, as a read's driver does, and clone B's `main`. Expect: A's windows
+/// let go before B's make; the content store's bring-backs moved across B's make (it met the let-go content); B made at
+/// version 1; its clone's `x` whole. Red before: B's make refused `Unmade::Unread`, its file's windows let go.
+#[test]
+fn a_git_commit_made_of_bytes_another_repository_let_go_brings_them_back_and_reads_whole() {
+  let (away, made, version, clone) = crate::test_store::run_on_stored_shard(|| async {
+    let (_, a) = git_made("let-go-holder").await;
+    let bytes = on_state(|state| multi_window_file(state));
+    version_awaited(a, 1, vec![create("/x", bytes)]).await;
+    let brought = |state: &ShardState| {
+      state
+        .vcs_stores
+        .content()
+        .map_or(0, |content| content.counters().brought_back)
+    };
+    let (away, before) = on_state(|state| (let_go_content_here(state, bytes), brought(state)));
+    let (repository, b) = git_made("made-of-let-go").await;
+    let version = version_awaited(b, 1, vec![create("/x", bytes)]).await;
+    let made = on_state(|state| brought(state)) - before;
+    crate::vcs_store::tests::brought_back_settled(repository, &[]).await;
+    let clone = on_state(|state| cloned(state, repository, "main"));
+    (away, made, version, (clone, bytes))
+  });
+  let (clone, bytes) = clone;
+  assert!(away > 0, "A's file let go");
+  assert!(made > 0, "B's make brought back the let-go content it read");
+  assert_eq!(version, 1, "B made");
+  let expected = listing(&[("x", Mode::File, bytes)]);
+  assert_eq!(clone.files, expected, "B's file read back whole");
+}
+
 /// The trees the store keeps for the head of the green keyed `key`: its root tree's id.
 fn kept_tree(state: &ShardState, repository: RepositoryId, key: u64) -> Option<ObjectId> {
   let (content, git) = state.vcs_stores.git_ref(repository)?;
@@ -313,6 +397,10 @@ type RecordFacts = (Vec<(u64, u64, Option<ObjectId>)>, Vec<Kind>);
 #[test]
 fn t_a664_p3_made_commits_name_the_one_before_and_are_made_again_from_the_log() {
   crate::test_store::run_on_stored_shard(|| async {
+    // Kind (3) (main's rule of 2026-11-27 10:33): its clones are answered in one synchronous step, which cannot await a
+    // bring-back, and its point is the made commits, not the read; the clone over let-go windows:
+    // `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+    crate::test_store::keep_landed_here();
     let (repository, green) = git_made("history").await;
     let root = to_db_volume(green);
     let key = green_key(root);
@@ -364,6 +452,10 @@ fn t_a664_p3_made_commits_name_the_one_before_and_are_made_again_from_the_log() 
 #[test]
 fn t_a664_p3_a_branchs_first_made_commit_names_the_commit_it_was_made_at() {
   let (main, topic) = crate::test_store::run_on_stored_shard(|| async {
+    // Kind (3) (main's rule of 2026-11-27 10:33): its clones are answered in one synchronous step, which cannot await a
+    // bring-back, and its point is the made commits, not the read; the clone over let-go windows:
+    // `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+    crate::test_store::keep_landed_here();
     let (repository, green) = git_made("branched").await;
     version_awaited(green, 1, vec![create("/f", b"main")]).await;
     let topic = on_state(|state| branch(state, "branched", "topic"));
@@ -463,6 +555,10 @@ fn moved(from: &str, to: &str) -> Op {
 #[test]
 fn t_a664_p3_an_executable_file_moved_is_100755_in_its_commit() {
   let (first, second) = crate::test_store::run_on_stored_shard(|| async {
+    // Kind (3) (main's rule of 2026-11-27 10:33): its clone is answered in one synchronous step, which cannot await a
+    // bring-back, and its point is the made commit, not the read; the clone over let-go windows:
+    // `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+    crate::test_store::keep_landed_here();
     let (repository, green) = git_made("moved").await;
     let ops = vec![
       mkdir("/d"),
