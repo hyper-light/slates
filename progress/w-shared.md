@@ -818,3 +818,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Main x16 at 69fbc8de0: stall red 16/16, a914 15/16 (run 2, region reads on a dead unsuspected home, 1 s each).
 - (a) written: rebuild_steps + Under::replayed in slices_done. Its red is not deterministic (b held most names locally; one read delayed); asked main for (i) or (ii).
 - Hook added: Daemon::delay_region_reads. Kept-v1 Behind: single digits per run (3, 9).
+
+## 2026-11-27 20:45 PST: A-936 replay half + Windows diag logs landed (slates def53472a, 3b0015fa6)
+- ce318a92b: a build waiting on its store's replay reports the replay's steps (units as ruled).
+- 9c2a54f75: a log for live entries admitted under a walk-lagged copy (item 1, superseded owner's FsDone); Daemon::route_view (item 2: the stale-creator skip reads retired/completed, both false after readmission, even on the Mac); a934's held watch bounded at 150 periods (item 3 was the test).
+- Waiting: main's focused Windows diag; rulings on item 2's product gap and on item 1's fix (install_on_copy before admission). Then (b), the hedged region read.
