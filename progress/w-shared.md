@@ -839,3 +839,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - 219522a33: a921 warm-restart watch bounded and asserting never-a (my bd92839b7 made the old watch never converge); RouteView shows superseded.
 - 793df8069: the Behind reship bound stated (once a pass, ends at the ack); not once per install (would stall A-935).
 - Next: diag 12 item 5 (live-ship BudgetExceeded, arm64) unless main has higher.
+
+## 2026-11-27 22:43 PST: diag 12 item 5 landed (slates 327bf5d2f)
+- The live-ship admission test waits until a's placement names the filled candidate (a test premise; Windows arm64 set in 2 ms, inferred).
+- Sent main the 93-shared statuses: family three landed c5051eb51 (Linux run owed); lane/frames/A-B closed (35c740150, 3bc841699); inputs at B closed (A-826); A-658 3c open (maybe unblocked by A-767 C5).
+- Free; waiting for main's order.
