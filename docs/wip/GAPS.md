@@ -1062,6 +1062,13 @@
 > deterministic in `crates/rt/tests/spin_kick.rs` (3 of 3 hung, shard parked), green 3 of 3
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
+> **FIXED 2026-11-27 (w-svn; main's git-2000 release rounds, 4 imports of 5 refused at r593): a stepped directory
+> removal judged again over a half-made count.** A step that decided one directory and was spent counting the next
+> one's children left the phase's place before the first, so the next decided it again and refused the revision
+> `DeleteModify` (`Green::decide_rmdirs_some`, A-920's ee0c95e8f). Each decided directory now keeps its place. Bug
+> record `docs/bugs/2026-11-27-an-imports-directory-removals-were-judged-again-over-a-half-made-count.md`; a refused
+> staging now logs what the member holds and the work does there (`ImportBatch::refusal_logged`).
+
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history

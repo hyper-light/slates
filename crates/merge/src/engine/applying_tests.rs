@@ -401,3 +401,107 @@ fn an_entry_measured_a_unit_a_step_is_the_entry_measured_whole() {
   }
   assert!(spliced.get() > 0, "no verdict recorded a splice");
 }
+
+/// The import's r593 refusal (main's git-2000 release rounds of 2026-11-27, 4 imports of 5 refused `ContentUnavailable`:
+/// "an imported revision's version was not staged: NotAccepted(Conflict { .. DeleteModify .. })" on the directories
+/// r593 removes with every file under them, each window repeated hundreds of times). A step that decided one directory
+/// and was spent counting the next one's children left the phase's place before the first, so the next step decided
+/// the first again over the second's half-made count (A-920's [`super::deciding`] walk, ee0c95e8f): a unit pushed
+/// twice, and a removal the work makes whole judged `DeleteModify`. Changes of one revision are sequential and compose,
+/// never conflict (D-27's verdicts are for concurrent work). Do: make `trunk/contrib/emacs` and
+/// `trunk/contrib/persistent-https` with three files each and other files beside them; judge a work at the head removing
+/// every file under both directories, both directories and the other files, once whole ([`Green::judge`]), and once
+/// with its steps spent every `n`th check of the clock for `n` from 1 to [`R593_EVERY`]. Expect each judgment accepted.
+#[test]
+fn a_revision_removing_a_directorys_files_then_the_directory_is_accepted_however_it_is_judged() {
+  let removal = r593_removal();
+  let mut whole = r593_green();
+  let judged_whole = whole.judge(&removal);
+  assert!(
+    matches!(judged_whole, Judgment::Accepted(_)),
+    "judged whole: {judged_whole:?}"
+  );
+  for every in 1..=R593_EVERY {
+    let mut sliced = r593_green();
+    let judged = judged_spent_every(&mut sliced, &mut removal.clone(), every);
+    assert!(
+      matches!(judged, Judgment::Accepted(_)),
+      "judged with a step spent every {every} checks: {judged:?}"
+    );
+  }
+}
+
+/// A green holding r593's directories, their files and the other files beside them, at version 1.
+fn r593_green() -> Green {
+  let mut green = Green::new();
+  let mut work = Work::default()
+    .op(super::OpKind::Mkdir, "trunk", (0, 0, u64::MAX))
+    .op(super::OpKind::Mkdir, "trunk/contrib", (0, 0, u64::MAX));
+  for dir in R593_DIRS {
+    work = work.op(super::OpKind::Mkdir, dir, (0, 0, u64::MAX));
+    for file in R593_FILES {
+      work = work.create(&format!("{dir}/{file}"), file.as_bytes());
+    }
+  }
+  for other in 0..R593_OTHERS {
+    work = work.create(&format!("trunk/other-{other:02}"), b"other");
+  }
+  let (outcome, _) = green.submit_resolved(&work.at(0, 1));
+  assert_eq!(outcome, Outcome::Accepted { version: 1 });
+  green
+}
+
+/// r593's work at version 1: every other file, and each directory's files then the directory, removed.
+fn r593_removal() -> super::Increment {
+  let mut removal = Work::default();
+  for other in 0..R593_OTHERS {
+    removal = removal.op(
+      super::OpKind::Unlink,
+      &format!("trunk/other-{other:02}"),
+      (0, 0, u64::MAX),
+    );
+  }
+  for dir in R593_DIRS {
+    for file in R593_FILES {
+      removal = removal.op(
+        super::OpKind::Unlink,
+        &format!("{dir}/{file}"),
+        (0, 0, u64::MAX),
+      );
+    }
+    removal = removal.op(super::OpKind::Rmdir, dir, (0, 0, u64::MAX));
+  }
+  removal.at(1, 2)
+}
+
+/// `inc` judged on `green` with each step spent at every `every`th check of its clock ([`Green::judging_step`]), so a
+/// step ends at every place a unit or a count can end one.
+fn judged_spent_every(green: &mut Green, inc: &mut super::Increment, every: u64) -> Judgment {
+  let mut judging = green.begin_judging(inc);
+  let mut checks = 0u64;
+  for _ in 0..R593_STEP_BOUND {
+    let mut spent = || {
+      checks += 1;
+      checks % every == 0
+    };
+    if let Some(judgment) = green.judging_step(inc, &mut judging, &mut spent) {
+      return judgment;
+    }
+  }
+  panic!("a judge spent every {every} checks took more than {R593_STEP_BOUND} steps");
+}
+
+/// Shape: the steps a judge of r593's work may take before the test calls it endless: the work's 62 operations, each
+/// with its few units and its directory's children, at one check a step, are well under it.
+const R593_STEP_BOUND: u64 = 100_000;
+
+/// Shape: the most checks between two spent steps the r593 test tries, past a directory's files and its neighbour's, so
+/// some step decides one directory whole and is spent counting the next one's children.
+const R593_EVERY: u64 = 12;
+
+/// Shape: r593's two directories removed with their files (git/git's `contrib/emacs` and `contrib/persistent-https`).
+const R593_DIRS: [&str; 2] = ["trunk/contrib/emacs", "trunk/contrib/persistent-https"];
+/// Shape: the files under each (`contrib/emacs` held three: README, git-blame.el, git.el).
+const R593_FILES: [&str; 3] = ["README", "git-blame.el", "git.el"];
+/// Shape: the revision's other removals beside them (r593 removed 62 paths in all).
+const R593_OTHERS: usize = 54;

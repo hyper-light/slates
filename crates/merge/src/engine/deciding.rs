@@ -434,7 +434,13 @@ impl Green {
         .unit(position::Footprint::directory(path), |_, sink| {
           sink.of(decided)
         });
-      if walk.spent_after(path) {
+      // Its place kept whether the step is spent here or not: a step spent counting a later directory's children takes
+      // the phase on after this one, never at it again. Kept only when spent, the next step decided this directory a
+      // second time over the later one's half-made count, a unit pushed twice and a removal the work makes whole judged
+      // delete against modify (the git-2000 import's r593, 2026-11-27; red in
+      // `applying_tests::a_revision_removing_a_directorys_files_then_the_directory_is_accepted_however_it_is_judged`).
+      walk.deciding.after = Some(path.clone());
+      if (walk.spent)() {
         return false;
       }
     }
