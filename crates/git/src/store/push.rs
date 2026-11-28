@@ -31,6 +31,7 @@ use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::Ident;
 use crate::objects::commit::Commit;
 
+use super::hook_view::Quantum;
 use super::naming::NameRefused;
 use super::packed::{self, Base, Bases, InPack, PackSource, PackedRefused, Scratch};
 
@@ -163,6 +164,61 @@ struct Placed {
   identity: ContentId,
 }
 
+/// A landed push's maps by object, given up by its landing ([`Push::release_holds`]) and freed after the landing's
+/// step, a slice a turn (P2 piece 3, CLAUDE.md §3: a step's work is bounded): its commits, its objects' places in its
+/// pack, its pack's entries by offset, and the positions its stage gave. They hold nothing of the content store, so
+/// when they are freed changes nothing a reader sees; dropped whole, they freed one entry an object in the landing's
+/// step.
+#[derive(Debug, Default)]
+pub struct Shedding {
+  commits: BTreeMap<ObjectId, Arrived>,
+  placed: BTreeMap<ObjectId, Placed>,
+  entries: BTreeMap<u64, ObjectId>,
+  positions: BTreeMap<ObjectId, u64>,
+}
+
+impl Shedding {
+  /// The entries left to free.
+  pub fn len(&self) -> u64 {
+    [
+      self.commits.len(),
+      self.placed.len(),
+      self.entries.len(),
+      self.positions.len(),
+    ]
+    .into_iter()
+    .fold(0_u64, |total, len| total.saturating_add(crate::to_u64(len)))
+  }
+
+  /// Whether none is left to free.
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
+  /// Frees its entries an entry a unit until the quantum is spent, a unit at least: whether none is left, and the
+  /// entries freed.
+  pub fn turn(&mut self, quantum: Quantum<'_>) -> (bool, u64) {
+    let deadline = quantum.clock.now_ns().saturating_add(quantum.ns);
+    let mut freed = 0_u64;
+    loop {
+      let one = self
+        .commits
+        .pop_first()
+        .map(drop)
+        .or_else(|| self.placed.pop_first().map(drop))
+        .or_else(|| self.entries.pop_first().map(drop))
+        .or_else(|| self.positions.pop_first().map(drop));
+      if one.is_none() {
+        return (true, freed);
+      }
+      freed = freed.saturating_add(1);
+      if quantum.clock.now_ns() >= deadline {
+        return (self.is_empty(), freed);
+      }
+    }
+  }
+}
+
 /// A push's objects (module docs).
 #[derive(Debug)]
 pub struct Push {
@@ -208,6 +264,8 @@ pub struct Push {
   /// after read; what it keeps lately is held to the budget its admission granted ([`Push::widen_reading`]). In a cell
   /// because a read is a look, not a change.
   reading: RefCell<Scratch>,
+  /// What its landing gave up, to be freed after the landing's step ([`Shedding`]); empty until it lands.
+  shedding: Shedding,
 }
 
 impl Push {
@@ -226,6 +284,7 @@ impl Push {
       pack_whole: false,
       placed: BTreeMap::new(),
       entries: BTreeMap::new(),
+      shedding: Shedding::default(),
       stored_pack: None,
       unlanded: Vec::new(),
       largest: 0,
@@ -783,9 +842,12 @@ impl Push {
   }
 
   /// Gives back the push's holds once its objects' rows hold them, leaving the push empty: the stored pack's one hold,
-  /// whatever its objects' count, and each object held whole.
+  /// whatever its objects' count, and each object held whole. Its maps by object (its commits, its objects' places,
+  /// its pack's entries) are given up whole, not freed, to be freed after the landing's step ([`Shedding`]).
   pub(crate) fn release_holds(&mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
-    self.commits.clear();
+    self.shedding.commits = core::mem::take(&mut self.commits);
+    self.shedding.placed = core::mem::take(&mut self.placed);
+    self.shedding.entries = core::mem::take(&mut self.entries);
     self.parents_held = 0;
     let placed = self.release_placed(store);
     self.quarantine.abandon(store).and(placed)
@@ -807,6 +869,29 @@ impl Push {
     self.placed = BTreeMap::new();
     *self.reading.get_mut() = Scratch::default();
     given
+  }
+
+  /// The entries its maps by object hold now: its commits, its objects' places and its pack's entries.
+  #[cfg(test)]
+  pub(crate) fn held_entries(&self) -> u64 {
+    crate::to_u64(
+      self
+        .commits
+        .len()
+        .saturating_add(self.placed.len())
+        .saturating_add(self.entries.len()),
+    )
+  }
+
+  /// Takes what its landing gave up to be freed after the landing's step ([`Shedding`]), for its owner to free a slice
+  /// a turn; dropped with the push otherwise.
+  pub fn take_shedding(&mut self) -> Shedding {
+    core::mem::take(&mut self.shedding)
+  }
+
+  /// Keeps the positions its stage gave, which its landing took, to be freed with the rest it gave up ([`Shedding`]).
+  pub(crate) fn shed_positions(&mut self, positions: BTreeMap<ObjectId, u64>) {
+    self.shedding.positions = positions;
   }
 
   /// The rows staged, if the push was staged.

@@ -1775,6 +1775,9 @@ impl Repository {
     self.charged = exact;
     self.count(|counters| counters.positions = counters.positions.saturating_add(given));
     self.depth.seen(push.deepest());
+    // The positions the stage gave, one entry an object, are given up with the push's maps, freed after the step (P2
+    // piece 3, `Shedding`).
+    push.shed_positions(positions);
     push.release_holds(store)?;
     // The push's objects read lately go with it, their charge given back (A-861).
     push.release_recent(store);
