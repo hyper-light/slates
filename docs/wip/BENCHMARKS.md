@@ -20089,3 +20089,44 @@ it is real capacity on git/git: fewer roots inflated and steps rebuilt, more hit
   gain if anything.
 - **What is left:** git/git's working set is 2,511 MiB of trees inflated against this 12 MB budget (the GAPS entry "The
   fetch's read cache on git/git"); this piece takes the budget's own idle share back, not the working set.
+
+## The hg leg at 343703bd7, three runs: the stream clone 1.60× stock at best, its count stage 55 % of its steps (goal 93 perf; main 01a20182's hg_scale round, 2026-11-27 19:18 to 20:29 PST; recorded with cut 2, A-937)
+
+The round main ran once piece 2 of the stream's cuts (the index rows a run a step, c5862b6a0) was in, before cut 2 (the
+kept rendered length, A-937) landed: what cut 2 is measured against.
+
+- **Build.** `cargo build --release --locked -p slates-cli --bin slates` at 343703bd7, binary sha1 157a34b36a5a.
+- **Command**, from the worktree root: `SERVERS="stock slates" SLATES=<that binary>
+  KEEP_LOGS=~/.local/state/main-01a20182/rounds/hg-stream/logs bash crates/cli/bench/hg_scale.sh hg
+  ~/.local/state/main-01a20182/data/hg-src ~/.local/state/main-01a20182/rounds/hg-stream/work 3 3600`: three runs,
+  stock then slates each run, over hg-src (Mercurial's own history: 57,036 changesets, 4,283 files, 73.8 MB), stock
+  Mercurial 7.2.4 (Homebrew) as `hg` and its `hg serve`. Run by `~/slates-work/main-ship/hg-stream-round.sh`.
+- **Machine and load.** adas-macbook-pro-2, 2026-11-27 19:18 to 20:29:07 PST, shared: load 12 to 49 with main's other
+  rounds beside it; run 1 overlapped a release build at nice 15. Loaded points: the counts are the stable signal, the
+  times moved two to three times with load.
+- **The record.** `~/.local/state/main-01a20182/rounds/hg-stream/run.log` (every step's line) and `summary.txt` (each
+  stream's counters moved, from the status files in `logs/`).
+
+**Seconds a step** (each run, and the best of three against stock's):
+
+| step | stock (best) | slates runs 1, 2, 3 | slates best | slates against stock |
+|---|---|---|---|---|
+| stream clone | 3.07 | 15.41, 4.92, 6.25 | 4.92 | 1.60× slower |
+| push (whole history) | 34.3 | | 67.9 | 1.98× slower |
+| clone | 13.9 | | 22.2 | 1.60× slower |
+| incremental push (one changeset after the big push) | 0.375 | 5.03, 4.77, 3.16 | 3.16 | 8.4× slower |
+| incremental pull | 0.303 | | 0.515 | 1.70× slower |
+| 18 concurrent clones | 184 | | 140 | 1.31× faster |
+| 18 concurrent pulls | 1.32 | | 1.48 | 1.12× slower |
+
+**The stream's counters** (`vcs_store.hg_stream_steps.*` and `hg_stream_reads.*`), identical in all three runs: 842,218
+steps, of them count 464,254 (55 %), index 238,557 and data 139,403; the content store's reads, count 541,331 and index
+524,131. Run 1's two clocks (hg's own transfer line, 11.6 s at 6.34 MB/s, against a 15.4 s wall) put about 3.8 s before
+the first byte, the count stage and the head.
+
+- **What it decided** (main's reading of 20:30): cut 2 (A-937) removes the count stage, so a stream's head is named
+  from what the index kept and its first byte comes with no walk; then the data stage a run a step (73.8 MB over 139,403
+  steps, 529 bytes a step, about 30 µs a step: bound by the per-step cost, not by bytes); and the index stage's 524,131
+  reads on this layout, against 0.37 a revision on piece 2's red, are owed an explanation first. After those, the
+  one-changeset push right after the big push (8.4×), logs first: the big push's background let-go or publication,
+  or a fixed cost a push.

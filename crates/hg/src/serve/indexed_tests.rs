@@ -27,6 +27,9 @@ use crate::phases::{Phase, PhaseHead};
 use crate::{Admission, NULL_NODE, Node, PastAdmission, delta, node};
 use proptest::prelude::*;
 
+#[path = "rendered_tests.rs"]
+mod rendered;
+
 /// The window the tests' stores are made with: room for a few rows a table, and longer than every fixture's text.
 const WINDOW: usize = 1 << 12;
 /// Shape: a fetch's texts asked a want with no step bound but the room's, past every fixture's texts
@@ -1231,6 +1234,73 @@ fn whole_texts<'s>(
   }
 }
 
+/// The stream `stream_out` answers of `imported` with its secret roots dropped, from its whole texts.
+fn public_stream(imported: &Imported, store: &ContentStore) -> Vec<u8> {
+  let public: Vec<PhaseHead> = imported
+    .phase_roots
+    .iter()
+    .filter(|root| root.phase != Phase::Secret)
+    .copied()
+    .collect();
+  let state = State {
+    roots: &public,
+    ..state_of(imported)
+  };
+  let view = Indexed::new(&imported.index, store, state, (UNSTEPPED, &mut room())).unwrap();
+  let mut answer = Vec::new();
+  super::super::stream::stream_out(
+    &view,
+    &mut whole_texts(&imported.index, store),
+    &mut room(),
+    &mut answer,
+  )
+  .unwrap();
+  answer
+}
+
+/// What makes a test's changeset store over an index ([`sized_by`]).
+type MakeSource<'m> =
+  &'m dyn for<'a> Fn(&'a HgIndex, &'a ContentStore) -> Box<dyn crate::render::StoredSource + 'a>;
+
+/// `index` sized from the changeset store `make` makes over it (goal 93, cut 2): what a landing keeps of each revision's
+/// chunk ([`HgIndex::keep_sized`]), counted here by a [`crate::render::Recount`] over that store, its asks answered at
+/// once, and kept once it ends. An import in a test names no place (the test's store does), so a test sizes the index it
+/// streams first, by the store it streams from. The recount's own steps and reads.
+fn sized_by(
+  index: &mut HgIndex,
+  store: &mut ContentStore,
+  make: MakeSource<'_>,
+) -> crate::render::StageTally {
+  let mut recount = crate::render::Recount::new();
+  {
+    // One store for the whole count: a test's store keeps the texts it named a place by for its chunks' asks.
+    let mut source = make(index, store);
+    loop {
+      crate::render::answer_want(&mut recount, &mut *source).unwrap();
+      if !recount.step(index, store, &mut room()).unwrap() {
+        break;
+      }
+    }
+  }
+  let tally = recount.take_tally();
+  recount.keep_counted(index, store).unwrap();
+  tally
+}
+
+/// `index` sized from its whole texts ([`sized_by`] over [`WholeTexts`]).
+fn sized_whole(index: &mut HgIndex, store: &mut ContentStore) {
+  sized_by(index, store, &|index, store| {
+    Box::new(whole_texts(index, store))
+  });
+}
+
+/// [`imported`], sized from its whole texts ([`sized_whole`]): what most stream tests stream.
+fn imported_sized(name: &str) -> (Imported, ContentStore) {
+  let (mut imported, mut store) = imported(name);
+  sized_whole(&mut imported.index, &mut store);
+  (imported, store)
+}
+
 /// Stream clones part 2 (A-712; 7.2's `generatev1wireproto`): do ask `stream_out` of the `states` repository, which
 /// holds a secret changeset, and of the same repository with its secret root dropped. Expect the first answered `1\n`
 /// and listing no `streamreqs`; the second `0\n`, then every non-empty revlog of `render::revlogs` in its order, each
@@ -1239,7 +1309,7 @@ fn whole_texts<'s>(
 #[test]
 fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
   use super::super::stream::stream_out;
-  let (imported, store) = imported("states");
+  let (imported, store) = imported_sized("states");
   let view = Indexed::new(
     &imported.index,
     &store,
@@ -1345,7 +1415,7 @@ impl ChangelogDeltas<'_> {
 
 /// The `states` repository with its secret root dropped, so it streams: its import, its store and its public roots.
 fn streaming_states() -> (Imported, ContentStore, Vec<PhaseHead>) {
-  let (imported, store) = imported("states");
+  let (imported, store) = imported_sized("states");
   let public = imported
     .phase_roots
     .iter()
@@ -1355,13 +1425,34 @@ fn streaming_states() -> (Imported, ContentStore, Vec<PhaseHead>) {
   (imported, store, public)
 }
 
-/// The changelog's files a stream of `states` from `source` sent: its status, and the `.i` and `.d` (empty if none).
-fn streamed_changelog(
-  source: &mut ChangelogDeltas<'_>,
-  view: &Indexed<'_>,
-) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+/// The changelog's files a stream of `states` sent from a store whose changelog revisions are deltas each against the
+/// revision `against` names ([`ChangelogDeltas`]), its index sized by that store ([`sized_by`]): its status, and the
+/// `.i` and `.d` (empty if none).
+fn streamed_changelog(against: fn(usize) -> usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+  let (mut imported, mut store) = imported("states");
+  sized_by(&mut imported.index, &mut store, &|index, store| {
+    Box::new(ChangelogDeltas {
+      inner: whole_texts(index, store),
+      against,
+    })
+  });
+  let public: Vec<PhaseHead> = imported
+    .phase_roots
+    .iter()
+    .filter(|root| root.phase != Phase::Secret)
+    .copied()
+    .collect();
+  let state = State {
+    roots: &public,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
+  let mut source = ChangelogDeltas {
+    inner: whole_texts(&imported.index, &store),
+    against,
+  };
   let mut answer = Vec::new();
-  super::super::stream::stream_out(view, source, &mut room(), &mut answer).unwrap();
+  super::super::stream::stream_out(&view, &mut source, &mut room(), &mut answer).unwrap();
   if answer == b"1\n" {
     return (b"1".to_vec(), Vec::new(), Vec::new());
   }
@@ -1385,17 +1476,7 @@ fn streamed_changelog(
 /// changelog without generaldelta cannot hold that delta.
 #[test]
 fn a_streamed_changelog_has_no_generaldelta_and_its_deltas_name_their_chains_start() {
-  let (imported, store, public) = streaming_states();
-  let state = State {
-    roots: &public,
-    ..state_of(&imported)
-  };
-  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
-  let mut before = ChangelogDeltas {
-    inner: whole_texts(&imported.index, &store),
-    against: |rev| rev - 1,
-  };
-  let (status, index, data) = streamed_changelog(&mut before, &view);
+  let (status, index, data) = streamed_changelog(|rev| rev - 1);
   assert_eq!(status, b"0");
   assert_eq!(index[..4], [0, 0, 0, 1], "the changelog's header");
   let log = crate::revlog::Revlog::open(&index, &data, &mut room()).unwrap();
@@ -1408,11 +1489,10 @@ fn a_streamed_changelog_has_no_generaldelta_and_its_deltas_name_their_chains_sta
     );
     log.text(rev, &mut room()).unwrap();
   }
-  let mut skipping = ChangelogDeltas {
-    inner: whole_texts(&imported.index, &store),
-    against: |rev| if rev == 2 { 0 } else { rev - 1 },
-  };
-  assert_eq!(streamed_changelog(&mut skipping, &view).0, b"1");
+  assert_eq!(
+    streamed_changelog(|rev| if rev == 2 { 0 } else { rev - 1 }).0,
+    b"1"
+  );
 }
 
 /// A changeset store that keeps every revision as stock's revlog chunk of its whole (`Form::Chunk`, main's ruling (b)),
@@ -1688,6 +1768,10 @@ fn a_streams_index_rows_are_written_a_run_a_step() {
     imported.index.rows().tiered_due(),
     imported.index.rows().compaction_due(&store)
   );
+  let recount = sized_by(&mut imported.index, &mut store, &|index, store| {
+    Box::new(whole_texts(index, store))
+  });
+  eprintln!("index runs: sized once, {recount:?}");
   imported.index.rows().seal_all(&mut store).unwrap();
   let revisions: u64 = [Log::Changelog, Log::Manifest]
     .iter()
@@ -1719,6 +1803,12 @@ fn a_streams_index_rows_are_written_a_run_a_step() {
     imported.index.rows().run_tables().len()
   );
   assert!(revisions > 600, "a long history: {revisions} revisions");
+  assert!(out.starts_with(b"0\n"), "the stream served");
+  assert_eq!(
+    tally.count,
+    crate::render::Tally::default(),
+    "no count walk: the head named from what the index kept (goal 93, cut 2)"
+  );
   assert!(
     tally.index.steps * 2 < revisions,
     "index rows a run a step: {} steps for {revisions} revisions",
@@ -1741,7 +1831,7 @@ fn a_streams_index_rows_are_written_a_run_a_step() {
 #[test]
 fn a_streams_steps_and_reads_are_counted_by_stage() {
   for name in ["amended-root", "divergent", "states"] {
-    let (imported, store) = imported(name);
+    let (imported, store) = imported_sized(name);
     let mut streaming = crate::render::Streaming::default();
     let mut source = whole_texts(&imported.index, &store);
     let mut out = Vec::new();
@@ -1762,10 +1852,14 @@ fn a_streams_steps_and_reads_are_counted_by_stage() {
     let counted = tally.count.steps + tally.index.steps + tally.data.steps + tally.other.steps;
     eprintln!("{name}: {steps} steps; {tally:?}");
     assert_eq!(counted, steps, "{name}: every step counted once");
-    assert!(tally.count.steps > 0, "{name}: the count walk counted");
+    assert_eq!(
+      tally.count,
+      crate::render::Tally::default(),
+      "{name}: no count walk, the head named from what the index kept (goal 93, cut 2)"
+    );
     assert!(
-      tally.index.steps > 0 && tally.index.steps <= tally.count.steps,
-      "{name}: the index rows a run a step, never more steps than the count: {tally:?}"
+      tally.index.steps > 0,
+      "{name}: the index rows counted: {tally:?}"
     );
     assert_eq!(
       tally.count.reads + tally.index.reads + tally.data.reads + tally.other.reads,
@@ -1788,7 +1882,7 @@ fn a_streams_steps_and_reads_are_counted_by_stage() {
 fn a_stream_clone_is_sent_a_row_at_a_time_each_within_its_own_room() {
   use super::super::stream::stream_out;
   for name in ["amended-root", "divergent", "states"] {
-    let (imported, store) = imported(name);
+    let (imported, store) = imported_sized(name);
     let public: Vec<PhaseHead> = imported
       .phase_roots
       .iter()
@@ -1996,7 +2090,16 @@ impl Deltas<'_> {
 #[test]
 fn a_stream_sends_each_revision_as_the_store_keeps_it_within_its_delta_bytes() {
   use super::super::stream::stream_out;
-  let (imported, store) = imported("states");
+  let (whole_imported, whole_store) = imported_sized("states");
+  let whole = public_stream(&whole_imported, &whole_store);
+  let (mut imported, mut store) = imported("states");
+  sized_by(&mut imported.index, &mut store, &|index, store| {
+    Box::new(Deltas {
+      whole: whole_texts(index, store),
+      edits: BTreeMap::new(),
+      delta_bytes: 0,
+    })
+  });
   let public: Vec<PhaseHead> = imported
     .phase_roots
     .iter()
@@ -2008,14 +2111,6 @@ fn a_stream_sends_each_revision_as_the_store_keeps_it_within_its_delta_bytes() {
     ..state_of(&imported)
   };
   let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
-  let mut whole = Vec::new();
-  stream_out(
-    &view,
-    &mut whole_texts(&imported.index, &store),
-    &mut room(),
-    &mut whole,
-  )
-  .unwrap();
   let mut deltas = Deltas {
     whole: whole_texts(&imported.index, &store),
     edits: BTreeMap::new(),
@@ -2036,8 +2131,8 @@ fn a_stream_sends_each_revision_as_the_store_keeps_it_within_its_delta_bytes() {
     .map(|(_, bytes)| bytes.len())
     .sum();
   let revisions = entries / 64;
-  // Counted twice by the walk (the count, then the writing), the store's bytes are half its tally.
-  let delta_bytes = usize::try_from(deltas.delta_bytes / 2).unwrap();
+  // Read once, by the writing: the count walk is the sizing's, before (goal 93, cut 2).
+  let delta_bytes = usize::try_from(deltas.delta_bytes).unwrap();
   assert!(
     chunks <= delta_bytes + revisions,
     "chunks {chunks}, deltas {delta_bytes}, revisions {revisions}"
@@ -2093,9 +2188,9 @@ const MANY_LOGS: u64 = 64;
 /// Goal 93 perf (main's order of 2026-11-21 05:06: the stream clone ~37x slower than stock; r20 on 94c1696bb, hg-src:
 /// the serving shard idle half the stream, waiting on one store ask a log, both passes, about 12,000 of them, each a turn
 /// with its view made afresh). Do: build a repository of one changeset and [`MANY_LOGS`] file logs of one revision
-/// each; stream it whole, in a room that holds it, from a store that counts its asks. Expect the store asked for rows
-/// once a pass (the count, then the writing) and for chunks once a pass too (the count sizes each chunk compressed,
-/// main's ruling of 2026-11-25), whatever the logs; and the same bytes as the stream
+/// each, sized as a landing sizes it ([`sized_whole`]); stream it whole, in a room that holds it, from a store that
+/// counts its asks. Expect the store asked for rows once and for chunks once, by the writing (the count walk, a second
+/// pass of each, is gone from the stream: goal 93, cut 2), whatever the logs; and the same bytes as the stream
 /// made a step at a time in a room that holds one log's rows or one chunk (which asks more).
 #[test]
 fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
@@ -2127,6 +2222,7 @@ fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
       .append_revisions(&mut built.store, Log::File(&path), &[revision])
       .unwrap();
   }
+  sized_whole(&mut built.index, &mut built.store);
   let view = view_of(&built, true);
   let mut counted = Counted {
     inner: whole_texts(&built.index, &built.store),
@@ -2174,8 +2270,9 @@ fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
       counted.rows,
       counted.chunks
     ),
-    // The file logs and the changelog: `build`'s changesets name no manifest, so no manifest log is written.
-    (usize::try_from(MANY_LOGS).unwrap() + 1, 2, 2),
+    // The file logs and the changelog: `build`'s changesets name no manifest, so no manifest log is written. One ask
+    // of each kind: the send's alone, the count walk gone from the stream (goal 93, cut 2; two of each before).
+    (usize::try_from(MANY_LOGS).unwrap() + 1, 1, 1),
     "(index files, row asks, chunk asks)"
   );
 }
@@ -2320,7 +2417,8 @@ fn a_streams_ask_for_a_long_logs_rows_is_gathered_a_window_a_step() {
       bookmark: false,
     })
     .collect();
-  let built = build(&line, false);
+  let mut built = build(&line, false);
+  sized_whole(&mut built.index, &mut built.store);
   let view = view_of(&built, true);
   let mut whole = Vec::new();
   stream_out(
@@ -2928,7 +3026,7 @@ fn answered_getbundle(
 
 /// The `states` repository imported, its secret roots dropped as `keep_secret` says, served as a view.
 fn states_view(keep_secret: bool) -> (Imported, ContentStore, Vec<PhaseHead>) {
-  let (imported, store) = imported("states");
+  let (imported, store) = imported_sized("states");
   let roots: Vec<PhaseHead> = imported
     .phase_roots
     .iter()

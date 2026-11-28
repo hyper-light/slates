@@ -1288,6 +1288,11 @@ pub(crate) fn land(
       released,
     };
   }
+  let mut forked = forked;
+  // Its revisions sized in the fork that takes the index's place, after any re-base (goal 93, cut 2).
+  if let Some(forked) = forked.as_mut() {
+    vcs_store::hg_sized::size_fork(state, forked);
+  }
   let Some(Forked {
     fork,
     intaken,
@@ -1407,6 +1412,9 @@ pub(crate) struct Forked {
   /// ([`hg_run`](super::hg_run)): a test's driver's, landed at its landing (`store_blocking`, the tests'); the daemon's
   /// driver lands each as it is cut.
   pub(crate) segments: Vec<RecordedSegment>,
+  /// Each kept revision of its segments landed so far, its chunk's length as the segment made it: what its fork is
+  /// sized by at its landing ([`vcs_store::hg_sized::size_fork`]; goal 93, cut 2).
+  pub(crate) sized: Vec<slates_hg::push::sized::Landed>,
 }
 
 /// A segment cut and its `Record`, written from the fork it was cut from as it was cut (record v10, its rows by node,
@@ -2945,6 +2953,8 @@ pub(crate) struct Taking {
   /// What its kept-but-unlanded revisions pin unlanded in its shard's content store (`ContentStore::pin_unlanded`),
   /// pinned after each slice, a segment's unpinned just before its let-go, the rest given back however the push ends.
   counted: slates_hg::push::pins::Counted,
+  /// Each kept revision of its segments landed so far, its chunk's length ([`Forked::sized`]).
+  sized: Vec<slates_hg::push::sized::Landed>,
 }
 
 impl Taking {
@@ -3014,6 +3024,7 @@ impl Taking {
         changegroup: self.changegroup.take()?,
         room: self.room,
         segments: Vec::new(),
+        sized: core::mem::take(&mut self.sized),
       }),
       Err(intake) => {
         self.intake = Some(*intake);
@@ -3110,6 +3121,7 @@ fn begin_intake(
           generation,
           costs: vcs_store::TurnCosts::ZERO,
           counted: slates_hg::push::pins::Counted::default(),
+          sized: Vec::new(),
         }),
         Err(refused) => Err(refused),
       },
@@ -3295,6 +3307,7 @@ async fn segment_landed(
     changegroup,
     room,
     counted,
+    sized,
     ..
   } = taking;
   let (intake, (_, payload)) = (intake.as_ref()?, changegroup.as_ref()?);
@@ -3322,6 +3335,14 @@ async fn segment_landed(
   let Some(chunks) = chunked_paced((&segment.texts, slice), &mut costs).await? else {
     return unlanded();
   };
+  // Each kept revision's chunk length as the segment made it, for the fork's sizing at the push's landing (goal 93,
+  // cut 2): never compressed again to size.
+  match slates_hg::push::sized::chunked(&segment.texts, &chunks.1) {
+    Ok(lengths) => sized.extend(lengths),
+    Err(_) => {
+      crate::state::with_state(|state| state.count(vcs_store::hg_sized::SIZED_REFUSED, 1))?;
+    }
+  }
   let held = crate::state::with_state(|state| {
     super::hg_run::segment_held(state, repository, segment, (written, chunks))
   })?;
