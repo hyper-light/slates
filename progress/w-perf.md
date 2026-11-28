@@ -897,3 +897,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     sets a look (the waiting cut's cost or twice the held frees) and every borrow's close brings the pass forward to
     now past it; a look a doubling at most. Reds: the early look and its doubling twin. Focused 71 on the merge.
   - Waiting on main: the 57k rerun with samplers (target: held peak well under 149 MB on all 3 runs).
+- 2026-11-27 19:28 PST (written then):
+  - BUILT, not on main: agents/w-perf-cadence at a6477ec16 (c36989701). The 57k on 4a281d25b put each run's held
+    peak in one borrow: hg_push.rs:3342's give-back of a landed segment's held set (264.5 MB). It is now let go a
+    slice a turn (let_go_sliced_then_release), each slice stopping at a copy slice of bytes; git's slices bounded too.
+    Red: give-back borrow 1,048,576 B before, 0 now. Site 3's borrow line reads the arena and the process.
+    Focused: server 119, fleet 3 (holder, a908 pair), slates-git 634.
+  - Next: site 2 (taking.slice's 42 MB, its own byte budget). Waiting on main's 57k round on a6477ec16.
