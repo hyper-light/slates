@@ -891,3 +891,9 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     drains first, begins a due cut while busy, asks once idle. Four reds, each checked against what it guards; chain
     132 cuts / 1,884,475 B against 2 / 171,629 B. Focused 68 on the merge.
   - Waiting on main: the 57k round with samplers on that tip; it lands only if clean.
+- 2026-11-27 17:55 PST (written then):
+  - BUILT, not on main: the held-peak fix on agents/w-perf-cadence at 1361cd1b6 (4306b0673). The 57k round on
+    8974631df was 3 of 3 good at 104-124 s but held 357,847,040 bytes: the sweep looked once an interval. Now a drain
+    sets a look (the waiting cut's cost or twice the held frees) and every borrow's close brings the pass forward to
+    now past it; a look a doubling at most. Reds: the early look and its doubling twin. Focused 71 on the merge.
+  - Waiting on main: the 57k rerun with samplers (target: held peak well under 149 MB on all 3 runs).
