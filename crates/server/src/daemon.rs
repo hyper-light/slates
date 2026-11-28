@@ -6224,6 +6224,7 @@ async fn init_shard(
     pending_green_materializations: std::collections::BTreeMap::new(),
     pending_repositories: std::collections::BTreeMap::new(),
     adopted_names: std::collections::BTreeMap::new(),
+    increment_buffer: Default::default(),
   };
   slices
     .piece_done("the secrets, failover and the shard's state")

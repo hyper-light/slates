@@ -1162,8 +1162,15 @@ fn copied_dir(to: &str, (from, rev): (&str, u64)) -> String {
   )
 }
 
-/// [`imported_whole_and_stepped`]'s reading: the youngest revision, the longest step, its window, and the copies grafted.
-type ImportedWholeAndStepped = (Result<u64, String>, u64, u64, (u64, u64, u64, u64), u64);
+/// [`imported_whole_and_stepped`]'s reading: the youngest revision, the longest step, its window, and the copies grafted;
+/// and its landing steps' most off the CPU with the large frees its prepare steps made (`staging::returned`).
+type ImportedWholeAndStepped = (
+  Result<u64, String>,
+  u64,
+  u64,
+  (u64, u64, u64, u64),
+  (u64, u64),
+);
 
 /// `dump` imported on a store-backed shard: its youngest revision, the shard's longest step and its window, and the
 /// copies the green grafted (`Green::copies_grafted`).
@@ -1202,10 +1209,15 @@ fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWhol
         let most = count(state, LANDING_OFF_CPU_MOST_NS);
         eprintln!(
           "OFFCPU {name} landing_off_cpu_most_ns={most} returned_steps={} returned_off_ns={} returned_bytes={} \
-           slowest_fell_bytes={} slowest_off_ns={}",
-          back.steps, back.off_ns, back.bytes, back.slowest.0, back.slowest.1
+           slowest_fell_bytes={} slowest_off_ns={} prepare_large_frees={}",
+          back.steps,
+          back.off_ns,
+          back.bytes,
+          back.slowest.0,
+          back.slowest.1,
+          back.prepare_large_frees
         );
-        most
+        (most, back.prepare_large_frees)
       });
       (
         loaded
@@ -1234,7 +1246,7 @@ fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWhol
   );
   eprintln!(
     "{name}: a landing step's most off its CPU {} us",
-    read.5 / 1000
+    read.5.0 / 1000
   );
   (read.0, read.1, read.2, read.3, read.5)
 }
@@ -1651,9 +1663,11 @@ fn t_a920_a_revision_copying_a_tree_of_thousands_of_files_imports_with_every_ste
   let (loaded, longest_ns, window_ns, (grafted, _, walk_most, _), _) =
     imported_whole_and_stepped("wide-copy", dump);
   assert_eq!(loaded, Ok(2));
-  // A landing step's most off its CPU is printed (OFFCPU) and not yet held to 84a's 1 ms bar: it is held there again
-  // with the fix that ends one free's return of about 50 MB of pages inside a step (main's ruling of 2026-11-27 22:16:
-  // a red lands with its fix). The page-return reading is process-wide (`Facts::footprint_now`).
+  // A landing step's most off its CPU is printed (OFFCPU), not asserted: in a debug lib test on a loaded Mac a step is
+  // preempted past 84a's 1 ms bar with no page return (1.70 ms with no footprint fall at load 39, and 34.7 ms in the
+  // server set's run, 2026-11-28), so main's bare-metal release rounds hold the bar (main's ruling of 2026-11-28 02:42).
+  // The fix that ended one free's return of 25-115 MB inside a landing step, the shard's kept increment buffer, is held
+  // by its count (`prepare_large_frees`, the move's test). The page-return reading is process-wide.
   assert!(grafted > 0, "no copy grafted");
   // The copy's tree walked a file a unit in its revision's recording (A-920 9a: its 9,000 files in one unit, 23.5-30.6
   // ms, debug).
@@ -1683,8 +1697,15 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1)), moved],
   );
-  let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most, gone_most), _) =
+  let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most, gone_most), (_, large)) =
     imported_whole_and_stepped("wide-move", dump);
+  // A landing's prepare frees no large buffer on its shard: each version's increment encoded into the shard's kept
+  // buffer, reserved once at its exact length (A-920, main's ruling of 2026-11-28 01:38: its buffer doubled through 64
+  // KiB to 2 MiB, freeing each smaller one, the 512 KiB one inside the step whose footprint fell 29.8 MB, debug).
+  assert_eq!(
+    large, 0,
+    "the landings' prepare steps freed {large} buffers of 64 KiB or more"
+  );
   // The move's delete of the trunk walked, noted gone and its paths made ops a path a unit in its build (A-920 9b: the
   // row 13.7 ms and the build's end 6.6 ms for 9,001 paths in one unit each, debug; and its tree listed whole in the
   // row's unit, 2.2 ms, red at 9,000).

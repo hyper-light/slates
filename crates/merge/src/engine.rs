@@ -69,20 +69,55 @@ use crate::ops_doc::{NodeOrigin, Op, OpKind, OpsDoc};
 use crate::range::Range;
 use crate::verdict::MergeConflictClass;
 
-/// An increment's encoding under way ([`Increment::encode_step`]): its bytes so far and where it stands.
+/// An increment's encoding under way ([`Increment::encode_step`]): its bytes so far and where it stands, and the buffer
+/// it writes into.
+///
+/// **Its buffer never grows** (A-920, main's ruling of 2026-11-28 01:38). The encoding is measured first, a piece of
+/// its ops document a unit, and its buffer reserved once at that exact length: written as it went, the buffer doubled
+/// through 64 KiB to 2 MiB for an import's 1,250,037-byte increment, and each doubling freed the last on the shard, one
+/// of them inside a landing step whose footprint fell 29.8 MB (1.19 ms off its CPU, debug). A buffer handed in
+/// ([`IncrementEncoding::with_buffer`]) is written into when it holds the measured length, and otherwise set aside for
+/// the caller to free where it chooses ([`IncrementEncoding::take_outgrown`]).
 #[derive(Debug, Default)]
 pub struct IncrementEncoding {
   out: Vec<u8>,
   stage: EncodeStage,
   /// Where the header left the document's length to fill in.
   at: usize,
+  /// The encoding's exact length, once measured.
+  measured: Option<usize>,
+  /// The handed-in buffer, when it was too small for the measured length.
+  outgrown: Option<Vec<u8>>,
+}
+
+impl IncrementEncoding {
+  /// An encoding that writes into `buffer`, emptied, when its room holds the encoding's exact length.
+  pub fn with_buffer(mut buffer: Vec<u8>) -> IncrementEncoding {
+    buffer.clear();
+    IncrementEncoding {
+      out: buffer,
+      ..IncrementEncoding::default()
+    }
+  }
+
+  /// The encoding's exact length, once its measure has ended: the room its buffer was reserved at.
+  pub fn measured(&self) -> Option<usize> {
+    self.measured
+  }
+
+  /// The handed-in buffer, when it was too small for the measured length and a buffer of that length was made in its
+  /// place: the caller's to free where it chooses.
+  pub fn take_outgrown(&mut self) -> Option<Vec<u8>> {
+    self.outgrown.take()
+  }
 }
 
 /// Where an [`IncrementEncoding`] is.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 enum EncodeStage {
+  /// Its ops document's length summed from this piece, and the sum so far: the measure the buffer is reserved by.
+  Measure { piece: usize, doc: usize },
   /// Its id, base and the document length's place.
-  #[default]
   Header,
   /// Its ops document, from this piece.
   Doc(usize),
@@ -92,6 +127,12 @@ enum EncodeStage {
   Evidence(usize),
   /// Its named runs, from this one.
   Runs(usize),
+}
+
+impl Default for EncodeStage {
+  fn default() -> Self {
+    EncodeStage::Measure { piece: 0, doc: 0 }
+  }
 }
 
 /// Format: the bytes of an increment's encoded document length (a `u64`, [`Increment::encode`]).
@@ -156,7 +197,9 @@ impl Increment {
   }
 
   /// [`Increment::encode`] taken a slice at a time (A-920 6b: an import's revision of 9,000 files encoded whole in its
-  /// landing's entry step), from `encoding` ([`IncrementEncoding::default`]), a unit at least, until `spent`: its header,
+  /// landing's entry step), from `encoding` ([`IncrementEncoding::default`] or [`IncrementEncoding::with_buffer`]), a unit
+  /// at least, until `spent`: its ops document measured a piece a unit and its buffer reserved at the exact length
+  /// (A-920, [`IncrementEncoding`]'s "Its buffer never grows"), then its header,
   /// its ops document a piece a unit ([`crate::ops_doc::OpsDoc::encode_piece`], its length filled in once every piece
   /// is written), its inline bytes `chunk` a unit, then each evidence reference and named run a unit. Once it ends,
   /// [`Increment::encode`]'s bytes.
@@ -176,10 +219,37 @@ impl Increment {
     }
   }
 
+  /// One unit of [`Increment::encode_step`]'s measure, at the ops document's `piece` with `doc` bytes summed before it:
+  /// the piece's length added, or past the last piece, the buffer reserved at the encoding's exact length (the handed-in
+  /// one set aside when it is too small) and the header next.
+  fn measure_unit(&self, encoding: &mut IncrementEncoding, (piece, doc): (usize, usize)) {
+    encoding.stage = match self.doc.piece_len(piece) {
+      Some(len) => EncodeStage::Measure {
+        piece: piece.saturating_add(1),
+        doc: doc.saturating_add(len),
+      },
+      None => {
+        let exact = self.encoded_len_with(doc);
+        if encoding.out.capacity() < exact {
+          let small = core::mem::replace(&mut encoding.out, Vec::with_capacity(exact));
+          encoding.outgrown = (small.capacity() > 0).then_some(small);
+        }
+        encoding.measured = Some(exact);
+        EncodeStage::Header
+      }
+    };
+  }
+
   /// One unit of [`Increment::encode_step`]: whether any is left.
   fn encode_unit(&self, encoding: &mut IncrementEncoding, chunk: usize) -> bool {
-    let IncrementEncoding { out, stage, at } = encoding;
+    if let EncodeStage::Measure { piece, doc } = encoding.stage {
+      self.measure_unit(encoding, (piece, doc));
+      return true;
+    }
+    let IncrementEncoding { out, stage, at, .. } = encoding;
     match stage {
+      // Measured above: this unit is the measure's.
+      EncodeStage::Measure { .. } => {}
       EncodeStage::Header => {
         out.extend_from_slice(&self.id);
         out.extend_from_slice(&self.base.to_le_bytes());
