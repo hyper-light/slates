@@ -7709,3 +7709,9 @@ At or past the tip carrying the encode keep's slice (named in w-git's landing no
 - The same run's `deepen` row (`git fetch --deepen 100`, after `tag-push` and `tag-delete`): PASS or FAIL and its
   seconds. 2026-11-21 it failed "bad pack header"; 2026-11-20 it took 217 s. Green: PASS. Red: the row's stderr, and
   the anchor log's lines around it.
+
+## 2026-11-28 01:52 PST, w-interop: the hg row cost's boot-measured first value against the cost learned online (0f5e9faee)
+- **Why:** main's ruling of 2026-11-28 00:46 (the first value measured) and 01:19 (the release timing is main's). One release run of mine before 01:19 read the probe at 739 ns a row, against about 84 ns learned online, so a shard's first stream is held to its slices but takes about a row a step until it learns.
+- **Platform:** macOS arm64 (the MacBook), release, quiet if possible; stock `hg` on PATH.
+- **Command, from the worktree root at 0f5e9faee or later:** `cargo test --release -p slates-hg --lib -- a_shards_first_gathering_steps_are_held_to_their_slice_at_the_probes_first_cost --nocapture`. Run it three times. It prints "first cost: N ns a row (B bytes at R B/s); K budget-ended gathering steps, p50 P ns, most M; the slice S ns".
+- **Red would be:** p50 above the slice plus one row's cost, which fails the test. Also worth reading: the first cost against about 84 ns a row (the release cost learned online at 54fb9a3ba, BENCHMARKS and GAPS). N far above it means the probe overestimates and a shard's first stream runs a row a step until it learns; N under it means the first stream runs past its slices.
