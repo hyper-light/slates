@@ -57050,6 +57050,38 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   made durable, `Unanswered`: Subversion's commit path, which this change does not touch); fmt clean (macOS arm64,
   this Mac, local).
 
+### A-722 part 4h — A commit reads and charges its own greens' records alone (P2, 2026-11-27, w-git; main 01a20182's order of 18:44 and its condition of 19:22)
+- **Why.** CLAUDE.md §3 (bounded work): a push's landing step ran `Repository::commit` with passes that grew with the
+  repository's life, not the push. Its charge summed every chain of every green (`footprint`, each chain's kept
+  fragments folded), cloned each moved green's whole chain to push one version, and copied the whole head map to move
+  its heads. A commit of one move over 1,000 greens of 20 versions each read 22,021 chain records and head entries
+  (`StoreCounters::commit_walked`, new). The release run of record v4 part A (BENCHMARKS, git/git v1.5.0) had the
+  store commit at 1.2 ms, over the 1 ms step.
+- **Change.** The repository keeps the chains' footprints summed (`chains_charged`) and the head map's entries
+  (`head_entries`), moved as each changes. A commit's plan reads each moved green's newest version and its two head
+  entries (`entries_moved`), and charges the records' difference at the peeled and holders' maps' bound
+  (`Repository::prepared`). Once the stage is adopted, it pushes each version onto its chain in place, moves each head
+  in the map in place, and trues the bound up, so the charge always equals the whole recomputation (the next charge
+  had trued it before). A fragment's or a base pack's recharge moves the sum by its one chain's difference. The read
+  budget follows the largest pack kept as each lands, not a walk over the packs, one a landing.
+- **A refused commit leaves the store as it was** (main's condition: with the clones gone, every refusal after the
+  plan must put things back exactly). Nothing of the repository changes before the stage's adoption; after it nothing
+  refuses but a discharge or a release past what was held. Found by the condition's oracle, a bug since A-722 part 3:
+  a commit refused at its values, its records' charge or its landing map's charge dropped the stage's index fork with
+  its tables still held, 397 bytes in the test. It is given back now.
+- **Tests.** `slates-git` `store::tests::commit_walk::a_commit_reads_its_own_moves_records_whatever_the_repositorys_other_greens_hold`
+  (3, red 22,021). `a_commit_refused_at_each_point_after_its_plan_leaves_the_store_as_it_was`: every point refused
+  (`CommitPoint`; a current fork's adoption charges nothing, so a test refuses it as a stale fork is), each refusal
+  leaving the records and the store's bytes as they were, then the same push and moves committed. Red with the fork
+  dropped: 397 bytes held. A-614's map oracle
+  (`the_git_store_reads_as_its_map_model_over_every_history`) now refuses every generated push's commit at each point
+  first, and holds the charge to its whole recomputation after every step, fragments' recharges included.
+  `slates-git --lib -- store::` 113 passed, 4 ignored; `slates-server --lib -- vcs_store:: git_push::` 270 passed,
+  1 ignored; fmt clean (macOS arm64, this Mac, local).
+- **Owed (P2, in order).** `landed_runs` for a push of several moves walks the push's positions in the step; the
+  release drops the push's placed map and the stage's positions map, one entry an object, in the step; a stale stage
+  restaged whole (A-722 part 4e's owed). Each is its own piece.
+
 ### A-722 part 4g — A replayed record's moves are admitted an object a turn (bug, 2026-11-20, w-git for UI goal 93; main's report: a restarted daemon recovering git/git's v2.0.0 spun and was killed again)
 - **Found by use.** r110 (w-interop, git v2.0.0): every daemon restarted after the push spun in A-662's recovery of the
   pushed repository (`daemon.rs` `spawn_alone`) and the watchdog killed it again, 7 of 27 steps answered.
@@ -66698,3 +66730,48 @@ Applied in the same change to:
     are no longer told apart by a test, so they go back to the crate.
 - **Applied in the same change to:** `crates/cluster/src/failover.rs`, `crates/server/src/{fleet,vcs_store/homes}.rs`,
   `crates/server/tests/fleet.rs`, GAPS.
+
+### A-936 — A holder sent a record of a newer configuration answers that it is catching up, and a push's barrier counts it as movement (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 19:09 and 19:31; the replica-build stall; §4.8 the piggyback rule)
+
+- **Why.** A death makes several configuration steps in a row (the takeover, each survivor's settlement and
+  confirmation, the council's seat), and a holder installs each a little after its owner. A record its owner sent
+  under a configuration the holder had not reached was refused `ForeignGeneration`, and the owner's reship had to win
+  a race against the next step. A holder one step behind on every reship never acknowledged the version, and a push
+  during the second death was refused `unable to commit` (a914 at 604aa12a0 run 10 and d08595c7e's five reds, each after
+  a refused first push, which left the holder's replica to be built then too). The refusal had two sources: the
+  council's version (`fleet::check_held_record`) and the copy's own acceptor authority, which the install's walk moves
+  a slice a turn (A-398; `Acceptor::check_against`).
+- **The rule.**
+  - A record from a council member that owns it, naming a newer configuration than this node's council or its installed
+    placement, is answered at once `ContentMessage::CatchingUp { object, sequence, generation }` (content kind 12,
+    beside `ReplicaBuilding` and `Behind`): the holder is behind, not the record stale (`fleet::catching_up_answer`;
+    a learner's fetch asked for). It catches up off the session, through its council and install, and the owner's next
+    reship is judged. Never a wait in the session: the peer's session serves one request at a time, and the council's
+    appends such a wait would want ride it (a first cut that waited inline held them until its budget).
+  - Where only the copy's authority lags (the walk has not reached it), the copy gets the walk's own step now
+    (`fleet::install_on_copy_ahead`, `install_on_copy`, idempotent; counted `fleet.record.copy_installed_ahead`) and the
+    record is judged.
+  - An older record is judged, and refused as the fence intends.
+  - The owner records a target's answer on the pending version (`PendingMergeRecord::catching_up`, the highest
+    configuration it answered), and a push's barrier counts it as movement (`merge_service::catching_up_heard`, in
+    `state_log::push_progress`), as it counts a replica build's turns.
+- **The bound.** A catching-up answer moves the barrier at most once per target, version and configuration: the map
+  keeps the highest configuration a target answered and only a higher one moves it, so the extension is bounded by the
+  configuration change's own steps, and the barrier's own window rule is unchanged.
+- **D-14.** A record names a newer configuration only after a membership or takeover change committed, never on a quiet
+  write's path, where nothing here runs.
+- **Counted.** `fleet.record.catching_up_answered` (holder), `merge.catching_up.heard` (owner),
+  `fleet.record.copy_installed_ahead`. Logged: a replica build's begin, its end with its turns, its replica made with its
+  turns and time, and a record that waits on a build begun and never turned.
+- **Tests.**
+  - Fleet `a_holders_first_replica_build_at_a_second_death_after_a_refused_push_lands_the_push` (red first). Four nodes
+    at `f = 1`; b and c answer home messages past the homing (`Daemon::delay_home_answers`), so the first death's push is
+    refused on purpose; the repair window closed; the stretched second death and its push, which must land. Red: b
+    refused v2 `foreign_generation` at every reship (15 a run) and the barrier refused the push. Green: no
+    `foreign_generation`, b answered `CatchingUp` 23 times and a heard 7, b's replica made in 2 turns, the push landed.
+    2 of 3 focused runs green at the last cut; the one red before the build logs showed b's build for v2 at no turn,
+    which the new logs now name.
+  - Unit: `slates_cluster::content::tests::a_catching_up_answer_has_a_golden_encoding_and_its_cuts_are_refused`, the
+    kind in `every_message`'s round trip and the unknown-kind refusal moved past it.
+- **Applied in the same change to:** `crates/cluster/src/content.rs`, `crates/server/src/{fleet,merge_service,
+  state_log,replica_build}.rs`, `crates/server/tests/fleet.rs`, GAPS.

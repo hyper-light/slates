@@ -124,6 +124,8 @@ const KIND_PIECE: u8 = 9;
 const KIND_REPLICA_BUILDING: u8 = 10;
 /// Format: the kind byte of a holder's answer to a merge record it is behind (A-918).
 const KIND_BEHIND: u8 = 11;
+/// Format: the kind byte of a holder's answer to a record it is catching up to the configuration of (A-936).
+const KIND_CATCHING_UP: u8 = 12;
 /// Format: the flag byte before a `Behind` answer's reached version: 0 for none held, 1 for a version that follows.
 const REACHED_NONE: u8 = 0;
 /// Format: see [`REACHED_NONE`].
@@ -238,6 +240,20 @@ pub enum ContentMessage {
     sequence: u64,
     /// The newest version this holder's replica holds, `None` when it holds none of the green.
     reached: Option<u64>,
+  },
+  /// A holder's answer to a record its owner sent under a newer configuration than the holder has reached (A-936, main
+  /// 01a20182's rulings of 2026-11-27 19:09 and 19:31): the holder is behind, not the record stale, and it catches up
+  /// off the session; the owner records it on the pending version, where a push's barrier counts it as movement, as it
+  /// counts [`ContentMessage::ReplicaBuilding`]. Before, it was refused `ForeignGeneration`, and a reship had to win a
+  /// race against the next configuration step. An owner of a build that predates the kind refuses it typed
+  /// (`ContentError::UnknownKind`) and reads it as no answer, as it read the refusal.
+  CatchingUp {
+    /// The register the record is of.
+    object: ObjectId,
+    /// The record's position.
+    sequence: u64,
+    /// The configuration the record names, which the holder is catching up to.
+    generation: u64,
   },
 }
 
@@ -545,6 +561,16 @@ impl ContentMessage {
         out.extend_from_slice(&sequence.to_le_bytes());
         out.extend_from_slice(&slices_done.to_le_bytes());
       }
+      ContentMessage::CatchingUp {
+        object,
+        sequence,
+        generation,
+      } => {
+        out.push(KIND_CATCHING_UP);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(&sequence.to_le_bytes());
+        out.extend_from_slice(&generation.to_le_bytes());
+      }
       ContentMessage::Behind {
         object,
         sequence,
@@ -630,6 +656,11 @@ impl ContentMessage {
           REACHED_SOME => Some(reader.u64()?),
           flag => return Err(ContentError::BadFlag { flag }),
         },
+      },
+      KIND_CATCHING_UP => ContentMessage::CatchingUp {
+        object: reader.object()?,
+        sequence: reader.u64()?,
+        generation: reader.u64()?,
       },
       kind => return Err(ContentError::UnknownKind { kind }),
     };
@@ -4107,7 +4138,46 @@ mod tests {
         sequence: SEQUENCE,
         reached: Some(1),
       },
+      ContentMessage::CatchingUp {
+        object: OBJECT,
+        sequence: SEQUENCE,
+        generation: 7,
+      },
     ]
+  }
+
+  /// Golden vector (§4.9, A-936): a holder's catching-up answer's bytes are fixed (kind, object, sequence, the
+  /// configuration it catches up to), and every cut of it, and one with a byte after it, is refused typed.
+  #[test]
+  fn a_catching_up_answer_has_a_golden_encoding_and_its_cuts_are_refused() {
+    let bytes = ContentMessage::CatchingUp {
+      object: ObjectId([0xCC; 16]),
+      sequence: 0x0708,
+      generation: 0x090A,
+    }
+    .encode();
+    let mut expected = vec![KIND_CATCHING_UP];
+    expected.extend_from_slice(&[0xCC; 16]);
+    expected.extend_from_slice(&0x0708u64.to_le_bytes());
+    expected.extend_from_slice(&0x090Au64.to_le_bytes());
+    assert_eq!(bytes, expected);
+    assert_catching_up_cuts_refused(&bytes);
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(
+      ContentMessage::decode(&trailing).is_err(),
+      "a trailing byte refused"
+    );
+  }
+
+  /// Every cut of `bytes`, a catching-up answer, is refused typed, never read as a shorter answer.
+  fn assert_catching_up_cuts_refused(bytes: &[u8]) {
+    for cut in 0..bytes.len() {
+      assert!(
+        ContentMessage::decode(&bytes[..cut]).is_err(),
+        "a cut at {cut} refused"
+      );
+    }
   }
 
   /// Golden vector (§4.9, A-918): a holder's behind answer's bytes are fixed (kind, object, sequence, then a flag and the
@@ -4164,9 +4234,9 @@ mod tests {
     expected.extend_from_slice(&0x0506u64.to_le_bytes());
     assert_eq!(bytes, expected);
     assert_eq!(
-      ContentMessage::decode(&[KIND_BEHIND.saturating_add(1)]),
+      ContentMessage::decode(&[KIND_CATCHING_UP.saturating_add(1)]),
       Err(ContentError::UnknownKind {
-        kind: KIND_BEHIND.saturating_add(1)
+        kind: KIND_CATCHING_UP.saturating_add(1)
       })
     );
     let mut trailing = bytes;

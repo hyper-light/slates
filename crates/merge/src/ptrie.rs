@@ -838,7 +838,16 @@ fn remove_at<V: Clone>(
       let Some((index, child)) = found else {
         return (Some(slot), None);
       };
-      let label = nodes.node(child).map_or(0, |node| node.label.len());
+      // The key goes on below the child only where it holds the child's whole label, as `get` matches it: a key that
+      // leaves the label or ends inside it is not held, and takes nothing (red before: removing "ax" beside "ab" took
+      // "ab"'s value; [`Ptrie::remove`] asks `get` first, so no caller met it).
+      let Some(label) = nodes
+        .node(child)
+        .filter(|node| rest.starts_with(&node.label))
+        .map(|node| node.label.len())
+      else {
+        return (Some(slot), None);
+      };
       let below = rest.get(label..).unwrap_or_default();
       let (child, removed) = remove_at(nodes, child, below, false, holders);
       if let Some(node) = nodes.node_mut(slot) {
@@ -1177,6 +1186,36 @@ mod tests {
     count
   }
 
+  /// The sibling of the git-2000 r593 fix (main's order of 2026-11-27 19:34): a removal's descent found its child by the
+  /// key's first byte and went on past the child's label without checking the key holds it. Do: hold "ab" alone, then
+  /// remove, below the root, the absent keys "ax" (the first byte shared), "a" (shorter than the label) and "abc" (longer
+  /// than it); and the same keys through the map's own `remove`. Expect each answered none and "ab" still held. Red
+  /// before, below the root: "ax" and "a" took "ab"'s value. The map's own `remove` was never reached so, as it asks
+  /// whether it holds the key first (by `get`, which matches each label whole), so this was latent.
+  #[test]
+  fn a_removal_of_an_absent_key_beside_a_held_one_takes_nothing() {
+    for absent in [&b"ax"[..], b"a", b"abc"] {
+      let mut nodes: Nodes<u32> = Nodes::default();
+      let mut counted = Counted::default();
+      let mut trie = Ptrie::new();
+      counted.put(7);
+      trie.insert(&mut nodes, b"ab", 7, &mut counted);
+      let root = trie.root.expect("a root");
+      let (root, removed) = remove_at(&mut nodes, root, absent, true, &mut counted);
+      trie.root = root;
+      assert_eq!(removed, None, "below the root, {absent:?} took a value");
+      assert_eq!(
+        trie.get(&nodes, b"ab"),
+        Some(&7),
+        "below the root, {absent:?} took \"ab\""
+      );
+      assert_eq!(trie.remove(&mut nodes, absent, &mut counted), None);
+      assert_eq!(trie.get(&nodes, b"ab"), Some(&7), "{absent:?} took \"ab\"");
+      assert_eq!(trie.len(&nodes), 1);
+      trie.release(&mut nodes, &mut counted);
+    }
+  }
+
   /// A map of the oracle's and the ordered map it is held to.
   type Modeled = (Ptrie<u32>, BTreeMap<Vec<u8>, u32>);
 
@@ -1211,8 +1250,15 @@ mod tests {
           }
           Step::Remove { map, key } => {
             if let Some((trie, model)) = maps[map].as_mut() {
+              let copied = nodes.copied();
               let removed = trie.remove(&mut nodes, &key, &mut counted);
-              prop_assert_eq!(removed, model.remove(&key));
+              let held = model.remove(&key);
+              // A key the map does not hold, however near one it holds (a first byte shared, a prefix, an extension),
+              // copies nothing and takes nothing.
+              if held.is_none() {
+                prop_assert_eq!(nodes.copied(), copied, "removing absent {:?} copied a node", key);
+              }
+              prop_assert_eq!(removed, held);
               if let Some(removed) = removed {
                 counted.freed(removed);
               }

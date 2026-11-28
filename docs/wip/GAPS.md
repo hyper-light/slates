@@ -413,8 +413,12 @@
 >   each log's newest part stays owed while it has remote candidates, so the owed-part ship re-ships it to a candidate a
 >   change brings in, and the settle waits for it on `f + 1` of the new cohort, naming the log it waits for. Bounded:
 >   one part a state log of a repository the partition holds (design A-934).
-> - **OPEN, being logged (w-shared; main 01a20182's order of 2026-11-27 18:08): a holder's replica build stalls at the
->   second death.** Not seen in a914 since A-914 (c) (16 of 16 at 02548a267): every stalled red followed a refused first
+> - **FIXED in part (A-936, w-shared, 2026-11-27; main's rulings of 19:09 and 19:31), OPEN for the rest: a holder's
+>   replica build stalls at the second death.** Reproduced on purpose (a refused first-death push, then the second
+>   death): the logs put it on the holder's configuration lag, not the build or the region (the build's replay 5 ms):
+>   each reship refused `foreign_generation`. Now the holder answers `CatchingUp` and the barrier counts it (design
+>   A-936). Still open: one focused run after it showed the holder's build for v2 at no turn, before the build's begin
+>   and end were logged; they are now. Not seen in a914 since A-914 (c) (16 of 16 at 02548a267): every stalled red followed a refused first
 >   push, so its red must make the condition on purpose, or the logs show a refused push is its only door (main's ruling
 >   of 19:02). a914 at 604aa12a0 run 10 and at d08595c7e runs 1, 3, 5, 7 and 9 (each after a refused first-death
 >   push): the second death's v2 placed at the owner alone, its other live candidate answering `ReplicaBuilding` at 0
@@ -1199,6 +1203,17 @@
 > deterministic in `crates/rt/tests/spin_kick.rs` (3 of 3 hung, shard parked), green 3 of 3
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
+> **FIXED 2026-11-27 (w-svn; main's git-2000 release rounds, 4 imports of 5 refused at r593): a stepped directory
+> removal judged again over a half-made count.** A step that decided one directory and was spent counting the next
+> one's children left the phase's place before the first, so the next decided it again and refused the revision
+> `DeleteModify` (`Green::decide_rmdirs_some`, A-920's ee0c95e8f). Each decided directory now keeps its place. Bug
+> record `docs/bugs/2026-11-27-an-imports-directory-removals-were-judged-again-over-a-half-made-count.md`; a refused
+> staging now logs what the member holds and the work does there (`ImportBatch::refusal_logged`). Its sibling, latent:
+> the ptrie's removal descent (`ptrie::remove_at`) went on past a child's label without checking the key held it, so
+> below the root removing "ax" beside "ab" took "ab"'s value; `Ptrie::remove` asks `get` first, so no caller met it.
+> Now matched as `get` matches it; the sweep found every other descent (`get`, `insert_at`, `graft_at`, `cut_at`,
+> `under_any`) already matching its labels whole. The oracle asserts an absent key's removal copies no node.
+
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
@@ -1225,7 +1240,11 @@
 > ms of the op's 4.29 (debug), and the cost was the identity's hash of the whole op (4.92 ms), which hashes each entry as
 > its digest since 13c. The log write's about 48 bytes a path stays, for a wider probe to judge. Release probe 17's
 > move leader was the test's own setup (the simulated host's copy of the dump), which now holds the dump moved in, never copied; the
-> product's create and begin print apart (`SETUP`). Copy's release unit was an allocator's batch of freed pages returned
+> product's create and begin print apart (`SETUP`). Release probe 18's move leader, `begin` (1.4 ms, CPU-bound, at any
+> load), was the simulated host again: its `open_file` cloned the whole dump as the open's snapshot (debug: 0.43 of
+> `begin`'s 0.46 ms, about twice add's for move's dump). Since (w-svn, main's ruling (a) of 2026-11-27 17:29) an open
+> copies nothing, as a real host's does, and a file displaced while open is retired whole, the files beneath a removed
+> directory too (`SimHost::retire`); held by `crates/vfs/tests/sim_opens.rs` (red: the open held the file's 1 MiB). Copy's release unit was an allocator's batch of freed pages returned
 > in one free (1.2-1.3 ms of system time in release); since the reaper, what a release frees is dropped on the daemon's
 > reaper thread (25 µs the longest unit, debug), owed probe 18's release read. The shard's handed and in-place counts are
 > read by the tests alone, not yet the status report. Move's `stage.committing` was the commit's node moves, a walk of
@@ -3466,9 +3485,17 @@
 > pack's length (resident at most twice the pack while judged); staging puts what lands. Owed: the landed half
 > (changesets, a clone's pack derived from them, with w-store); a replay still reads its record's pack whole.
 >
+> **A-722 part 4h (P2, 2026-11-27, w-git; main's order of 18:44).** BUILT: a commit reads and charges its own greens'
+> records alone (one move over 1,000 greens of 20 versions: 3 records read, 22,021 before), its versions pushed and
+> its heads moved in place after its stage's adoption, the charge trued up to its whole recomputation; a commit refused
+> after its plan leaves the store as it was (found: the stage's fork was dropped holding its tables, 397 bytes a
+> refusal), held at every point by the store's oracle. OWED, each its own piece: `landed_runs` over a several-move
+> push's positions; the release's drops of the push's placed and positions maps; a stale stage restaged whole.
+>
 > **A-722 part 4e (2026-11-20, w-git).** BUILT: an overtaken stage made again in the judge's turns; a stage giving no
 > position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live). Owed: the
-> store commit's whole passes; the check's propagation in one unit (57.9 ms at 100 pushes).
+> store commit's whole passes (part 4h above began them: the chains' and the head map's); the check's propagation in
+> one unit (57.9 ms at 100 pushes).
 >
 > **A-753 (2026-11-20, w-git).** BUILT: a create at a commit another branch holds is made from it (empty work); a
 > resent object is read from the index; at the chains' cap a push checkpoints the repository's other members too.
