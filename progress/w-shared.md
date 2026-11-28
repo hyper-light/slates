@@ -794,3 +794,7 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - 7563eb2d2: replica_build logs its wait on the store's replay; homes::read_remote logs each home that gave nothing; the rebuild logs names it could not fetch. GAPS: the stall, OPEN, being logged.
 - A refused push's holds are let go at every home and never homed again.
 - New: one a914 run red at the first death's barrier, "unable to commit": A-935's kept v1 retargeted to the newcomer, and b never acked v2. Asked main: holder-side log first (recommended) or narrow A-935.
+
+## 2026-11-27 18:52 PST: holder-side merge log landed (slates 02548a267)
+- 1598dcede: judge_merge_record returns its reply and why; note_unaccepted logs holder, green, version, sender and reason once per (green, version, reason). Units 55/55.
+- Main runs a914 x16 at 02548a267. Next: read its reds (A-935 or not; the stall's object/homes).
