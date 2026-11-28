@@ -38412,6 +38412,87 @@ fn homing_counts(daemon: &Daemon) -> HomingCounts {
   ))
 }
 
+/// Shape: how long b and c wait before they answer each home message in the replica-build stall's red: past the first
+/// death's homing deadline, which follows the homing window as it is measured (A-914 (c)) and read 17.1 s at most in
+/// a914c's stretched first death, so the push during it is refused at its homing, on purpose.
+const PAST_THE_HOMING_NS: u64 = 30_000_000_000;
+
+/// The replica-build stall (main 01a20182's orders of 2026-11-27 18:08 and 19:03; a914 at 604aa12a0 run 10 and
+/// d08595c7e runs 1, 3, 5, 7 and 9, each after a refused first-death push). Do: on a four-node `f = 1` git fleet with a
+/// repository on a, push `main`; make b and c answer every home message past the homing's deadline
+/// ([`PAST_THE_HOMING_NS`], `Daemon::delay_home_answers`) and run a914's stretched first death, so its push is refused
+/// at its homing, on purpose; answer at once again, wait out f = 1's repair window ([`repair_window_closed`]); then the
+/// stretched second death, stopping c, and its push. Expect that push to land. Red before: a refused first push leaves
+/// b's replica of the green unbuilt (a holder builds one only when a later version needs it), so b builds it at the
+/// second death, replaying the repository's store from the region while c, one of its homes, has just died, and the push
+/// is refused at its barrier with b `ReplicaBuilding` at 0 turns (`unable to commit`).
+#[test]
+fn a_holders_first_replica_build_at_a_second_death_after_a_refused_push_lands_the_push() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), stores, lease) =
+    started_git_fleet_of("stall-after-refused", &["a", "b", "c", "d"]);
+  let mut fleet = founded_git_fleet(
+    "stall-after-refused",
+    (daemons, hosts),
+    stores,
+    (Some(lease), None),
+  );
+  let first = fleet.push(0, ("first.txt", b"main before any death\n"));
+  delay_home_answers_at(&fleet, PAST_THE_HOMING_NS);
+  let at_d = stretched_death(&mut fleet, 3, "after-d.txt");
+  delay_home_answers_at(&fleet, 0);
+  let (repaired, holders) = repair_window_closed(&fleet);
+  let at_c = stretched_death(&mut fleet, 2, "after-c.txt");
+  let catch_ups = catch_up_counts(&fleet);
+  fleet.stop();
+  eprintln!(
+    "stall-after-refused: first {first:?}; the first death's (window, push, taken, after) {at_d:?}; repaired {repaired} \
+     at {holders:?}; the second death's {at_c:?}; each survivor's (catching up answered, heard, refused foreign \
+     generation, behind heard, merge records shipped) {catch_ups:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before any death landed");
+  assert!(
+    at_d.1.is_err(),
+    "the first death's push was refused, on purpose"
+  );
+  assert!(
+    repaired && at_d.2,
+    "d was taken over and f = 1's repair window closed"
+  );
+  assert_eq!(at_c.1, Ok(()), "the push during the second death landed");
+}
+
+/// Each node's records answered `CatchingUp` (a holder behind the record's configuration), catching-up answers heard
+/// as an owner, records refused `ForeignGeneration`, `Behind` answers heard and merge records shipped (A-936's
+/// non-vacuity, and the kept version's reships), or why they could not be read.
+fn catch_up_counts(fleet: &GitFleet) -> Vec<Result<[u64; 5], ObserveError>> {
+  let names = [
+    "fleet.record.catching_up_answered",
+    "merge.catching_up.heard",
+    "fleet.record.refused.foreign_generation",
+    "merge.behind.heard",
+    "merge.record.shipped",
+  ];
+  fleet
+    .daemons
+    .iter()
+    .map(|daemon| {
+      let mut counts = [0; 5];
+      for (count, name) in counts.iter_mut().zip(names) {
+        *count = move_counter(daemon, name)?;
+      }
+      Ok(counts)
+    })
+    .collect()
+}
+
+/// Makes b and c, the fleet's nodes after a, wait `delay_ns` before they answer each home message (0: at once again).
+fn delay_home_answers_at(fleet: &GitFleet, delay_ns: u64) {
+  for daemon in fleet.daemons.iter().skip(1).take(2) {
+    daemon.delay_home_answers(delay_ns).unwrap();
+  }
+}
+
 /// A node's homing window as read from its status, or why it could not be ([`stretched_death`]'s readings).
 type WindowRead = Result<HomingWindowReading, ObserveError>;
 

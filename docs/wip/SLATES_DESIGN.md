@@ -66658,3 +66658,48 @@ Applied in the same change to:
     are no longer told apart by a test, so they go back to the crate.
 - **Applied in the same change to:** `crates/cluster/src/failover.rs`, `crates/server/src/{fleet,vcs_store/homes}.rs`,
   `crates/server/tests/fleet.rs`, GAPS.
+
+### A-936 — A holder sent a record of a newer configuration answers that it is catching up, and a push's barrier counts it as movement (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 19:09 and 19:31; the replica-build stall; §4.8 the piggyback rule)
+
+- **Why.** A death makes several configuration steps in a row (the takeover, each survivor's settlement and
+  confirmation, the council's seat), and a holder installs each a little after its owner. A record its owner sent
+  under a configuration the holder had not reached was refused `ForeignGeneration`, and the owner's reship had to win
+  a race against the next step. A holder one step behind on every reship never acknowledged the version, and a push
+  during the second death was refused `unable to commit` (a914 at 604aa12a0 run 10 and d08595c7e's five reds, each after
+  a refused first push, which left the holder's replica to be built then too). The refusal had two sources: the
+  council's version (`fleet::check_held_record`) and the copy's own acceptor authority, which the install's walk moves
+  a slice a turn (A-398; `Acceptor::check_against`).
+- **The rule.**
+  - A record from a council member that owns it, naming a newer configuration than this node's council or its installed
+    placement, is answered at once `ContentMessage::CatchingUp { object, sequence, generation }` (content kind 12,
+    beside `ReplicaBuilding` and `Behind`): the holder is behind, not the record stale (`fleet::catching_up_answer`;
+    a learner's fetch asked for). It catches up off the session, through its council and install, and the owner's next
+    reship is judged. Never a wait in the session: the peer's session serves one request at a time, and the council's
+    appends such a wait would want ride it (a first cut that waited inline held them until its budget).
+  - Where only the copy's authority lags (the walk has not reached it), the copy gets the walk's own step now
+    (`fleet::install_on_copy_ahead`, `install_on_copy`, idempotent; counted `fleet.record.copy_installed_ahead`) and the
+    record is judged.
+  - An older record is judged, and refused as the fence intends.
+  - The owner records a target's answer on the pending version (`PendingMergeRecord::catching_up`, the highest
+    configuration it answered), and a push's barrier counts it as movement (`merge_service::catching_up_heard`, in
+    `state_log::push_progress`), as it counts a replica build's turns.
+- **The bound.** A catching-up answer moves the barrier at most once per target, version and configuration: the map
+  keeps the highest configuration a target answered and only a higher one moves it, so the extension is bounded by the
+  configuration change's own steps, and the barrier's own window rule is unchanged.
+- **D-14.** A record names a newer configuration only after a membership or takeover change committed, never on a quiet
+  write's path, where nothing here runs.
+- **Counted.** `fleet.record.catching_up_answered` (holder), `merge.catching_up.heard` (owner),
+  `fleet.record.copy_installed_ahead`. Logged: a replica build's begin, its end with its turns, its replica made with its
+  turns and time, and a record that waits on a build begun and never turned.
+- **Tests.**
+  - Fleet `a_holders_first_replica_build_at_a_second_death_after_a_refused_push_lands_the_push` (red first). Four nodes
+    at `f = 1`; b and c answer home messages past the homing (`Daemon::delay_home_answers`), so the first death's push is
+    refused on purpose; the repair window closed; the stretched second death and its push, which must land. Red: b
+    refused v2 `foreign_generation` at every reship (15 a run) and the barrier refused the push. Green: no
+    `foreign_generation`, b answered `CatchingUp` 23 times and a heard 7, b's replica made in 2 turns, the push landed.
+    2 of 3 focused runs green at the last cut; the one red before the build logs showed b's build for v2 at no turn,
+    which the new logs now name.
+  - Unit: `slates_cluster::content::tests::a_catching_up_answer_has_a_golden_encoding_and_its_cuts_are_refused`, the
+    kind in `every_message`'s round trip and the unknown-kind refusal moved past it.
+- **Applied in the same change to:** `crates/cluster/src/content.rs`, `crates/server/src/{fleet,merge_service,
+  state_log,replica_build}.rs`, `crates/server/tests/fleet.rs`, GAPS.

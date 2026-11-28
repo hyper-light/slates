@@ -2776,7 +2776,7 @@ impl PendingGreen {
       .map(|(version, pending)| {
         format!(
           "v{version}: record candidates {:?} acked {:?} joint {:?}; inputs acked {:?}; lacking {:?}; building {:?}; \
-           behind {:?}; shipments {}",
+           behind {:?}; catching up {:?}; shipments {}",
           pending.record.candidates,
           pending.record.acked,
           pending.record.joint,
@@ -2784,6 +2784,7 @@ impl PendingGreen {
           pending.lacking.keys().collect::<Vec<_>>(),
           pending.building,
           pending.behind,
+          pending.catching_up,
           pending.shipments,
         )
       })
@@ -2933,6 +2934,12 @@ pub struct PendingMergeRecord {
   /// replica holds, `None` for none of the green: the latest answer alone, so it holds one entry a target. Bounded by
   /// the candidates; a target leaves once it acknowledges.
   pub behind: BTreeMap<HostId, Option<u64>>,
+  /// Each target that answered it is catching up to the configuration the record names
+  /// (`ContentMessage::CatchingUp`, A-936), with the highest such configuration it answered: a push's barrier reads it
+  /// rising as movement ([`catching_up_heard`]), so an answer counts once per target, version and configuration, and a
+  /// target that keeps answering at one configuration never moves it twice. Bounded by the candidates; a target leaves
+  /// once it acknowledges.
+  pub catching_up: BTreeMap<HostId, u64>,
   /// When it was enqueued, on the host's monotonic clock: what [`SUBMIT_PLACE`] times its placement from.
   pub enqueued_ns: u64,
   /// The shipments that carried its inputs so far ([`SUBMIT_SHIPMENTS`]): inputs larger than one shipment's bound
@@ -3799,6 +3806,7 @@ pub(crate) fn insert_pending(
       lacking: BTreeMap::new(),
       building: BTreeMap::new(),
       behind: BTreeMap::new(),
+      catching_up: BTreeMap::new(),
       enqueued_ns: slates_machine::clock::monotonic_ns(),
       shipments: 0,
       inputs_manifest: None,
@@ -4650,6 +4658,7 @@ fn record_behind_answers(
   answers: &[(HostId, Vec<u8>)],
 ) {
   let mut heard = 0u64;
+  let mut catching_up = 0u64;
   if let Some(pending) = state
     .merge
     .pending
@@ -4659,21 +4668,69 @@ fn record_behind_answers(
     pending
       .behind
       .retain(|host, _| !pending.record.acked.contains(host));
+    pending
+      .catching_up
+      .retain(|host, _| !pending.record.acked.contains(host));
     for (host, answer) in answers {
-      if let Ok(slates_cluster::content::ContentMessage::Behind {
-        object: behind,
-        sequence,
-        reached,
-      }) = slates_cluster::content::ContentMessage::decode(answer)
-        && behind == object
-        && sequence == version
-      {
-        pending.behind.insert(*host, reached);
-        heard = heard.saturating_add(1);
+      match slates_cluster::content::ContentMessage::decode(answer) {
+        Ok(slates_cluster::content::ContentMessage::Behind {
+          object: behind,
+          sequence,
+          reached,
+        }) if behind == object && sequence == version => {
+          pending.behind.insert(*host, reached);
+          heard = heard.saturating_add(1);
+        }
+        Ok(slates_cluster::content::ContentMessage::CatchingUp {
+          object: catching,
+          sequence,
+          generation,
+        }) if catching == object && sequence == version => {
+          note_catching_up(
+            &mut pending.catching_up,
+            *host,
+            generation,
+            &mut catching_up,
+          );
+        }
+        _ => {}
       }
     }
   }
   state.count(BEHIND_HEARD, heard);
+  state.count(CATCHING_UP_HEARD, catching_up);
+}
+
+/// Notes `host` catching up to `generation` for a pending version ([`PendingMergeRecord::catching_up`], A-936): kept only
+/// where it rises, so the barrier's movement counts once per target, version and configuration; `rose` counts each rise.
+fn note_catching_up(
+  catching: &mut BTreeMap<HostId, u64>,
+  host: HostId,
+  generation: u64,
+  rose: &mut u64,
+) {
+  let held = catching.entry(host).or_insert(0);
+  if generation > *held {
+    *held = generation;
+    *rose = rose.saturating_add(1);
+  }
+}
+
+/// Counter: a target's catching-up answer to a pending merge record that rose past the configuration it last answered
+/// ([`record_behind_answers`], A-936). Format: a counter name in the daemon's status report.
+const CATCHING_UP_HEARD: &str = "merge.catching_up.heard";
+
+/// The configurations every target catching up to one of `object`'s pending records answered, summed (A-936): it rises
+/// only as a target answers a newer configuration than it last did, and a push's barrier reads it as movement
+/// (`crate::state_log::push_progress`), as it reads a replica build's turns.
+pub(crate) fn catching_up_heard(state: &ShardState, object: ObjectId) -> u64 {
+  state.merge.pending.get(&object).map_or(0, |pending| {
+    pending
+      .records
+      .values()
+      .flat_map(|record| record.catching_up.values())
+      .fold(0u64, |sum, generation| sum.saturating_add(*generation))
+  })
 }
 
 /// Records what each target that did not acknowledge `version`'s record answered about its inputs, `manifest` (§4.16
@@ -6232,6 +6289,7 @@ mod tests {
       lacking: BTreeMap::new(),
       building: BTreeMap::new(),
       behind: BTreeMap::new(),
+      catching_up: BTreeMap::new(),
       enqueued_ns: 0,
       shipments: 0,
       inputs_manifest: None,
@@ -6353,6 +6411,7 @@ mod tests {
           lacking: BTreeMap::new(),
           building: BTreeMap::new(),
           behind: BTreeMap::new(),
+          catching_up: BTreeMap::new(),
           enqueued_ns: 0,
           shipments: 0,
           inputs_manifest: None,
@@ -6454,6 +6513,7 @@ mod tests {
             lacking: BTreeMap::new(),
             building: BTreeMap::new(),
             behind: BTreeMap::new(),
+            catching_up: BTreeMap::new(),
             enqueued_ns: 0,
             shipments: 0,
             inputs_manifest: None,
@@ -7221,6 +7281,7 @@ mod tests {
           lacking: BTreeMap::new(),
           building: BTreeMap::new(),
           behind: BTreeMap::new(),
+          catching_up: BTreeMap::new(),
           enqueued_ns: 0,
           shipments: 0,
           inputs_manifest: None,

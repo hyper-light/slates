@@ -413,8 +413,12 @@
 >   each log's newest part stays owed while it has remote candidates, so the owed-part ship re-ships it to a candidate a
 >   change brings in, and the settle waits for it on `f + 1` of the new cohort, naming the log it waits for. Bounded:
 >   one part a state log of a repository the partition holds (design A-934).
-> - **OPEN, being logged (w-shared; main 01a20182's order of 2026-11-27 18:08): a holder's replica build stalls at the
->   second death.** Not seen in a914 since A-914 (c) (16 of 16 at 02548a267): every stalled red followed a refused first
+> - **FIXED in part (A-936, w-shared, 2026-11-27; main's rulings of 19:09 and 19:31), OPEN for the rest: a holder's
+>   replica build stalls at the second death.** Reproduced on purpose (a refused first-death push, then the second
+>   death): the logs put it on the holder's configuration lag, not the build or the region (the build's replay 5 ms):
+>   each reship refused `foreign_generation`. Now the holder answers `CatchingUp` and the barrier counts it (design
+>   A-936). Still open: one focused run after it showed the holder's build for v2 at no turn, before the build's begin
+>   and end were logged; they are now. Not seen in a914 since A-914 (c) (16 of 16 at 02548a267): every stalled red followed a refused first
 >   push, so its red must make the condition on purpose, or the logs show a refused push is its only door (main's ruling
 >   of 19:02). a914 at 604aa12a0 run 10 and at d08595c7e runs 1, 3, 5, 7 and 9 (each after a refused first-death
 >   push): the second death's v2 placed at the owner alone, its other live candidate answering `ReplicaBuilding` at 0
