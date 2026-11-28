@@ -390,8 +390,16 @@ const ONE_CALL_WINDOW: usize = 1 << 12;
 /// register's phase roots, and each bookmark's name with its green's head changeset and head identity.
 #[derive(Debug, PartialEq, Eq)]
 struct Served {
-  /// The index's rows, each its key and body.
+  /// The index's rows of its history, each its key and body: not its sized rows (`S`, and the log numbers `X` they name
+  /// a log by), which a landing and a recovery's recount number each in its own order (goal 93, cut 2, A-937); their
+  /// values are [`Served::kept`].
   rows: Vec<(Vec<u8>, Vec<u8>)>,
+  /// What the index keeps for a stream: its head ([`slates_hg::index::HgIndex::rendered`]) and each log's chunk spans,
+  /// by the log's name.
+  kept: (
+    Option<slates_hg::index::Rendered>,
+    Vec<(Vec<u8>, Vec<Option<slates_hg::index::ChunkSpan>>)>,
+  ),
   /// Each changeset's text, in revision order.
   texts: Vec<Vec<u8>>,
   /// The phase roots, each its phase and node.
@@ -450,9 +458,11 @@ fn served_held(
     .index
     .rows()
     .iter(content)
+    .filter(|row| !matches!(row.key().first(), Some(b'S' | b'X')))
     .map(|row| (row.key().to_vec(), row.body().to_vec()))
     .collect();
   let index = &store.index;
+  let kept = kept_of(index, content);
   let mut asks = Vec::new();
   let texts = (0..index.len(content, Log::Changelog))
     .map(|rev| {
@@ -474,12 +484,39 @@ fn served_held(
   (
     Served {
       rows,
+      kept,
       texts,
       roots,
       bookmarks,
     },
     asks,
   )
+}
+
+/// What `index` keeps for a stream ([`Served::kept`]): its head and every log's chunk spans, revision by revision.
+fn kept_of(
+  index: &slates_hg::index::HgIndex,
+  content: &ContentStore,
+) -> (
+  Option<slates_hg::index::Rendered>,
+  Vec<(Vec<u8>, Vec<Option<slates_hg::index::ChunkSpan>>)>,
+) {
+  let files: Vec<Vec<u8>> = index.file_logs(content).map(<[u8]>::to_vec).collect();
+  let logs = [
+    (b"\0changelog".to_vec(), Log::Changelog),
+    (b"\0manifest".to_vec(), Log::Manifest),
+  ]
+  .into_iter()
+  .chain(files.iter().map(|path| (path.clone(), Log::File(path))));
+  let spans = logs
+    .map(|(name, log)| {
+      let revisions = (0..index.len(content, log))
+        .map(|rev| index.chunk_span(content, log, rev))
+        .collect();
+      (name, revisions)
+    })
+    .collect();
+  (index.rendered(), spans)
 }
 
 /// A recovery's own steps over this shard (A-575, A-662): every green rebuilt from its records in recovery's order
@@ -546,8 +583,11 @@ fn check_served(served: &Served, imported: &Imported) {
 /// the verb on a running shard and wait for its answer; read what the repository serves; then recover the shard's greens
 /// and the repository's store from the partition's records alone, as a recovery does, and read it again. Expect the
 /// import answered; before the recovery, the history, the phase roots and each bookmark at its changeset the one-call
-/// import found; after it, the same served repository (rows, texts, roots, each bookmark's head and identity), its one
-/// record replayed and counted.
+/// import found; after it, once its rebuild and the recount of its kept rendered length end (A-937), the same served
+/// repository (rows, what it keeps for a stream, texts, roots, each bookmark's head and identity), its one record
+/// replayed and counted. The sized rows themselves are compared by their values ([`Served::kept`]), not their keys: a
+/// landing and a recount number the logs each in its own order (diag CI 13's TSan lane, run 46114400491, compared them
+/// by key and failed).
 #[test]
 fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
@@ -580,11 +620,14 @@ fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
     },
     TASK_WAIT,
   );
+  // The rebuild, then its recount (A-937: a replay names no chunk length, so the index serves no stream until it ends).
   let began = Instant::now();
-  while crate::daemon::observe_first(&daemon, move |state| state.vcs_stores.rebuilding(id)) {
+  while crate::daemon::observe_first(&daemon, move |state| {
+    state.vcs_stores.rebuilding(id) || state.vcs_stores.hg_recounts.holds(id)
+  }) {
     assert!(
       began.elapsed() < TASK_WAIT,
-      "still rebuilding after {TASK_WAIT:?}"
+      "still rebuilding or recounting after {TASK_WAIT:?}"
     );
   }
   let (after, replayed) = crate::test_store::run_on_first(
@@ -600,6 +643,10 @@ fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
   daemon.stop();
   assert_eq!(answered, 1);
   check_served(&before, &imported_in_one_call());
+  assert!(
+    before.kept.0.is_some(),
+    "the import kept a head for a stream"
+  );
   assert_eq!(after, before);
   assert_eq!(replayed, 1);
 }

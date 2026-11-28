@@ -262,6 +262,10 @@ pub(super) fn joined(nodes: impl IntoIterator<Item = Node>) -> Vec<u8> {
     .join(&b' ')
 }
 
+/// Shape: the cache line the tests charge a stream's reads in: Apple M-series' 128 bytes, the machine main 01a20182's
+/// ruling of 2026-11-27 22:13 measured on (`slates_machine`'s facts give the machine's own to the daemon).
+pub(super) const TEST_LINE: u64 = 128;
+
 pub(super) fn room() -> Admission {
   Admission::new(u64::MAX)
 }
