@@ -655,6 +655,139 @@ fn content_map_given_up_after(works: &[Changes], turns: u64) -> Result<bool, Str
   Ok(staged)
 }
 
+/// The content history as it is published: each path's entries in full, every value's pieces and their chunks, and
+/// every value's bytes read through them. A reader between a stage's steps reads it so; a refusal must leave it so.
+pub(super) fn content_history_held(green: &Green) -> String {
+  // Each value's bytes too, read through the chunks: a value's pieces can stay as they were while the chunk they name
+  // is repointed (the layered re-anchor's anchor), which only a read through the chunks shows.
+  let read: Vec<(String, Vec<Option<Vec<u8>>>)> = green
+    .content_history
+    .iter()
+    .map(|(path, history)| {
+      let values = history
+        .iter()
+        .map(|(_, value)| {
+          value
+            .as_ref()
+            .and_then(|value| value.materialize(&green.chunks, green.content.blocks()))
+        })
+        .collect();
+      (path, values)
+    })
+    .collect();
+  format!(
+    "{:?}\n{read:?}",
+    green.content_history.iter().collect::<Vec<_>>()
+  )
+}
+
+/// Every file's bytes at every version up to the head: what the published content history and map answer a reader.
+pub(super) fn content_bytes_read(green: &Green) -> String {
+  let head = green.head();
+  let mut read = String::new();
+  for version in 0..=head {
+    for path in PATHS {
+      read.push_str(&format!(
+        "{version} {path} {:?}\n",
+        green.content_ref_at_bytes(path, version)
+      ));
+    }
+  }
+  read
+}
+
+/// The chunk guard (main 01a20182's rulings of 2026-11-28 01:29 and 03:41): each live chunk's count is the pieces the
+/// green's content history values name it by, so none is released twice and none freed while a value names it. It
+/// holds of a history with no layered anchor (these works make and remove files, never overwrite one in place); a
+/// layer holds its overwritten bytes' chunk outside any value, so `copy_tests`'s staged overwrites hold every chunk's
+/// holds to what they were instead.
+pub(super) fn chunks_held_once(green: &Green) -> Result<(), String> {
+  let mut named: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+  for (_, history) in green.content_history.iter() {
+    for chunk in history
+      .iter()
+      .filter_map(|(_, value)| value.as_ref())
+      .flat_map(crate::history::Value::chunks_named)
+    {
+      let count = named.entry(chunk).or_insert(0);
+      *count = count.saturating_add(1);
+    }
+  }
+  let held = green.chunks.holds();
+  if held == named {
+    return Ok(());
+  }
+  Err(format!(
+    "chunk holds {held:?}, named by the values {named:?}"
+  ))
+}
+
+/// [`changes_unseen`] with the published content history read between the steps ([`content_history_held`]) and the
+/// chunk guard after each.
+pub(super) fn content_history_unseen(
+  green: &mut Green,
+  inc: &Increment,
+) -> Result<Option<u64>, String> {
+  let Judgment::Accepted(held) = green.judge(inc) else {
+    return Ok(None);
+  };
+  let before = content_history_held(green);
+  let mut staging = green.begin_staging(held);
+  loop {
+    let stepped = green.staging_step(&mut staging, &mut || true);
+    if content_history_held(green) != before {
+      return Err(format!(
+        "a reader saw the stage's content history at unit {}",
+        staging.units()
+      ));
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  let version = green.publish(staging).map(|(version, _)| version);
+  chunks_held_once(green)?;
+  Ok(version)
+}
+
+/// [`changes_given_up_after`] with the content history, the content map's live blocks and the chunk guard the guard:
+/// U7's blocks assertion, (6, 4) from (5, 4) before this unit.
+fn content_history_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let mut green = submitted_in_every_dimension(before);
+  let inc = work_in_every_dimension(&green, last, u64::MAX);
+  let Judgment::Accepted(held) = green.judge(&inc) else {
+    return Ok(true);
+  };
+  let (history, live) = (content_history_held(&green), green.content.live());
+  let mut staging = green.begin_staging(held);
+  let mut staged = false;
+  for _ in 0..turns {
+    if let StagingStep::Staged = green.staging_step(&mut staging, &mut || true) {
+      staged = true;
+      break;
+    }
+  }
+  green.abandon_staging(staging);
+  if content_history_held(&green) != history {
+    return Err(format!(
+      "a stage given up after {turns} turns left the content history changed"
+    ));
+  }
+  let left = green.content.live();
+  if left != live {
+    return Err(format!(
+      "a stage given up after {turns} turns left (blocks, nodes) {left:?}, from {live:?}"
+    ));
+  }
+  chunks_held_once(&green)?;
+  Ok(staged)
+}
+
 /// The works [`proptest`] generates: one to eight, each of one to four changes.
 fn works() -> impl Strategy<Value = Vec<Changes>> {
   prop::collection::vec(
@@ -910,6 +1043,43 @@ proptest! {
       let prefix = steps.get(..end).unwrap_or_default();
       for turns in 0u64.. {
         if content_map_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+
+  /// A-752 part 3c U8 (the content history staged with chunk-holding copies; main 01a20182's rulings of 2026-11-28
+  /// 01:29, 03:10 and 03:41). Do: as U2's, works that make and remove files among the rest, the published content
+  /// history read between every two steps. Expect it held exactly as before the stage (its every value, re-anchored
+  /// or superseded by none but the stage's copies), after each publish every version's bytes the serial twin's, and the
+  /// chunk guard after each publish. Red before: the commit appended, superseded and re-anchored the published values
+  /// in place.
+  #[test]
+  fn a_staged_verdicts_content_history_moves_only_at_its_publish(steps in works()) {
+    let (mut whole, mut staged) = (submitted_in_every_dimension(&[]), submitted_in_every_dimension(&[]));
+    for (id, changes) in (1u64..).zip(&steps) {
+      let inc = work_in_every_dimension(&whole, changes, id);
+      let (outcome, _) = whole.submit_resolved(&inc);
+      let version = content_history_unseen(&mut staged, &inc).map_err(TestCaseError::fail)?;
+      let accepted = match outcome {
+        super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+        _ => None,
+      };
+      prop_assert_eq!(version, accepted);
+      prop_assert_eq!(content_bytes_read(&staged), content_bytes_read(&whole));
+    }
+  }
+
+  /// A-752 part 3c U8 (a refusal at every turn, its last too). Expect the content history held exactly as before, the
+  /// content map's live blocks and nodes as before, and the chunk guard. Red before: U7's blocks, a stage given up
+  /// after `set_file`'s re-anchor leaving (6, 4) from (5, 4), its history naming the stage's block.
+  #[test]
+  fn a_stage_given_up_at_any_turn_leaves_the_content_history_and_its_chunks_as_they_were(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if content_history_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
           break;
         }
       }

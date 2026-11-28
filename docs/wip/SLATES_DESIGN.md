@@ -58409,6 +58409,22 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
     published history naming the stage's new block (blocks 6 live against 5); the refusal's blocks assertion is U8's
     red, and no production path drives a staged commit until U8 has landed (`repository::push`'s landing is wired to it
     after U8, not before).
+  - **U8, the content history forked with chunk-holding copies** (main's rulings of 01:29, 03:10, 03:41 and 04:01).
+    The content history (`Dim<history::Entries>`, A-920 arena unit 1) joins the stage's forks. Its every mutation goes
+    through `history::HistoryHolders` (`Dim::{get_mut_held, insert_held, remove_held, release_fork_held}`): a node a
+    fork copies holds every chunk its values name (`Value::hold`, a piece's first reference each), and the last node
+    holding entries freed gives their chunks back, so a stage's copies and the published values release each chunk
+    once. A staged commit re-anchors a changed file's history in full (`history::reanchor`'s `layered` false while a
+    stage runs): the layered route repoints the path's shared anchor chunk to the new block and layers it, which every
+    published value naming it would read. That closes U7's gap. Red first: a stage given up after any turn leaves the
+    content history, every value's bytes read through the chunks, the content map's live blocks and nodes and the
+    chunk guard as they were (red: a reader saw the stage's content history at unit 8, and a stage given up after 8
+    turns left it changed; U7's blocks, 6 against 5, back to the twin's); guards removed, each red: copies holding no
+    chunks (chunk 0 freed while a value named it: holds {1, 2, 3, 4} against named {0, 1, 2, 3, 4}), and a stage
+    allowed the layered route (`copy_tests`'s staged one-byte overwrites: a reader saw the stage's content history at
+    unit 9, the anchor repointed). The chunk recount holds of a history with no layered anchor; a layer holds its
+    overwritten bytes' chunk outside any value, so the overwrite tests hold every chunk's holds to what they were.
+    Removed: `Dim::get_mut` (unit 1's), its one caller now `get_mut_held`.
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
