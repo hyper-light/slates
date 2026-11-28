@@ -39516,7 +39516,20 @@ fn condemnation_of(daemon: &Daemon, member: HostId, before: Option<u64>) -> Opti
   let held = daemon.fleet_plane_belief(member).ok().flatten();
   let dead = held.is_some_and(|held| held.liveness == slates_cluster::membership::Liveness::Dead);
   let epoch = fencing_epoch_of(daemon, member);
-  (dead || epoch != before).then(|| format!("held {held:?}, epoch {before:?} -> {epoch:?}"))
+  (dead || epoch != before).then(|| {
+    // Where the death came from (A-921's warm restart, windows-11-arm 5 runs in 16): the detector's own condemnations
+    // of `member` (a death learned from gossip is none) and how long after its last answer, its report, and the fleet's
+    // belief, at the look that first saw it.
+    let detector = daemon.council_death_view().ok().and_then(|view| {
+      view
+        .into_iter()
+        .find(|(host, ..)| *host == member)
+        .map(|(_, fleet, detector, watched)| {
+          format!("fleet {fleet}, detector {detector}, watched {watched}")
+        })
+    });
+    format!("held {held:?}, epoch {before:?} -> {epoch:?}; {detector:?}")
+  })
 }
 
 /// What [`rekeyed_after_warm_restart`] watched: whether the node restarted and settled, its detection term, its own

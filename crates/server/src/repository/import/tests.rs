@@ -396,10 +396,7 @@ struct Served {
   rows: Vec<(Vec<u8>, Vec<u8>)>,
   /// What the index keeps for a stream: its head ([`slates_hg::index::HgIndex::rendered`]) and each log's chunk spans,
   /// by the log's name.
-  kept: (
-    Option<slates_hg::index::Rendered>,
-    Vec<(Vec<u8>, Vec<Option<slates_hg::index::ChunkSpan>>)>,
-  ),
+  kept: Kept,
   /// Each changeset's text, in revision order.
   texts: Vec<Vec<u8>>,
   /// The phase roots, each its phase and node.
@@ -493,14 +490,14 @@ fn served_held(
   )
 }
 
-/// What `index` keeps for a stream ([`Served::kept`]): its head and every log's chunk spans, revision by revision.
-fn kept_of(
-  index: &slates_hg::index::HgIndex,
-  content: &ContentStore,
-) -> (
+/// What an index keeps for a stream: its head and each log's chunk spans, revision by revision, by the log's name.
+type Kept = (
   Option<slates_hg::index::Rendered>,
   Vec<(Vec<u8>, Vec<Option<slates_hg::index::ChunkSpan>>)>,
-) {
+);
+
+/// What `index` keeps for a stream ([`Served::kept`]): its head and every log's chunk spans, revision by revision.
+fn kept_of(index: &slates_hg::index::HgIndex, content: &ContentStore) -> Kept {
   let files: Vec<Vec<u8>> = index.file_logs(content).map(<[u8]>::to_vec).collect();
   let logs = [
     (b"\0changelog".to_vec(), Log::Changelog),

@@ -971,8 +971,9 @@ async fn streamed_from_the_store(id: RepositoryId) -> (Vec<u8>, slates_hg::rende
   let mut out = Vec::new();
   loop {
     let (more, step) = crate::state::with_state(|state| {
-      let step = crate::vcs_store::hg_view::text_bytes_a_step(state);
-      streaming.set_step_bytes(step);
+      let copy = crate::vcs_store::hg_view::step_copy(state);
+      streaming.set_step_copy(copy);
+      let step = copy.bytes;
       let (content, store) = state.vcs_stores.mercurial(id).expect("the store");
       let more = streaming
         .step(

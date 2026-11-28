@@ -20,6 +20,9 @@ use slates_hg::serve::getbundle::Store;
 use slates_hg::serve::indexed::{Indexed, State};
 use slates_hg::{Admission, NULL_NODE, Node, node};
 use slates_mem::large::{LargeMapped, heap};
+
+/// Shape: the cache line a view's stream would charge a read in (Apple M-series' 128 bytes); these views never stream.
+const LINE: u64 = 128;
 use std::borrow::Cow;
 
 use slates_vcs::{ContentRefused, ContentStore, StoredWindow, WindowStorage};
@@ -440,7 +443,13 @@ fn a_views_manifest_read_is_one_text() {
     &index,
     &store,
     state,
-    (u64::MAX, &mut Admission::new(u64::MAX)),
+    (
+      slates_hg::render::StepCopy {
+        bytes: u64::MAX,
+        line: LINE,
+      },
+      &mut Admission::new(u64::MAX),
+    ),
   )
   .unwrap();
   let nodes: Vec<Node> = (0..index.len(&store, Log::Manifest))
@@ -505,7 +514,13 @@ fn a_views_read_of_a_let_go_manifest_allocates_no_text() {
     &index,
     &store,
     state,
-    (u64::MAX, &mut Admission::new(u64::MAX)),
+    (
+      slates_hg::render::StepCopy {
+        bytes: u64::MAX,
+        line: LINE,
+      },
+      &mut Admission::new(u64::MAX),
+    ),
   )
   .unwrap();
   let churn = |count: usize| {

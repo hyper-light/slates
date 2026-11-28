@@ -324,6 +324,15 @@ enum Walked {
 }
 
 impl Walked {
+  /// The walk's name of `log`.
+  fn of(log: Log<'_>) -> Walked {
+    match log {
+      Log::File(path) => Walked::File(path.to_vec()),
+      Log::Manifest => Walked::Manifest,
+      Log::Changelog => Walked::Changelog,
+    }
+  }
+
   /// The index's name of the log.
   fn log(&self) -> Log<'_> {
     match self {
@@ -689,9 +698,13 @@ pub struct Streaming {
   sizing: Vec<u32>,
   /// The steps taken in each stage since the last [`Streaming::take_tally`], and the content store's reads during them.
   tally: StageTally,
-  /// The bytes one step's gathering may touch ([`Streaming::set_step_bytes`]); none for a stream its caller does not
-  /// size, which gathers [`rows_a_step`] rows a step as before.
-  step_bytes: Option<u64>,
+  /// What one step may move ([`Streaming::set_step_copy`]); none for a stream its caller does not size, which gathers
+  /// [`rows_a_step`] rows a step as before.
+  step_copy: Option<StepCopy>,
+  /// Each gathering step's rows, reads, the tables its walks met and how it ended, for the tests' rule
+  /// (`a_streams_gathering_spends_each_step_and_reads_a_table_once`).
+  #[cfg(test)]
+  gather_trace: Vec<GatherTraced>,
   /// The base the last entry written names: for the changelog, its delta chain's start ([`CHANGELOG_HEADER`]).
   chain_base: u32,
 }
@@ -755,9 +768,137 @@ struct Gathering {
   at_numbers: Vec<EntryNumbers>,
   /// The kept chunk lengths of the log being gathered, so far.
   at_spans: Vec<u32>,
-  /// The length of the log being gathered, asked of the index once a log (a search of its runs, 10 to 20 reads of the
-  /// content store on a sealed history), not again at each step it resumes.
-  at_count: Option<u32>,
+  /// What the log being gathered's rows take so far, of [`Gathering::bytes`]: given back where it is left for the next
+  /// ask (the room full).
+  at_bytes: u64,
+}
+
+impl Gathering {
+  /// A gathering from `log`'s first revision.
+  fn at(log: Walked) -> Gathering {
+    Gathering {
+      logs: Vec::new(),
+      wanted: Vec::new(),
+      numbers: Vec::new(),
+      spans: Vec::new(),
+      bytes: 0,
+      at: (log, 0, Vec::new()),
+      at_numbers: Vec::new(),
+      at_spans: Vec::new(),
+      at_bytes: 0,
+    }
+  }
+
+  /// The log being gathered, gathered whole: `next` the log after it, which is gathered next where there is one.
+  fn log_ended(&mut self, next: Option<Walked>) {
+    let (log, _, nodes) = core::mem::replace(&mut self.at, (Walked::Changelog, 0, Vec::new()));
+    self.logs.push((log.stored_name(), nodes));
+    self.wanted.push(log);
+    self.numbers.push(core::mem::take(&mut self.at_numbers));
+    self
+      .spans
+      .push((core::mem::take(&mut self.at_spans), next.clone()));
+    self.at_bytes = 0;
+    if let Some(next) = next {
+      self.at = (next, 0, Vec::new());
+    }
+  }
+
+  /// Whether one more row of `row_bytes` would take the gathering past `room` with a log gathered before the one being
+  /// gathered (the first is gathered whole whatever its size, as one log's rows at least make an ask).
+  fn past_room(&self, (room, row_bytes): (u64, u64)) -> bool {
+    !self.logs.is_empty() && self.bytes.saturating_add(row_bytes) > room
+  }
+
+  /// The log being gathered left for the next ask, its rows given back.
+  fn left_for_next(&mut self) {
+    self.bytes = self.bytes.saturating_sub(self.at_bytes);
+    self.at_bytes = 0;
+    self.at.1 = 0;
+    self.at.2.clear();
+    self.at_numbers.clear();
+    self.at_spans.clear();
+  }
+
+  /// One row of the log being gathered taken: its numbers, its kept chunk length where one is, `row_bytes` its cost.
+  fn take(&mut self, (numbers, span): (EntryNumbers, Option<u32>), row_bytes: u64) {
+    self.at.2.push(numbers.node);
+    self.at_numbers.push(numbers);
+    self.at_spans.extend(span);
+    self.at.1 = self.at.1.saturating_add(1);
+    self.bytes = self.bytes.saturating_add(row_bytes);
+    self.at_bytes = self.at_bytes.saturating_add(row_bytes);
+  }
+}
+
+/// How a gathering's step ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GatherEnd {
+  /// Its budget spent: the gathering goes on at the next step.
+  Budget,
+  /// The room full: the logs gathered are asked for, the one being gathered left for the next ask.
+  Room,
+  /// Every log gathered: they are asked for.
+  Logs,
+}
+
+/// One gathering step as the tests' rule reads it: its rows and reads, the most reads its walks could make (one a
+/// table they met, `Index::tables_meeting`), how it ended, and what it was held to.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GatherTraced {
+  /// The rows walked.
+  pub(crate) rows: u64,
+  /// The content store's reads.
+  pub(crate) reads: u64,
+  /// The tables its walks met.
+  pub(crate) tables: u64,
+  /// How it ended.
+  pub(crate) ended: GatherEnd,
+}
+
+/// What a gathering's step has walked and what it is held to ([`Streaming::rows_held`]).
+struct GatherStep {
+  /// What it may move; none for a stream its caller does not size ([`rows_a_step`] rows).
+  copy: Option<StepCopy>,
+  /// The rows it may walk with no copy budget.
+  rows_most: u64,
+  /// The content store's reads when it began.
+  reads_at: u64,
+  /// The rows walked.
+  rows: u64,
+  /// What a row costs ([`row_charge`]).
+  row_bytes: u64,
+  /// The tables its walks met, for the tests' rule.
+  #[cfg(test)]
+  tables: u64,
+}
+
+impl GatherStep {
+  /// A step beginning now over `store`.
+  fn begin(store: &ContentStore, copy: Option<StepCopy>) -> GatherStep {
+    GatherStep {
+      copy,
+      rows_most: rows_a_step(store),
+      reads_at: store.reads(),
+      rows: 0,
+      row_bytes: row_charge(),
+      #[cfg(test)]
+      tables: 0,
+    }
+  }
+
+  /// Whether it has spent what it may (a row at least, so a budget below a row's cost still moves).
+  fn spent(&self, store: &ContentStore) -> bool {
+    self.rows > 0
+      && match self.copy {
+        Some(copy) => {
+          let reads = store.reads().saturating_sub(self.reads_at);
+          gather_spent(store, copy, (self.rows, reads)) >= copy.bytes
+        }
+        None => self.rows >= self.rows_most,
+      }
+  }
 }
 
 impl Default for Streaming {
@@ -781,7 +922,9 @@ impl Default for Streaming {
       sizing: Vec::new(),
       chain_base: 0,
       tally: StageTally::default(),
-      step_bytes: None,
+      step_copy: None,
+      #[cfg(test)]
+      gather_trace: Vec::new(),
     }
   }
 }
@@ -926,12 +1069,18 @@ impl Streaming {
     Stage::Head
   }
 
-  /// Sizes each step's gathering of rows by the bytes it may touch, `bytes` (a caller's copy budget: the daemon's
-  /// `copy_slice_bytes`, the machine's measured memcpy rate over the copy share of its step quantum, as
-  /// `getbundle::Store::text_bytes_a_step` names it): a step's walk of the index stops once its reads (a content window
-  /// each) and its rows (their stored form each) reach it, or the room does, whichever first ([`gather_spent`]).
-  pub fn set_step_bytes(&mut self, bytes: u64) {
-    self.step_bytes = Some(bytes);
+  /// Sizes each step by what it may move, `copy` (a caller's copy budget: the daemon's `copy_slice_bytes`, the machine's
+  /// measured memcpy rate over the copy share of its step quantum, as `getbundle::Store::text_bytes_a_step` names it,
+  /// and the machine's cache line): a step's walk of the index stops once its reads and its rows reach it, or the room
+  /// does, whichever first ([`gather_spent`]); a split log's data a run of chunks within it.
+  pub fn set_step_copy(&mut self, copy: StepCopy) {
+    self.step_copy = Some(copy);
+  }
+
+  /// Each gathering step since the last take ([`GatherTraced`]), for the tests' rule.
+  #[cfg(test)]
+  pub(crate) fn take_gather_trace(&mut self) -> Vec<GatherTraced> {
+    core::mem::take(&mut self.gather_trace)
   }
 
   /// The steps taken in each stage since the last take, and the content store's reads during them, given back and
@@ -956,105 +1105,24 @@ impl Streaming {
         }
         self.held.pop_front();
       }
-      self.gathering = Some(Gathering {
-        logs: Vec::new(),
-        wanted: Vec::new(),
-        numbers: Vec::new(),
-        spans: Vec::new(),
-        bytes: 0,
-        at: (log.clone(), 0, Vec::new()),
-        at_numbers: Vec::new(),
-        at_spans: Vec::new(),
-        at_count: None,
-      });
+      self.gathering = Some(Gathering::at(log.clone()));
     }
-    // A held row is its stored form, its index entry and its kept chunk length.
-    let row_bytes = to_u64(
-      core::mem::size_of::<StoredRevision>()
-        .saturating_add(core::mem::size_of::<EntryNumbers>())
-        .saturating_add(core::mem::size_of::<u32>()),
-    );
-    let mut budget = rows_a_step(store);
-    let (step_bytes, reads_at) = (self.step_bytes, store.reads());
-    let mut walked = 0_u64;
-    let Some(gathering) = self.gathering.as_mut() else {
-      return Ok(false);
+    let mut step = GatherStep::begin(store, self.step_copy);
+    let room = self.room_hint;
+    let ended = match self.gathering.as_mut() {
+      Some(gathering) => gather(gathering, (index, store), (&mut step, room))?,
+      None => GatherEnd::Logs,
     };
-    loop {
-      let (at, rev, nodes) = &mut gathering.at;
-      let count = *gathering
-        .at_count
-        .get_or_insert_with(|| index.len(store, at.log()));
-      if *rev == 0 {
-        let cost = u64::from(count).saturating_mul(row_bytes);
-        if !gathering.logs.is_empty() && gathering.bytes.saturating_add(cost) > self.room_hint {
-          break;
-        }
-        gathering.bytes = gathering.bytes.saturating_add(cost);
-        let rows = usize::try_from(count).map_err(|_| Refused::TooLong)?;
-        nodes
-          .try_reserve_exact(rows)
-          .map_err(|_| Refused::TooLong)?;
-        gathering
-          .at_numbers
-          .try_reserve_exact(rows)
-          .map_err(|_| Refused::TooLong)?;
-        gathering
-          .at_spans
-          .try_reserve_exact(rows)
-          .map_err(|_| Refused::TooLong)?;
-      }
-      // One range walk of the log from where the gathering stands, a row a step after its search, where a search a row
-      // read the index's runs each time (goal 93, hg's whole-history gap).
-      let mut walk = index.numbers_from(store, at.log(), *rev);
-      // Its kept chunk lengths beside, one range walk of its sized rows (goal 93, cut 2); none for a log never sized,
-      // which the send refuses stale and a recount sizes.
-      let mut spans = index.spans_from(store, at.log(), *rev);
-      while *rev < count {
-        let spent = step_bytes.map(|bytes| {
-          gather_spent(store, (walked, store.reads().saturating_sub(reads_at))) >= bytes
-        });
-        // One row a step at least, so a budget below a row's cost still moves.
-        if walked > 0 && spent.unwrap_or(budget == 0) {
-          return Ok(false);
-        }
-        let numbers = walk
-          .next()
-          .flatten()
-          .filter(|numbers| numbers.rev == *rev)
-          .ok_or_else(|| Refused::Unreadable {
-            log: unreadable_name(at),
-            rev: *rev,
-          })?;
-        nodes.push(numbers.node);
-        gathering.at_numbers.push(numbers);
-        gathering.at_spans.extend(
-          spans
-            .as_mut()
-            .and_then(|spans| spans.next().flatten())
-            .map(|span| span.len),
-        );
-        *rev = rev.saturating_add(1);
-        budget = budget.saturating_sub(1);
-        walked = walked.saturating_add(1);
-      }
-      let next = next_log(at, index, store);
-      let done = core::mem::take(nodes);
-      gathering.logs.push((at.stored_name(), done));
-      gathering.wanted.push(at.clone());
-      gathering
-        .numbers
-        .push(core::mem::take(&mut gathering.at_numbers));
-      gathering
-        .spans
-        .push((core::mem::take(&mut gathering.at_spans), next.clone()));
-      gathering.at_count = None;
-      match next {
-        Some(next) => gathering.at = (next, 0, Vec::new()),
-        None => break,
-      }
-    }
-    if let Some(gathering) = self.gathering.take() {
+    #[cfg(test)]
+    self.gather_trace.push(GatherTraced {
+      rows: step.rows,
+      reads: store.reads().saturating_sub(step.reads_at),
+      tables: step.tables,
+      ended,
+    });
+    if ended != GatherEnd::Budget
+      && let Some(gathering) = self.gathering.take()
+    {
       self.want = Some(Want::Rows {
         logs: gathering.logs,
       });
@@ -1105,7 +1173,8 @@ impl Streaming {
       return Ok(Stage::Head);
     }
     let chunks = core::mem::take(&mut self.sizing);
-    let next = next_log(&log, index, store);
+    // The next log as the gathering's walk found it, with no search.
+    let next = self.held.front().and_then(|held| held.next.clone());
     self.sized.push_back(SizedLog { log, chunks });
     Ok(next.map_or(Stage::Head, |next| Stage::Counting(next, 0)))
   }
@@ -1447,7 +1516,7 @@ impl Streaming {
   /// A split log's data file's next chunks, a run a step (goal 93; main 01a20182's reading of 2026-11-27 19:39 and its
   /// order of 20:30): each its stored bytes (asked for a batch at a time) as a stream sends them, held to the length the
   /// index kept; the run ends at the log's last chunk (the next log's index file next), at a chunk the store must be
-  /// asked for, or before a chunk that would take its bytes past the step's copy budget ([`Streaming::set_step_bytes`],
+  /// asked for, or before a chunk that would take its bytes past the step's copy budget ([`Streaming::set_step_copy`],
   /// the one a push's chunking and the gathering are held to) or the room, its first chunk written whatever. Before: a
   /// chunk a step (hg-src at 343703bd7: 139,403 steps for 73.8 MB, 529 bytes and about 30 µs a step).
   fn data_chunk(
@@ -1457,7 +1526,7 @@ impl Streaming {
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
     let (seq, count) = self.front_log()?;
-    let budget = self.step_bytes.unwrap_or(u64::MAX);
+    let budget = self.step_copy.map_or(u64::MAX, |copy| copy.bytes);
     let (mut rev, mut written) = (rev, 0_u64);
     while rev < count {
       match self.data_one((&log, seq, rev), (written, budget), admission, out)? {
@@ -1538,9 +1607,9 @@ impl Recount {
     Recount::default()
   }
 
-  /// Sizes each step's gathering of rows by the bytes it may touch ([`Streaming::set_step_bytes`]).
-  pub fn set_step_bytes(&mut self, bytes: u64) {
-    self.walk.set_step_bytes(bytes);
+  /// Sizes each step by what it may move ([`Streaming::set_step_copy`]).
+  pub fn set_step_copy(&mut self, copy: StepCopy) {
+    self.walk.set_step_copy(copy);
   }
 
   /// One step of the count over `index`, what it holds charged to `admission`: whether more follow. A step that needs
@@ -1671,19 +1740,190 @@ fn first_log(index: &HgIndex, store: &ContentStore) -> Option<Walked> {
   }
 }
 
-/// Derived: the bytes a step's gathering has touched, `rows` walked and `reads` of the content store made: a content
-/// window a read (`ContentStore::window`, what one read may touch at most) and its stored form and index entry a row,
-/// the budget [`Streaming::set_step_bytes`] holds it to. A walk's start costs a table of each run its range meets, so
-/// stopping by bytes touched, not by rows, makes the restarts of a long log's walk as few as the budget allows whatever
-/// the index's layout (goal 93, hg's whole-history gap; main 01a20182's ruling of 2026-11-27 17:57: a 300-row log
-/// restarted about six times at a row bound, a table in each of 48 runs each time).
-fn gather_spent(store: &ContentStore, (rows, reads): (u64, u64)) -> u64 {
-  let row_bytes = to_u64(
-    core::mem::size_of::<StoredRevision>().saturating_add(core::mem::size_of::<EntryNumbers>()),
-  );
+/// The rows of `gathering`'s logs walked from where it stands, the log rows walked on past each log's last into the
+/// next one's ([`HgIndex::numbers_onward`]: no search for the next log, main 01a20182's ruling of 2026-11-27 22:13),
+/// until `step` is spent, the room `room` is full, or every log is gathered; the changelog, walked alone, after the rest.
+fn gather(
+  gathering: &mut Gathering,
+  (index, store): (&HgIndex, &ContentStore),
+  (step, room): (&mut GatherStep, u64),
+) -> Result<GatherEnd, Refused> {
+  loop {
+    let (log, rev) = (gathering.at.0.clone(), gathering.at.1);
+    #[cfg(test)]
+    {
+      step.tables = step
+        .tables
+        .saturating_add(index.numbers_onward_tables(log.log(), rev));
+    }
+    let mut walk = index.numbers_onward(store, log.log(), rev);
+    if let Some(ended) = gather_walk(gathering, (index, store), (&mut walk, step, room))? {
+      return Ok(ended);
+    }
+    // The walk's logs gathered and the changelog next: a walk of its own.
+  }
+}
+
+/// One walk of [`gather`]'s: what ended the step, or none where the walk's logs are gathered and the changelog is next.
+fn gather_walk<'s>(
+  gathering: &mut Gathering,
+  (index, store): (&'s HgIndex, &'s ContentStore),
+  (walk, step, room): (
+    &mut impl Iterator<Item = Option<(Log<'s>, EntryNumbers)>>,
+    &mut GatherStep,
+    u64,
+  ),
+) -> Result<Option<GatherEnd>, Refused> {
+  let mut spans = spans_walk(index, store, (&gathering.at.0, gathering.at.1), step);
+  loop {
+    if step.spent(store) {
+      return Ok(Some(GatherEnd::Budget));
+    }
+    let Some(row) = walk.next() else {
+      // Past the walk's last log: the changelog after the file logs and the manifest log, nothing after it.
+      let next = (gathering.at.0 != Walked::Changelog).then_some(Walked::Changelog);
+      let last = next.is_none();
+      gathering.log_ended(next);
+      return Ok(last.then_some(GatherEnd::Logs));
+    };
+    let (row_log, numbers) = row.ok_or_else(|| unreadable_at(gathering))?;
+    if row_log != gathering.at.0.log() {
+      if numbers.rev != 0 {
+        return Err(unreadable_at(gathering));
+      }
+      let next = Walked::of(row_log);
+      gathering.log_ended(Some(next.clone()));
+      spans = spans_walk(index, store, (&next, 0), step);
+    } else if numbers.rev != gathering.at.1 {
+      return Err(unreadable_at(gathering));
+    }
+    if gathering.past_room((room, step.row_bytes)) {
+      gathering.left_for_next();
+      return Ok(Some(GatherEnd::Room));
+    }
+    let span = spans
+      .as_mut()
+      .and_then(|spans| spans.next().flatten())
+      .map(|span| span.len);
+    gathering.take((numbers, span), step.row_bytes);
+    step.rows = step.rows.saturating_add(1);
+  }
+}
+
+/// `log`'s kept chunk lengths from `rev` on, one range walk of its sized rows (goal 93, cut 2; none for a log never
+/// sized, which the send refuses stale and a recount sizes), noted in `step` for the tests' rule.
+fn spans_walk<'s>(
+  index: &'s HgIndex,
+  store: &'s ContentStore,
+  (log, rev): (&Walked, u32),
+  step: &mut GatherStep,
+) -> Option<impl Iterator<Item = Option<crate::index::ChunkSpan>> + use<'s>> {
+  #[cfg(test)]
+  {
+    // The count looks the log's number up again: its own read, which the step never made, is not the step's.
+    let before = store.reads();
+    step.tables = step
+      .tables
+      .saturating_add(index.spans_tables(store, log.log(), rev));
+    step.reads_at = step
+      .reads_at
+      .saturating_add(store.reads().saturating_sub(before));
+  }
+  #[cfg(not(test))]
+  let _ = step;
+  index.spans_from(store, log.log(), rev)
+}
+
+/// The refusal of a row of the log `gathering` is gathering that does not decode, or is not its next.
+fn unreadable_at(gathering: &Gathering) -> Refused {
+  Refused::Unreadable {
+    log: unreadable_name(&gathering.at.0),
+    rev: gathering.at.1,
+  }
+}
+
+/// What one step may move (goal 93; main 01a20182's rulings of 2026-11-27 17:57 and 22:13): its copy budget's bytes (the
+/// daemon's `copy_slice_bytes`) and the machine's cache line, which a read of the content store is charged in
+/// ([`read_charge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepCopy {
+  /// The bytes.
+  pub bytes: u64,
+  /// The machine's cache line, in bytes (`slates_machine`'s facts).
+  pub line: u64,
+}
+
+/// Format: the branching of std's B-tree (`alloc::collections::btree::node`'s `B`), whose nodes hold `2B - 1` keys: the
+/// content store's maps' (`ContentStore::get` looks a table up in two).
+const BTREE_B: u64 = 6;
+
+/// Format: the keys a node of std's B-tree holds at most (`2B - 1`, [`BTREE_B`]).
+const BTREE_CAPACITY: u64 = 2 * BTREE_B - 1;
+
+/// Derived (main 01a20182's ruling of 2026-11-27 22:13): what one read of the content store moves, in `line`-byte cache
+/// lines, as bytes. A read lends a table in place, its window never copied (`ContentStore::get`, then
+/// `TableView::open_known`, which checks the frame alone), so its cost is what it touches: the table's frame
+/// (`TABLE_FRAME_BYTES` over a line, rounded up); two lines a probe of a positioned walk's binary search over the
+/// offsets (the offset word's and its key's), ⌈log2 window⌉ probes bounding a table of a window's rows; and the store's
+/// own lookup of the table, two B-tree maps (`objects`, then `entries`) each its height over the contents held a level,
+/// a node's keys over a line and the node's own line a level. At a 256 KiB window and a 128-byte line, about 4.6 KB plus
+/// the lookup, against the window's 256 KiB it was charged before (hg-src's index stage a step a row: 238,557 steps).
+pub(crate) fn read_charge(store: &ContentStore, line: u64) -> u64 {
+  let line = line.max(1);
+  let frame = to_u64(slates_vcs::table::TABLE_FRAME_BYTES).div_ceil(line);
+  let probes = ceil_log2(to_u64(store.window())).saturating_mul(2);
+  let node = BTREE_CAPACITY
+    .saturating_mul(to_u64(core::mem::size_of::<slates_vcs::ContentId>()))
+    .div_ceil(line)
+    .saturating_add(1);
+  let lookup = btree_height(to_u64(store.len()))
+    .saturating_mul(node)
+    .saturating_mul(2);
+  frame
+    .saturating_add(probes)
+    .saturating_add(lookup)
+    .saturating_mul(line)
+}
+
+/// ⌈log2 `count`⌉, one at least: the probes a binary search over `count` items makes.
+fn ceil_log2(count: u64) -> u64 {
+  count
+    .max(2)
+    .checked_next_power_of_two()
+    .map_or(u64::from(u64::BITS), |power| {
+      u64::from(power.trailing_zeros())
+    })
+}
+
+/// The levels of a std B-tree holding `count` keys at most ([`BTREE_B`]-way at least below its root), one at least.
+fn btree_height(count: u64) -> u64 {
+  let (mut levels, mut reach) = (1_u64, BTREE_CAPACITY);
+  while reach < count && levels < u64::from(u64::BITS) {
+    reach = reach.saturating_mul(BTREE_B);
+    levels = levels.saturating_add(1);
+  }
+  levels
+}
+
+/// Derived: what a row a step's gathering holds costs: its stored form, its index entry and its kept chunk length, the
+/// bytes written to hold it.
+pub(crate) fn row_charge() -> u64 {
+  to_u64(
+    core::mem::size_of::<StoredRevision>()
+      .saturating_add(core::mem::size_of::<EntryNumbers>())
+      .saturating_add(core::mem::size_of::<u32>()),
+  )
+}
+
+/// Derived: what a step's gathering has moved, `rows` walked and `reads` of the content store made: a row its
+/// [`row_charge`], a read its [`read_charge`] in `copy`'s cache lines, the budget [`Streaming::set_step_copy`] holds it
+/// to. A walk's start costs a table of each run its range meets, so stopping by what is moved, not by rows, makes the
+/// restarts of a long log's walk as few as the budget allows whatever the index's layout (goal 93, hg's whole-history
+/// gap; main 01a20182's rulings of 2026-11-27 17:57 and 22:13).
+fn gather_spent(store: &ContentStore, copy: StepCopy, (rows, reads): (u64, u64)) -> u64 {
   rows
-    .saturating_mul(row_bytes)
-    .saturating_add(reads.saturating_mul(to_u64(store.window())))
+    .saturating_mul(row_charge())
+    .saturating_add(reads.saturating_mul(read_charge(store, copy.line)))
 }
 
 /// Derived: the rows a stream's step reads to gather an ask ([`Streaming::rows_held`]): a content window's worth of

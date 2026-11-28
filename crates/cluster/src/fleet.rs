@@ -294,21 +294,26 @@ impl FleetNode {
   /// leader, so the view still drives the configuration through the same path (R8). It never removes this
   /// host — the owner is never retired.
   ///
-  /// A member becoming alive — a join, a refutation of a suspicion or a death, a rejoin — is logged with the
-  /// call site that folded it (`#[track_caller]` through the folds below): a handful per node's life, and the
-  /// evidence a revival the design does not expect is traced by (GAPS 2026-09-29: retired peers' manifest seed
-  /// ids held alive).
+  /// A member becoming alive — a join, a refutation of a suspicion or a death, a rejoin — or dead is logged with
+  /// the call site that folded it (`#[track_caller]` through the folds below): a handful per node's life, and the
+  /// evidence a revival or a death the design does not expect is traced by (GAPS 2026-09-29: retired peers' manifest
+  /// seed ids held alive; 2026-11-28, A-921's warm-restarted node held dead at its old incarnation after its settle).
   #[track_caller]
   pub fn observe(&mut self, subject: HostId, update: MemberState) -> bool {
     let prior = self.membership.state(subject);
     let changed = self.membership.apply(subject, update).is_some();
     if changed
       && let Some(state) = self.membership.state(subject)
-      && prior.is_none_or(|prior| prior.liveness != Liveness::Alive)
-      && state.liveness == Liveness::Alive
+      && prior.is_none_or(|prior| prior.liveness != state.liveness)
+      && state.liveness != Liveness::Suspect
     {
+      let now = if state.liveness == Liveness::Alive {
+        "alive"
+      } else {
+        "dead"
+      };
       slates_machine::log_line!(
-        "slates-cluster: fleet: {:?} holds {subject:?} alive: {prior:?} -> {state:?}, folded at {}",
+        "slates-cluster: fleet: {:?} holds {subject:?} {now}: {prior:?} -> {state:?}, folded at {}",
         self.host,
         std::panic::Location::caller()
       );

@@ -878,20 +878,57 @@ pub fn entry_header(
 /// header and compressed data read a window at a time, nothing inflated. Refused as [`read`] refuses a piece it cannot
 /// read, or where the pack ends first.
 pub fn raw_crc(store: &dyn PackSource, place: InPack, len: u64) -> Result<u32, PackedRefused> {
-  let mut hasher = crc32fast::Hasher::new();
-  let mut left = len;
-  each_window_from(store, place, |piece| {
-    let take = usize::try_from(left).unwrap_or(usize::MAX).min(piece.len());
-    hasher.update(piece.get(..take).unwrap_or_default());
-    left = left.saturating_sub(u64::try_from(take).unwrap_or(u64::MAX));
-    left > 0
-  })?;
-  if left > 0 {
-    return Err(PackedRefused::Unread {
-      at: place.offset.saturating_add(len.saturating_sub(left)),
-    });
+  RawCrc::default().hash(store, place, len)
+}
+
+/// A raw entry's CRC32 taken as far as its windows are held ([`raw_crc`] across turns; A-864 piece 3, the clone's
+/// window peak of 2026-11-27): what it has hashed and how far into the entry, so a read that meets a let-go window
+/// keeps what it hashed and goes on from there once the window is brought back, never from the entry's start, and the
+/// windows it passed may be let go behind it. A check from the start each time held every window of the entry it had
+/// brought back: 12 of a 3 MiB blob's 13.
+#[derive(Clone, Debug, Default)]
+pub struct RawCrc {
+  hasher: crc32fast::Hasher,
+  at: u64,
+}
+
+impl RawCrc {
+  /// How far into the entry it has hashed.
+  pub fn at(&self) -> u64 {
+    self.at
   }
-  Ok(hasher.finalize())
+
+  /// Hashes on the `len` raw bytes of the entry at `place` from where it stopped: their CRC32 once every one is hashed.
+  /// Refused where a window is let go or unread, as [`raw_crc`] is, what it hashed before that window kept.
+  pub fn hash(
+    &mut self,
+    store: &dyn PackSource,
+    place: InPack,
+    len: u64,
+  ) -> Result<u32, PackedRefused> {
+    let from = InPack {
+      offset: place.offset.saturating_add(self.at),
+      ..place
+    };
+    let mut left = len.saturating_sub(self.at);
+    let (hasher, at) = (&mut self.hasher, &mut self.at);
+    if left > 0 {
+      each_window_from(store, from, |piece| {
+        let take = usize::try_from(left).unwrap_or(usize::MAX).min(piece.len());
+        hasher.update(piece.get(..take).unwrap_or_default());
+        let took = u64::try_from(take).unwrap_or(u64::MAX);
+        *at = at.saturating_add(took);
+        left = left.saturating_sub(took);
+        left > 0
+      })?;
+    }
+    if left > 0 {
+      return Err(PackedRefused::Unread {
+        at: place.offset.saturating_add(self.at),
+      });
+    }
+    Ok(self.hasher.clone().finalize())
+  }
 }
 
 /// The entry at `place` in a held pack as it lies there ([`RawEntry`], A-859): its header read, and its data inflated
