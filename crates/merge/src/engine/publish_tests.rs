@@ -5,7 +5,7 @@
 
 use proptest::prelude::*;
 
-use super::fold_tests::PATHS;
+use super::fold_tests::{PATHS, change};
 use super::replaced_node_tests::Work;
 use super::{Green, Increment, Judgment, OpKind, StagingStep};
 
@@ -123,6 +123,118 @@ fn given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
   Ok(false)
 }
 
+/// `changes` as an increment based at `green`'s head, numbered `id`, changing its paths in every way but their bytes'
+/// edits ([`change`]: a file made or removed, a mode, an attribute set or removed, a symbolic or hard link, a FIFO, a
+/// directory made or removed).
+fn work_in_every_dimension(green: &Green, (changes, mark): &Changes, id: u64) -> Increment {
+  let mut work = Work::default();
+  for (index, how) in changes {
+    work = change(work, PATHS[*index], *how, *mark);
+  }
+  work.at(green.head(), id)
+}
+
+/// Every value every reader reads at each version up to the head but a file's bytes (the content is staged by a later
+/// unit): each path's IPC node, directory, mode, symbolic and hard link and attribute, and the head.
+fn values_read(green: &Green) -> String {
+  let head = green.head();
+  let mut read = format!("head {head}\n");
+  for version in 0..=head {
+    for path in PATHS {
+      read.push_str(&format!(
+        "{version} {path} {:?} {} {:?} {:?} {:?} {:?}\n",
+        green.special_at(path, version),
+        green.dir_at(path, version),
+        green.mode_at(path, version),
+        green.symlink_at(path, version),
+        green.hardlink_at(path, version),
+        green.xattr_at(path, "user.k", version),
+      ));
+    }
+  }
+  read
+}
+
+/// Every value history as it is held, the head and the increments accepted: what a refusal leaves as it was.
+fn histories_as_they_were(green: &Green) -> String {
+  format!(
+    "{} {:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
+    green.head(),
+    green.mode_history,
+    green.special_history,
+    green.dir_history,
+    green.symlink_history,
+    green.hardlink_history,
+    green.xattr_history,
+    green.accepted
+  )
+}
+
+/// A green given every path and then `works` whole, each changing its paths in every dimension.
+fn submitted_in_every_dimension(works: &[Changes]) -> Green {
+  let mut green = Green::new();
+  let _ = green.submit_resolved(&made().at(0, 0));
+  for (id, changes) in (1u64..).zip(works) {
+    let inc = work_in_every_dimension(&green, changes, id);
+    let _ = green.submit_resolved(&inc);
+  }
+  green
+}
+
+/// Stages `inc`'s accepted verdict on `green` one unit a step, every value read and the head after each step held to
+/// before ([`values_read`]), then publishes it: its version, none for any other judgment.
+fn staged_unseen_in_every_dimension(
+  green: &mut Green,
+  inc: &Increment,
+) -> Result<Option<u64>, String> {
+  let Judgment::Accepted(held) = green.judge(inc) else {
+    return Ok(None);
+  };
+  let before = values_read(green);
+  let mut staging = green.begin_staging(held);
+  loop {
+    let stepped = green.staging_step(&mut staging, &mut || true);
+    if values_read(green) != before {
+      return Err(format!(
+        "a reader saw the stage at unit {}",
+        staging.units()
+      ));
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  Ok(green.publish(staging).map(|(version, _)| version))
+}
+
+/// [`given_up_after`] over works in every dimension, every value history held to as it was.
+fn given_up_in_every_dimension_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let mut green = submitted_in_every_dimension(before);
+  let inc = work_in_every_dimension(&green, last, u64::MAX);
+  let Judgment::Accepted(held) = green.judge(&inc) else {
+    return Ok(true);
+  };
+  let was = histories_as_they_were(&green);
+  let mut staging = green.begin_staging(held);
+  for _ in 0..turns {
+    if let StagingStep::Staged = green.staging_step(&mut staging, &mut || true) {
+      return Ok(true);
+    }
+  }
+  green.abandon_staging(staging);
+  if histories_as_they_were(&green) != was {
+    return Err(format!(
+      "a stage given up after {turns} turns left a value history changed"
+    ));
+  }
+  Ok(false)
+}
+
 /// The works [`proptest`] generates: one to eight, each of one to four changes.
 fn works() -> impl Strategy<Value = Vec<Changes>> {
   prop::collection::vec(
@@ -168,6 +280,40 @@ proptest! {
       let prefix = steps.get(..end).unwrap_or_default();
       for turns in 0u64.. {
         if given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+
+  /// A-752 part 3c U2 (the reader at v). Do: as U1's, with works changing paths in every dimension but their bytes.
+  /// Expect between every two steps the head and every value read up to it, IPC nodes, directories, modes, symbolic and
+  /// hard links and attributes, as before the stage; and the same version for every accepted work as the twin's.
+  #[test]
+  fn a_staged_verdicts_values_move_only_at_its_publish(steps in works()) {
+    let (mut whole, mut staged) = (submitted_in_every_dimension(&[]), submitted_in_every_dimension(&[]));
+    for (id, changes) in (1u64..).zip(&steps) {
+      let inc = work_in_every_dimension(&whole, changes, id);
+      let (outcome, _) = whole.submit_resolved(&inc);
+      let version = staged_unseen_in_every_dimension(&mut staged, &inc).map_err(TestCaseError::fail)?;
+      let accepted = match outcome {
+        super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+        _ => None,
+      };
+      prop_assert_eq!(version, accepted);
+      prop_assert_eq!(values_read(&staged), values_read(&whole));
+    }
+  }
+
+  /// A-752 part 3c U2 (a refusal at every turn). Do: as U1's, with works changing paths in every dimension. Expect
+  /// after every refusal every value history held exactly as before, the head and the accepted increments unchanged.
+  /// Red before: a refusal took the mode history's entries back alone, the others' kept.
+  #[test]
+  fn a_stage_given_up_at_any_turn_takes_every_value_historys_entries_back(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if given_up_in_every_dimension_after(prefix, turns).map_err(TestCaseError::fail)? {
           break;
         }
       }

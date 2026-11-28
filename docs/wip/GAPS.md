@@ -4273,8 +4273,8 @@
 > push's `preparing` still holds, an earlier command's or none: `push.build.turns` one more, and an earlier command's
 > last-turn units and quanta counted again. Part 3c (the engine's commit staged and published whole, main's rulings of
 > 2026-11-28 00:42 to 01:42): U0 BUILT, every read names its version; U1 BUILT, the head bump and `accepted` at the
-> publish, last, and the mode history appended in place and taken back at a refusal (design's part 3c); owed: the
-> other histories, the change index, the
+> publish, last, and the mode history appended in place and taken back at a refusal; U2 BUILT, every value history
+> alike (design's part 3c); owed: the change index, the
 > identity, the current-state Dims (w-shared: `file_removed` and the `*_changed` maps; w-svn: deltas, the identity's
 > sets, `latest_change`, `last_changed` and the change index as arena conversions, keeping U0's bounded reads), and the
 > content history after A-920 arena unit 1. Found by reading (2026-11-28, not worked): `file_removed` keeps only a

@@ -6437,6 +6437,7 @@ impl Green {
 
   /// Keep the superseded IPC value for pinned readers before setting the new value.
   fn commit_special(&mut self, path: String, node: SpecialNode, version: u64) {
+    self.mark_special(&path);
     let at = self.seed_of(&self.special_history, &path, &path, version);
     seed(
       &mut self.special_history,
@@ -6461,6 +6462,7 @@ impl Green {
   fn remove_special(&mut self, path: String, version: u64) {
     self.file_removed.insert(path.clone(), version);
     // The inode's own key is marked by its effect; its mode and attributes go with it and are marked here.
+    self.mark_special(&path);
     let at = self.seed_of(&self.special_history, &path, &path, version);
     seed(
       &mut self.special_history,
@@ -6514,6 +6516,7 @@ impl Green {
     for (name, value) in attributes {
       self.xattrs.remove(path, &name);
       let key = (path.to_owned(), name);
+      self.mark_xattr(&key);
       let at = self.seed_of(&self.xattr_history, &key, path, version);
       seed(&mut self.xattr_history, &key, Some(Some(value)), at);
       self
@@ -6631,14 +6634,9 @@ impl Green {
   /// Notes, while a verdict is staged, where `path`'s mode history stood before the stage first touched it (A-752 part
   /// 3c U1): what a refusal truncates it back to.
   fn mark_mode(&mut self, path: &str) {
-    let Some(marks) = self.stage_marks.as_mut() else {
-      return;
-    };
-    if marks.modes.contains_key(path) {
-      return;
+    if let Some(marks) = self.stage_marks.as_mut() {
+      staging::note(&mut marks.modes, &self.mode_history, path.to_owned());
     }
-    let held = self.mode_history.get(path).map(Vec::len);
-    marks.modes.insert(path.to_owned(), held);
   }
 
   fn commit_step(&mut self, run: &mut CommitRun, spent: &mut dyn FnMut() -> bool) -> bool {
@@ -6895,6 +6893,7 @@ impl Green {
       // 0 by the one history rule, A-534; since a copy, A-586), then its change.
       Effect::MakeDir(path) => {
         let stood = self.dirs.contains_key(&path).then_some(true);
+        self.mark_dir(&path);
         let at = self.seed_of(&self.dir_history, &path, &path, version);
         seed(&mut self.dir_history, &path, stood, at);
         self.dirs.insert(&path, ());
@@ -6908,6 +6907,7 @@ impl Green {
         self.file_removed.insert(path.clone(), version);
         staged.emptied.push(path.clone());
         let stood = self.dirs.contains_key(&path).then_some(true);
+        self.mark_dir(&path);
         let at = self.seed_of(&self.dir_history, &path, &path, version);
         seed(&mut self.dir_history, &path, stood, at);
         self.dirs.remove(&path);
@@ -6955,6 +6955,7 @@ impl Green {
 
   /// Sets or removes (`None`) a symbolic link at `version`, its history recording the change.
   fn set_symlink(&mut self, path: String, target: Option<String>, version: u64) {
+    self.mark_symlink(&path);
     let at = self.seed_of(&self.symlink_history, &path, &path, version);
     seed(
       &mut self.symlink_history,
@@ -6981,6 +6982,7 @@ impl Green {
   /// Sets or removes (`None`) a hard link at `version`, the reverse map of links with it and its history recording the
   /// change.
   fn set_hardlink(&mut self, path: String, target: Option<String>, version: u64) {
+    self.mark_hardlink(&path);
     let at = self.seed_of(&self.hardlink_history, &path, &path, version);
     seed(
       &mut self.hardlink_history,
@@ -7008,6 +7010,7 @@ impl Green {
       None => self.xattrs.remove(&key.0, &key.1),
     }
     .map(Some);
+    self.mark_xattr(&key);
     let at = self.seed_of(&self.xattr_history, &key, &key.0, version);
     seed(&mut self.xattr_history, &key, before, at);
     self.xattr_changed.insert(key.clone(), version);

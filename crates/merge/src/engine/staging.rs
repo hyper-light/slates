@@ -2,11 +2,11 @@
 //! to 01:42): its commit's changes made where no reader at the head sees them, and published in one step at its end,
 //! so a reader never waits on a commit's turns and a commit refused part-way publishes nothing.
 //!
-//! **Built so far (U1).** Every read names its version (U0), so what the commit appends at its own version is above
+//! **Built so far (U1, U2).** Every read names its version (U0), so what the commit appends at its own version is above
 //! the head until the publish moves the head to it, last (`Green::publish_run`: its delta pushed and its increment
-//! accepted). The mode history is appended in place and taken back at a refusal: where each path's history stood
-//! before the stage first touched it is marked ([`Marks`]), and a refusal truncates it there. **Owed (later units):**
-//! the other histories and the change index taken back alike, the identity's changes and `change_one`'s `last` held to
+//! accepted). The value histories (modes, IPC nodes, directories, symbolic and hard links, attributes) are appended in
+//! place and taken back at a refusal: where each key's history stood before the stage first touched it is marked
+//! ([`Marks`]), and a refusal truncates it there. **Owed (later units):** the change index taken back alike, the identity's changes and `change_one`'s `last` held to
 //! the publish, the current maps forked into the stage, and the content history's values copied with their chunks
 //! held; until then a refusal leaves those as the steps made them, and the stage holds no bytes of its own.
 
@@ -14,12 +14,51 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{ApplyStep, Committing, Green, Judged};
 
-/// Where each history a stage appends in place stood before its first touch (A-752 part 3c U1): a key's entries then,
-/// or none for a key with no history. Bounded by the keys the verdict's commit touches.
+/// Where each history a stage appends in place stood before its first touch (A-752 part 3c U1 and U2): a key's
+/// entries then, or none for a key with no history. Bounded by the keys the verdict's commit touches.
 #[derive(Debug, Default)]
 pub(super) struct Marks {
   /// The mode history's.
   pub(super) modes: BTreeMap<String, Option<usize>>,
+  /// The IPC nodes' history's.
+  pub(super) specials: BTreeMap<String, Option<usize>>,
+  /// The directories' history's.
+  pub(super) dirs: BTreeMap<String, Option<usize>>,
+  /// The symbolic links' history's.
+  pub(super) symlinks: BTreeMap<String, Option<usize>>,
+  /// The hard links' history's.
+  pub(super) hardlinks: BTreeMap<String, Option<usize>>,
+  /// The extended attributes' history's, by path and name.
+  pub(super) xattrs: BTreeMap<(String, String), Option<usize>>,
+}
+
+/// Marks where `key`'s history in `histories` stands, unless the stage marked it already: its entries, or none.
+pub(super) fn note<K: Ord, E>(
+  marks: &mut BTreeMap<K, Option<usize>>,
+  histories: &BTreeMap<K, Vec<E>>,
+  key: K,
+) {
+  if marks.contains_key(&key) {
+    return;
+  }
+  let held = histories.get(&key).map(Vec::len);
+  marks.insert(key, held);
+}
+
+/// Takes `histories` back to where `marks` say each marked key's stood: truncated to its entries then, or removed.
+fn take_back<K: Ord, E>(marks: BTreeMap<K, Option<usize>>, histories: &mut BTreeMap<K, Vec<E>>) {
+  for (key, held) in marks {
+    match held {
+      Some(len) => {
+        if let Some(history) = histories.get_mut(&key) {
+          history.truncate(len);
+        }
+      }
+      None => {
+        histories.remove(&key);
+      }
+    }
+  }
 }
 
 /// A held verdict being staged ([`Green::begin_staging`]): its commit under way, and whether it is staged whole.
@@ -128,17 +167,58 @@ impl Green {
     let Some(marks) = self.stage_marks.take() else {
       return;
     };
-    for (path, held) in marks.modes {
-      match held {
-        Some(len) => {
-          if let Some(history) = self.mode_history.get_mut(&path) {
-            history.truncate(len);
-          }
-        }
-        None => {
-          self.mode_history.remove(&path);
-        }
-      }
+    let Marks {
+      modes,
+      specials,
+      dirs,
+      symlinks,
+      hardlinks,
+      xattrs,
+    } = *marks;
+    take_back(modes, &mut self.mode_history);
+    take_back(specials, &mut self.special_history);
+    take_back(dirs, &mut self.dir_history);
+    take_back(symlinks, &mut self.symlink_history);
+    take_back(hardlinks, &mut self.hardlink_history);
+    take_back(xattrs, &mut self.xattr_history);
+  }
+
+  /// Marks, while a verdict is staged, where `path`'s IPC node history stood before the stage first touched it.
+  pub(super) fn mark_special(&mut self, path: &str) {
+    if let Some(marks) = self.stage_marks.as_mut() {
+      note(&mut marks.specials, &self.special_history, path.to_owned());
+    }
+  }
+
+  /// Marks, while a verdict is staged, where `path`'s directory history stood before the stage first touched it.
+  pub(super) fn mark_dir(&mut self, path: &str) {
+    if let Some(marks) = self.stage_marks.as_mut() {
+      note(&mut marks.dirs, &self.dir_history, path.to_owned());
+    }
+  }
+
+  /// Marks, while a verdict is staged, where `path`'s symbolic link history stood before the stage first touched it.
+  pub(super) fn mark_symlink(&mut self, path: &str) {
+    if let Some(marks) = self.stage_marks.as_mut() {
+      note(&mut marks.symlinks, &self.symlink_history, path.to_owned());
+    }
+  }
+
+  /// Marks, while a verdict is staged, where `path`'s hard link history stood before the stage first touched it.
+  pub(super) fn mark_hardlink(&mut self, path: &str) {
+    if let Some(marks) = self.stage_marks.as_mut() {
+      note(
+        &mut marks.hardlinks,
+        &self.hardlink_history,
+        path.to_owned(),
+      );
+    }
+  }
+
+  /// Marks, while a verdict is staged, where `key`'s attribute history stood before the stage first touched it.
+  pub(super) fn mark_xattr(&mut self, key: &(String, String)) {
+    if let Some(marks) = self.stage_marks.as_mut() {
+      note(&mut marks.xattrs, &self.xattr_history, key.clone());
     }
   }
 }

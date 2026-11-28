@@ -58334,6 +58334,13 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
     staged verdict's steps the head and every mode read up to it read as before (red: a reader saw the stage at unit
     12, the head moved), and a stage given up after any turn leaves the mode history, the head and the accepted
     increments exactly as they were (red: given up after 12 turns, the mode history kept the stage's entries).
+  - **U2, the other value histories alike.** The IPC nodes', directories', symbolic and hard links' and attributes'
+    histories are appended in place and marked at their first touch as the modes' are (`commit_special`,
+    `remove_special`, `apply_effect`'s directories, `set_symlink`, `set_hardlink`, `set_xattr`, `drop_metadata`'s
+    attributes), and a refusal truncates each. Red first (`engine::publish_tests`, works in every dimension but a
+    file's bytes): a stage given up after any turn leaves every value history, the head and the accepted increments as
+    they were (red with the mode history alone taken back: given up after 6 turns, a value history changed); every
+    value read up to the head is unchanged between steps (held by U0 and U1 already).
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
