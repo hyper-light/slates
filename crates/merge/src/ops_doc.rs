@@ -164,6 +164,14 @@ impl Ord for Name {
   }
 }
 
+// The index is looked a name up in by a borrowed `str` ([`PathTable::index_of`]): a `Name` orders as its `String`
+// does, which is how `str` orders, as `Borrow` requires.
+impl core::borrow::Borrow<str> for Name {
+  fn borrow(&self) -> &str {
+    &self.0
+  }
+}
+
 impl PartialOrd for Name {
   fn partial_cmp(&self, other: &Name) -> Option<Ordering> {
     Some(self.cmp(other))
@@ -224,6 +232,11 @@ impl PathTable {
       *index = rank;
     }
     remap
+  }
+
+  /// The index of `path`, without making a name of it (A-920: an entry's index finds a path's ops by it).
+  pub fn index_of(&self, path: &str) -> Option<u64> {
+    self.index.get(path).copied()
   }
 
   /// The path at `index`.

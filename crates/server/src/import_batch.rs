@@ -151,6 +151,8 @@ struct Measured {
   applied: Vec<Applied>,
   identity: Option<[u8; 32]>,
   measuring: slates_merge::chain_entry::Measuring,
+  /// The room of the shard's kept index room the measure was handed (A-920, `staging::IncrementBuffer`).
+  room: usize,
 }
 
 /// What a step of a pending verdict's commit left ([`ImportBatch::stage_step`]).
@@ -583,7 +585,12 @@ impl ImportBatch {
       }
       Ok(Stepped::Lend(unlent)) => self.lend_pending(state, pending, unlent),
       Ok(Stepped::Committed(measured)) => {
-        pending.measured = Some(*measured);
+        // The measure's index laid out in the shard's kept room, not a buffer of its own (A-920).
+        let mut measured = *measured;
+        let room = crate::repository::svn_commit::staging::IncrementBuffer::take::<u32>(state);
+        measured.room = room.capacity();
+        measured.measuring = slates_merge::chain_entry::measuring_in(pending.holders, room);
+        pending.measured = Some(measured);
         self.pending = Some(pending);
         None
       }
@@ -619,8 +626,12 @@ impl ImportBatch {
       outcome,
       applied,
       identity,
-      ..
+      measuring,
+      room,
     } = measured?;
+    let (index, outgrown) = measuring.into_room();
+    crate::repository::svn_commit::staging::IncrementBuffer::began(state, outgrown, room);
+    crate::repository::svn_commit::staging::IncrementBuffer::give_back(state, index);
     let staged = (outcome, Some(applied), identity, verdict.reserved, entry);
     Some(self.keep_staged(state, work, (Ok(staged), head)))
   }
@@ -1000,5 +1011,6 @@ fn committed(
     applied,
     identity,
     measuring: slates_merge::chain_entry::measuring(holders),
+    room: 0,
   }
 }
