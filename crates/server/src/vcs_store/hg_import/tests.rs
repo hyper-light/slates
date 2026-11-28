@@ -100,18 +100,22 @@ fn in_one_call(state: &ShardState, files: Files) -> (Rows, Imported) {
     .index
     .rows()
     .iter(&store)
+    .filter(|row| !matches!(row.key().first(), Some(b'S' | b'X')))
     .map(|row| (row.key().to_vec(), row.body().to_vec()))
     .collect();
   (rows, imported)
 }
 
-/// Repository `id`'s index rows, each its key and its body.
+/// Repository `id`'s index rows, each its key and its body: its history's, not its sized rows (`S`, and the log
+/// numbers `X` they name a log by: goal 93, cut 2), which a landing and a recount number in their own orders and which
+/// [`t_cut2_an_import_is_sized_where_it_lands_and_recounted_after_its_rebuild`] holds by their values.
 pub(crate) fn rows_of(state: &mut ShardState, id: RepositoryId) -> Rows {
   let (content, store) = state.vcs_stores.mercurial(id).expect("the store");
   store
     .index
     .rows()
     .iter(content)
+    .filter(|row| !matches!(row.key().first(), Some(b'S' | b'X')))
     .map(|row| (row.key().to_vec(), row.body().to_vec()))
     .collect()
 }
@@ -954,4 +958,154 @@ async fn stepped_to_its_end(id: RepositoryId) -> u64 {
   }
   assert_eq!(super::landed_in_flight(id, &mut flight).await, Some(Ok(())));
   most
+}
+
+/// Repository `id`'s stream clone made a step at a time on the shard, its asks answered by the node's changeset store
+/// between steps as an edge's are (`hg_view::answer_wants_over`): its bytes and its steps and reads by stage.
+async fn streamed_from_the_store(id: RepositoryId) -> (Vec<u8>, slates_hg::render::StageTally) {
+  let disk = crate::state::with_state(|state| state.vcs_disk.clone())
+    .flatten()
+    .expect("the node's store");
+  let repository = u128::from_be_bytes(id.bytes);
+  let mut streaming = slates_hg::render::Streaming::default();
+  let mut out = Vec::new();
+  loop {
+    let (more, step) = crate::state::with_state(|state| {
+      let step = crate::vcs_store::hg_view::text_bytes_a_step(state);
+      streaming.set_step_bytes(step);
+      let (content, store) = state.vcs_stores.mercurial(id).expect("the store");
+      let more = streaming
+        .step(
+          &store.index,
+          content,
+          &mut Admission::new(u64::MAX),
+          &mut out,
+        )
+        .expect("a step");
+      (more, step)
+    })
+    .expect("the shard");
+    if streaming.wants().is_some() {
+      crate::vcs_store::hg_view::answer_wants_over(&disk, repository, &mut streaming, step)
+        .await
+        .expect("the store answered");
+      continue;
+    }
+    if !more {
+      break;
+    }
+  }
+  (out, streaming.take_tally())
+}
+
+/// Repository `id`'s kept head ([`slates_hg::index::HgIndex::rendered`]) and whether a recount of it is under way.
+fn kept_head(
+  state: &mut ShardState,
+  id: RepositoryId,
+) -> (Option<slates_hg::index::Rendered>, bool) {
+  let recounting = state.vcs_stores.hg_recounts.holds(id);
+  let rendered = state
+    .vcs_stores
+    .mercurial(id)
+    .and_then(|(_, store)| store.index.rendered());
+  (rendered, recounting)
+}
+
+/// Goal 93, cut 2 (main 01a20182's rulings of 2026-11-27 18:56 and 20:19), the server's half. Do: import the `states`
+/// repository on a daemon's shard and land it; stream it from the node's changeset store a step at a time. Expect its
+/// revisions sized where they landed (`vcs_store.hg_sized.revisions`), the index's kept head named, and the stream
+/// served (`0` and its counts) with no count walk (its count stage's steps zero) and some index rows. Then make its
+/// store again from the log (what a restart does), and watch it until its recount ends. Expect: whenever its recount
+/// was under way, no head kept (the stream answers `1\n`, the client clones); the recount begun, sliced and ended
+/// whole (`vcs_store.hg_recount.{runs,slices,done}`, none short); then the same head kept as the landing kept, and the
+/// stream served again with no count walk, byte for byte the first.
+#[test]
+fn t_cut2_an_import_is_sized_where_it_lands_and_recounted_after_its_rebuild() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let id = created_on(&daemon, "hg", VcsTool::Mercurial);
+  crate::daemon::observe_first(&daemon, move |state| {
+    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+    let (_, ended) = to_its_end(state, id);
+    assert!(ended.is_ok(), "{ended:?}");
+  });
+  assert_eq!(
+    crate::vcs_store::hg_import::land_imported_on(&daemon, 0, id),
+    Ok(())
+  );
+  let (landed_head, sized) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      kept_head(state, id).0,
+      count(state, crate::vcs_store::hg_sized::SIZED),
+    )
+  });
+  let (first, first_tally) =
+    crate::test_store::run_on_first(&daemon, move || streamed_from_the_store(id), TASK_WAIT);
+  crate::daemon::observe_first(&daemon, move |state| crate::vcs_store::rebuild(state, id));
+  let (unsized_while_recounting, ended) = recount_watched(&daemon, id);
+  let (head, counted) = crate::daemon::observe_first(&daemon, move |state| {
+    let counted = [
+      crate::vcs_store::hg_sized::RECOUNTS,
+      crate::vcs_store::hg_sized::RECOUNT_SLICES,
+      crate::vcs_store::hg_sized::RECOUNT_DONE,
+      crate::vcs_store::hg_sized::RECOUNT_SHORT,
+    ]
+    .map(|name| count(state, name));
+    (kept_head(state, id).0, counted)
+  });
+  let (again, again_tally) =
+    crate::test_store::run_on_first(&daemon, move || streamed_from_the_store(id), TASK_WAIT);
+  daemon.stop();
+  assert!(
+    sized > 0 && landed_head.is_some(),
+    "sized where it landed: {sized}, {landed_head:?}"
+  );
+  assert_served_with_no_count(&first, first_tally);
+  assert!(
+    unsized_while_recounting,
+    "a stream served while its recount was under way"
+  );
+  assert!(ended, "the recount ended within {TASK_WAIT:?}");
+  assert!(
+    counted[0] >= 1 && counted[1] >= 1 && counted[2] >= 1 && counted[3] == 0,
+    "{counted:?}"
+  );
+  assert_eq!(head, landed_head, "the recount kept what the landing kept");
+  assert_served_with_no_count(&again, again_tally);
+  assert_eq!(again, first, "the same stream after the rebuild");
+}
+
+/// `streamed` served (`0` first) with no count walk and some index rows.
+fn assert_served_with_no_count(streamed: &[u8], tally: slates_hg::render::StageTally) {
+  assert!(
+    streamed.starts_with(b"0\n"),
+    "{:?}",
+    &streamed[..streamed.len().min(40)]
+  );
+  assert_eq!(
+    tally.count,
+    slates_hg::render::Tally::default(),
+    "no count walk: {tally:?}"
+  );
+  assert!(tally.index.steps > 0, "index rows written: {tally:?}");
+}
+
+/// Repository `id`'s rebuild and recount watched from the test's thread until both end or [`TASK_WAIT`] passes: whether
+/// every look while its recount was under way found no head kept, and whether they ended.
+fn recount_watched(daemon: &crate::Daemon, id: RepositoryId) -> (bool, bool) {
+  let began = Instant::now();
+  let mut unsized_while_recounting = true;
+  loop {
+    let (rebuilding, (head, recounting)) = crate::daemon::observe_first(daemon, move |state| {
+      (state.vcs_stores.rebuilding(id), kept_head(state, id))
+    });
+    if recounting && head.is_some() {
+      unsized_while_recounting = false;
+    }
+    if !rebuilding && !recounting {
+      return (unsized_while_recounting, true);
+    }
+    if began.elapsed() > TASK_WAIT {
+      return (unsized_while_recounting, false);
+    }
+  }
 }

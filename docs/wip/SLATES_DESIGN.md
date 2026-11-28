@@ -15243,8 +15243,18 @@ Status (2026-11-27, the stream's index rows a run a step): the gathering reads e
 link, node, flags, length) in one range walk of the index, which opens only the sealed tables whose first and last
 keys can meet the log's range, and spends at most a step's bytes touched (half the step quantum at the measured copy
 rate) or the room, whichever first. The index stage then writes as many rows a step as one step's copy holds, from
-those numbers, with no lookup a row, and the next log is the count pass's next sized one. Measured on a 1,200-revision
-stock history over 48 sealed runs: 0.37 index reads a revision, from 4.47.
+those numbers, with no lookup a row, and the next log is the one the gathering found after it. Measured on a
+1,200-revision stock history over 48 sealed runs: 0.37 index reads a revision, from 4.47.
+Status (2026-11-27, A-937, the kept rendered length): a stream walks nothing before its head. Each revision's chunk
+length as the stream sends it is kept where the revision lands, in the index that takes its place (a sized row a
+revision, a number row a log, the head's files and bytes a field of the index its fork copies): a push's fork at its
+landing, after any re-base, a made changeset's and an import's index likewise. The head is named from them, the
+entries and data are written from the sized rows the gathering reads beside the numbers, and a kept length that is not
+the chunk's is refused typed, never sent past the head. A rebuilt index is unsized (no record names a length) and
+serves no stream (`1\n`, the client clones) until a sliced recount, the count walk once, ends.
+Status (2026-11-27, the data stage a run a step): a split log's data file is written a run of chunks a step, within the
+step's copy budget or the room, whichever first, its first chunk whatever: on a 1,200-revision stock history one step
+for 300 chunks, where each chunk took a step.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
@@ -57050,6 +57060,52 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   made durable, `Unanswered`: Subversion's commit path, which this change does not touch); fmt clean (macOS arm64,
   this Mac, local).
 
+### A-722 part 4j — A landed push's maps by object are freed after its step, a slice a turn (P2 piece 3, 2026-11-27, w-git; main 01a20182's order of 18:44)
+- **Why.** CLAUDE.md §3 (bounded work). A commit's release freed the push's maps by object inside the landing's step:
+  its commits, its objects' places in its pack, and the positions its stage gave. A pack push's entries by offset
+  waited for the push's drop, a step of their own. Each is one entry an object, so the free grew with the push:
+  1,202 entries in one step for a push of 600 commits held whole (600 commits, 602 positions).
+- **Change.** The release gives the maps up whole into the push's `Shedding`, which moves them and frees nothing; the
+  commit adds its stage's positions. They hold nothing of the content store, so when they are freed changes nothing a
+  reader sees. The live commit (`vcs_store::commit`) queues the push's `Shedding` on the shard. A task frees the queue
+  an entry a unit under the step quantum (`shed_turn`, counted `vcs_store.landed.shed_entries`), as the landed
+  let-go's queue is turned. Unspawned, it waits for the next landing, counted `vcs_store.landed.shed_unspawned`.
+- **Tests.** `slates-git` `store::tests::commit_walk::a_landing_frees_none_of_its_pushs_maps_by_object_in_its_step`
+  (600 commits: the push holds no map entry after its landing and gives up all 1,202 with its stage's positions, red
+  0 given up; freed in more than one turn; the store empty once released). `slates-server`
+  `git_push::tests::a_landed_pushs_maps_by_object_are_freed_by_the_shards_task_after_its_step` (the fixtures' pack
+  push: three entries an object at least freed by the task, none left queued, the task ended; red with the queue not
+  fed: none freed).
+- **Owed.** A push refused or abandoned frees its maps in its own step (`Push::abandon`), and a replay's push is
+  dropped whole in its replay turn. Each is O(its objects), its own piece. A push of objects held whole still gives
+  each object's hold back in the step (`Quarantine::abandon`): no pack push holds any.
+
+### A-722 part 4i — A landing of several moves is mapped by position after its step, a slice a turn (P2 piece 2, 2026-11-27, w-git; main 01a20182's order of 18:44)
+- **Why.** The landing map names the green and version that brought each position (A-722, `Repository::bringer_of`:
+  a fetch's offers and a hook view's bringer read it). A commit of several moves (an atomic push, a first push of
+  many refs) built it in its step. It filled a slot for each position the stage gave, from each move's brought set,
+  then joined them into runs. That is a walk of the push's objects in the landing step (CLAUDE.md §3), and, as the
+  objects are positioned by type and then id, as many runs as objects in the worst case. One push of 599 commits
+  fast-forwarding two greens mapped all 599 in its step (`StoreCounters::landing_mapped`, new).
+- **Change.** The map keeps one entry a landing, keyed by its first position (`Landed`). A landing of one move is one
+  run, as before. A landing of several is recorded as its commit leaves it: each move's brought set, taken from its
+  plan, whose value is already put and which nothing reads after, in the moves' order. A position none of them holds
+  goes to the first move, A-722's rule. That is O(moves) in the step and copies no set. A look-up reads the first set
+  that holds the position, until the shard's task (`vcs_store::settle_landings_sliced`, started by the commit) maps
+  the landing a position a unit under the step quantum (`Repository::settle_landings_turn`). The task then puts its
+  runs in place, the store's charge moved from the sets' bytes to the runs', the room lent for them
+  (`settle_room`). A refused charge leaves the landing answered by its sets for the next commit's task, counted
+  `vcs_store.landings.settle_refused`.
+- **Tests.** `slates-git` `store::tests::commit_walk::a_landing_of_several_moves_maps_none_of_its_positions_in_its_step`
+  (599 commits, two greens: 0 positions mapped in the step, red 599; every bringer as the line says before and after
+  the turns; all 599 mapped in more than one turn; the store empty once released). The refusal oracle's two-move push
+  holds the unsettled landing to its pre-commit state at every point. `slates-server`
+  `git_push::tests::a_landing_of_several_refs_is_mapped_by_the_shards_task_after_its_step` (an atomic two-ref create:
+  mapped by the task after its step, its slot given back; red with the task not started: never mapped).
+- **Owed.** A store made again from its records (a replay, a recovery) maps its landings of several moves only when
+  its next live commit starts the task; until then its look-ups read the sets. A move with no sets planned whose
+  stage went stale has its members positioned by id in the step, with the stale restage's piece.
+
 ### A-722 part 4h — A commit reads and charges its own greens' records alone (P2, 2026-11-27, w-git; main 01a20182's order of 18:44 and its condition of 19:22)
 - **Why.** CLAUDE.md §3 (bounded work): a push's landing step ran `Repository::commit` with passes that grew with the
   repository's life, not the push. Its charge summed every chain of every green (`footprint`, each chain's kept
@@ -64196,6 +64252,20 @@ daemon}.rs`, `crates/server/src/vcs_http/{git,hg,svn,daemon_edge}.rs`, `crates/s
   limit: a forward's first try may go to a readmitted creator, costing a redirect, never a wrong answer. Keeping a fact
   past A-309's removal to close it is a design change of its own.
 
+- **Readmission keeps what the skip reads (2026-11-27, w-shared for main 01a20182, its ruling of 20:48; diag 12's
+  x86_64 red).** The creator skip (`owner_location`'s `known_owner`: a first owner the configuration keeps a retirement or
+  a completed takeover of is not offered) read nothing once the host was admitted again: `admit` drops the completion
+  record (A-309, rightly: kept, a later takeover of the id that never completed would settle its lines), and the
+  retirement had gone at the completion. A stranger with no route of its own offered the readmitted creator. Now `admit`
+  moves the fact to `RegionalConfiguration::superseded` (host to the admitting version), read by routing alone, so
+  A-309's lineage concern and the routing concern stay apart. An ObjectId carries no incarnation, so the skip cannot tell
+  the host's objects from before and after; one it made after takes the location round, which finds it, while the entry
+  is kept. Bound: at most `completed_bound`, the earliest admitted let go first; a let-go entry costs a stranger one
+  forward refused as not the owner's, never a wrong owner. Regional layout 8 carries it; layout 7 is read with none.
+  Tests: fleet `a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it` asks the stranger's
+  direct route of an unrouted object of a's (red first: it named a); units `a_member_admitted_again_after_its_completed_takeover_stays_superseded`,
+  `superseded_members_are_bounded_the_earliest_let_go_first`, `raft_wire::tests::a_superseded_member_round_trips_and_layout_seven_reads_none`.
+
 ### A-925 — A node announces its own version-control edges to its peers, as a client reaches them (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; A-921 part 2's prerequisite)
 
 - **Why.** A-921's product half answers a request at a node that is not a repository's owner with where to go. A node
@@ -66775,3 +66845,72 @@ Applied in the same change to:
     kind in `every_message`'s round trip and the unknown-kind refusal moved past it.
 - **Applied in the same change to:** `crates/cluster/src/content.rs`, `crates/server/src/{fleet,merge_service,
   state_log,replica_build}.rs`, `crates/server/tests/fleet.rs`, GAPS.
+- **The replay half (main 01a20182's ruling of 2026-11-27 20:19, its (i)).** A replica build that waits on its
+  repository's store's replay (`replica_build::laid_out`) made no turn, so it answered `ReplicaBuilding` at 0 through
+  the replay, and the barrier gave up while the replay moved (a914 at 69fbc8de0 run 2: two region reads, each spending
+  its whole share on d, just dead and not yet suspected, 2 s at 0 turns). Now the work done a build reports is its turns
+  and the most of its store's replay it saw (`VcsStores::rebuild_steps`: the records replayed and the names fetched from
+  the region, `rebuild_fetched`, reset at each rebuild's start and bounded by the partition's repositories), which only
+  rises (`replica_build::replayed_seen`). The barrier's rule is unchanged: movement counts once per target, version and
+  work done, which only rises. The barrier is right whatever a read costs; a read's cost itself is A-936's next item,
+  the hedged region read. Units: `state_log::tests::a_barrier_is_not_given_up_while_its_mark_rises_and_is_once_it_stands_still`,
+  `replica_build::tests::a_waiting_builds_replay_seen_rises_with_its_steps_and_never_falls`,
+  `vcs_store::tests::a_rebuilds_steps_are_its_records_replayed_and_names_fetched`; main's ×16's run 2 is the field
+  evidence.
+- **The hedged region read (main 01a20182's ruling of 2026-11-27 20:11, its (b); Dean and Barroso, "The Tail at Scale",
+  CACM 2013, hedged requests).** A region read with two homes or more asks its first home only until that home's
+  measured path tail (`homes::hedge_delay_ns`, the `PathRtt` tail RFC 9002's probe timeout gives), then each next
+  home its share of what is left, then the first again with the rest (`homes::hedged_asks`); one home, or a first home
+  with no measured path, is asked as before. Fan-out stays within the identity's homes, one at a time, so no read is
+  sent to two homes at once; the first home's late answer is its exchange's straggler, settled there with its session
+  given back, and the hedge counted `vcs_store.homes.reads_hedged`. Not a concurrent hedge: an exchange waits its
+  stragglers out to its own budget, and one cut short to race another would need its stragglers settled off the read's
+  path, which no task here owns. A dead first home not yet suspected costs a read its path tail and the next home's
+  round trips. Fleet red first: `a_region_read_whose_first_home_died_unseen_is_hedged_to_the_next_within_its_path_tail`
+  (1.000 s of a 1.998 s budget before, the stopped home's whole share; 2.2 ms hedged).
+
+### A-937 — A Mercurial revision's chunk length is kept where it lands, so a stream clone walks nothing before its head (2026-11-27, w-interop for main 01a20182, its order of 2026-11-27 16:23 (cut 2) and its rulings of 18:56, 18:58 and 20:19; goal 93's hg whole-history gap; §4.17.3 "Stream clones: the revlog view")
+
+- **Why.** A stream names its files' count and bytes first, so it walked every log's rows and sized every revision's
+  chunk before its first byte: at 343703bd7 on hg-src that count stage was 464,254 of a stream's 842,218 steps, 541,331
+  content store reads and about 3.8 s of a 15.4 s stream (main's hg_scale round, BENCHMARKS).
+- **What is kept.** In the hg index, RAM only, rebuilt with it (no disk format changes, main's ruling of 18:56):
+  - a sized row a revision, `S` and its log's number and its own (big-endian): its chunk's length (`u32`) and its offset
+    among the log's chunks (`u64`), its index entry's two numbers. 21 bytes of key and body (`SIZED_ROW_BYTES`), about
+    21 MB a million revisions; the log's number in place of its path halves it (main's ruling of 18:58);
+  - a number row a log, `X` and the log's key: its number, given in the order logs are first sized;
+  - the head's totals (files, bytes), the revisions appended and sized, and whether one cannot be streamed as kept: a
+    field of the index, copied by its fork, so a generation's totals are its rows'. A stream is served only while every
+    revision appended is sized and each can be streamed (`HgIndex::rendered`).
+  The index never replaces a row (insert-only, `RowDiffers`), which is why the length is a row of its own rather than a
+  field of the revision's row: a recount must be able to add it after the row exists.
+- **Where it is kept.** Where each revision's length is had: a segment's chunk by its length as the segment made it, any
+  other delta compressed once by the stream's own compressor (`index::chunk_len_of`), at the landing rather than at
+  every stream. A push sizes its fork just before its landing, after any re-base (`vcs_store::hg_sized::size_fork`), a
+  made changeset its fork, an import its index before it is placed (`slates_hg::push::sized`). A changelog delta against
+  another revision than the one before it is kept unstreamable, the stream's own rule.
+- **Recovery** (main's ruling (C) of 18:56 and of 20:19). A replay appends what each record names, a push's or an
+  import's (`import::record::replay`), and no record names a chunk length, so a rebuilt index is unsized and serves no
+  stream until its recount ends: `render::Recount`, the count walk once, sliced on a task of its own at a replay's end
+  (`hg_sized::rebuilt`), its asks answered by the node's store as a stream's are, begun again where a fork is swapped in
+  meanwhile, a row sized already kept as it is. Sizing inline in the replay would lengthen the recovery every client
+  waits on; an unsized repository only answers stream clones `1\n` for one walk's time, and they fall back to a clone.
+- **A stale length** is refused typed (`render::Refused::StaleLength`): a log with fewer sized rows than revisions, or a
+  chunk not its kept length. Before the head (the totals not the rows'), no stream (`1\n`); after it, the stream is cut
+  short there, never a byte past what the head named.
+- **Counted.** `vcs_store.hg_sized.{revisions,unsized_logs,refused}` and `vcs_store.hg_recount.{runs,slices,restarts,done,
+  short}`; the stream's count stage's steps (`vcs_store.hg_stream_steps.count`) at zero.
+- **Tests.** The oracle, `slates_hg::serve::indexed::tests::rendered`: generated landing histories (raw and chunk places,
+  logs crossing 7.2's inline bound) landed three ways, sized where they land, recounted after each landing, and replayed
+  from a generated landing on with nothing sized before it and then recounted; the three keep the same values after
+  every landing, and the landed history's stream is served with every text read back through its entries. Its reach
+  (a split log, both place forms), the stale refusals, and the stream tests' count stage at zero. The server:
+  `vcs_store::hg_import::tests::t_cut2_an_import_is_sized_where_it_lands_and_recounted_after_its_rebuild` (sized at
+  landing; a rebuild's recount begun, sliced and ended; the same head and stream after) and the edge's
+  `a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes` (a push sized where it landed, the stream's
+  count stage no step).
+- **Applied in the same change to:** `crates/hg/src/{index,render}.rs`, `crates/hg/src/push/{mod,sized}.rs`,
+  `crates/hg/src/serve/{indexed_tests,rendered_tests}.rs`, `crates/server/src/vcs_store.rs`,
+  `crates/server/src/vcs_store/{hg_sized,hg_import,hg_made}.rs`, `crates/server/src/vcs_store/hg_import/tests.rs`,
+  `crates/server/src/repository/hg_push.rs`, `crates/server/src/repository/hg_push/rebase.rs`,
+  `crates/server/src/vcs_http/tests/daemon_edge.rs`, this section's status, GAPS, BENCHMARKS.

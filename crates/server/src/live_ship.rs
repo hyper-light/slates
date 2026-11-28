@@ -1665,6 +1665,14 @@ fn placement_done(
   register_placed(state, register, sequence)
     && match kind {
       PlacementOf::Tombstone => true,
+      // A creation waits for its record and its names log at f + 1 (A-894, A-915), and for the greens its operations
+      // moved, through their versions (`state_log::greens_placed`), never for its root green's version 0 (main
+      // 01a20182's ruling of 2026-11-27 21:11). No creation path owes it: `Op::RepositoryCreated` moves no green's log
+      // and the root's join moves the names log alone, so no version of the root is owed; that version 0 is the empty
+      // green a creation makes, or an adopted green's (`RepositorySpec::green`), placed by its own creation; and a
+      // takeover's re-creation (`Op::RepositoryRebuilt`) and an import land their content as entries, whose versions
+      // are owed and waited for. A successor that lacks the root's chain records adopts them from the record and the
+      // names log (A-933).
       PlacementOf::Repository => crate::state_log::names_committed(
         state,
         slates_db::catalog::RepositoryId { bytes: register },
@@ -6331,6 +6339,7 @@ fn serve_taken(
       return encode_reply(&Err(not_served(state, object, epoch)));
     }
   };
+  note_admitted_under_a_lagging_copy(state, peer, object, epoch);
   let (reply, taken) = match decode(request, bound) {
     Ok(entries) => take_entries(state, peer, &entries, bound, identities),
     Err(refusal) => (Err(refusal), 0),
@@ -6361,6 +6370,46 @@ fn serve_taken(
     }
   }
 }
+
+/// Logs a live entry from `peer` admitted while this holder's copy of `object` still holds an authority older than the
+/// configuration this node installed (main 01a20182's order of 2026-11-27 20:35: diag 12's Windows red, a superseded
+/// owner's write answered `FsDone` after its successor's): the install's walk raises a copy's fence and moves its
+/// authority a slice a turn (A-398), so until it reaches the copy the copy names the owner it had. Logged with the
+/// copy's owner, its authority's generation, the installed version, the entry's epoch and the copy's fence, each time:
+/// a walk that keeps up never leaves one. Counted [`ADMITTED_UNDER_LAGGING_COPY`].
+fn note_admitted_under_a_lagging_copy(
+  state: &mut ShardState,
+  peer: HostId,
+  object: Option<ObjectId>,
+  epoch: Option<HostEpoch>,
+) {
+  let Some(object) = object else {
+    return;
+  };
+  let installed = state.fleet.configuration().version;
+  let Some(acceptor) = state.holder_records.get(&object) else {
+    return;
+  };
+  let authority = acceptor.authority();
+  if authority.generation >= installed {
+    return;
+  }
+  let fence = acceptor.fence();
+  state.count(ADMITTED_UNDER_LAGGING_COPY, 1);
+  slates_machine::log_line!(
+    "slates-server: partition {}: a live entry of {object:?} from {peer:?} (epoch {epoch:?}) was admitted under a copy \
+     whose authority names {:?} at generation {} below the installed {installed} (its fence {fence:?}), \
+     the install's walk not yet at it, at {} ns",
+    state.partition,
+    authority.owner,
+    authority.generation,
+    slates_machine::clock::monotonic_ns()
+  );
+}
+
+/// Counter: a live entry admitted under a copy whose authority is older than the installed configuration
+/// ([`note_admitted_under_a_lagging_copy`]). Format: a counter name in the daemon's status report.
+const ADMITTED_UNDER_LAGGING_COPY: &str = "fleet.live.admitted_under_lagging_copy";
 
 /// One entry taken into a candidate's copy (guard-then-apply, `Replica::check` then `commit`): applied and kept within
 /// `bound` when it extends the head, passed over when already held; the head held after it, or why not.

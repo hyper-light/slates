@@ -28,6 +28,9 @@ pub(super) struct Rebasing {
   /// Its segments cut and not yet landed, carried as they are: their records name rows by node (v10), whatever index
   /// they land over.
   segments: Vec<super::RecordedSegment>,
+  /// Its segments' kept revisions' chunk lengths, carried as they are: noted by node, whatever index the fork is
+  /// re-based onto ([`Forked::sized`]).
+  sized: Vec<slates_hg::push::sized::Landed>,
 }
 
 impl Rebasing {
@@ -65,6 +68,7 @@ impl Rebasing {
         changegroup,
         room: self.room,
         segments: core::mem::take(&mut self.segments),
+        sized: core::mem::take(&mut self.sized),
       }),
       _ => {
         state.count(vcs_store::RELEASE_REFUSED, 1);
@@ -106,6 +110,7 @@ pub(super) fn begin_rebase(
     room,
     record,
     segments,
+    sized,
     ..
   } = stale;
   // A refusal hands the fork back, boxed: an index is far larger than the rebase begun.
@@ -127,6 +132,7 @@ pub(super) fn begin_rebase(
         room,
         record,
         segments,
+        sized,
       })
       .map_err(|handed| {
         let (refused, fork) = *handed;

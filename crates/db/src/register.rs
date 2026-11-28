@@ -3417,6 +3417,17 @@ pub struct RegionalConfiguration {
   /// those are more, the oldest let go first; a line reaching a host whose record was let go reads
   /// [`Lineage::Unresolved`], so a holder that lagged past it keeps a stale copy rather than reclaim one nobody adopted.
   pub completed: std::collections::BTreeMap<HostId, CompletedTakeover>,
+  /// Each member admitted again while a completed takeover of it was kept, with the version that admitted it (A-921
+  /// part 2's skip, main 01a20182's ruling of 2026-11-27 20:48): its objects from before went to its successors, which
+  /// readmission does not undo. Read by routing alone (`owner_location`'s skip of a stale creator): a stranger holding
+  /// none of such an object never offers the creator its direct route. [`admit`](RegionalConfiguration::admit) still
+  /// drops the completion record (A-309: kept, it would settle the lines of the member the id names now), and moves
+  /// this fact here instead. At most [`completed_bound`](RegionalConfiguration::completed_bound) are kept, the oldest
+  /// let go first ([`bound_completed`]): one let go leaves a stranger with no route of its own to offer the creator
+  /// once, which refuses the forward as not its owner (`fleet.forward.refused.not_owner_here`), and the location round
+  /// then finds the adopter, a wasted forward and never a wrong owner. So the bound costs latency, never correctness,
+  /// and needs no guarantee that no such stranger remains.
+  pub superseded: std::collections::BTreeMap<HostId, u64>,
   /// The objects an explicit move took off their creator's line (§4.8 "Authority scope": "moving one volume changes
   /// that object's ownership generation, recorded in the configuration's moved-object exceptions, without fencing
   /// unrelated volumes"; §4.10 "operators keep an explicit move"), keyed by the object's placement key, so every register
@@ -3510,6 +3521,7 @@ impl RegionalConfiguration {
       retired: std::collections::BTreeMap::new(),
       adoptions: std::collections::BTreeMap::new(),
       completed: std::collections::BTreeMap::new(),
+      superseded: std::collections::BTreeMap::new(),
       moved: std::collections::BTreeMap::new(),
       voters: Vec::new(),
       settle_certified: std::collections::BTreeSet::new(),
@@ -3638,8 +3650,14 @@ impl RegionalConfiguration {
       self.domains.insert(member, domain);
     }
     // A record of an earlier takeover of this id says nothing of the member it names now (A-309): kept, a later
-    // takeover of it that never completed would read as completed, settling lines nobody adopted.
-    self.completed.remove(&member);
+    // takeover of it that never completed would read as completed, settling lines nobody adopted. What it says of the
+    // objects the id held before stays true, so routing keeps it (A-921 part 2's skip, [`superseded`]).
+    //
+    // [`superseded`]: RegionalConfiguration::superseded
+    if self.completed.remove(&member).is_some() {
+      self.superseded.insert(member, version);
+      self.bound_superseded();
+    }
     self.version = version;
     self.fix_neighbourhoods(scatter);
     // An admitted member owns nothing yet, so its first neighbourhood is settled at once. The members whose
@@ -4602,6 +4620,22 @@ impl RegionalConfiguration {
     evictable.sort_unstable_by_key(|(version, host)| (*version, host.0));
     for (_, host) in evictable.into_iter().take(excess) {
       self.completed.remove(&host);
+    }
+  }
+
+  /// Keeps at most [`completed_bound`](RegionalConfiguration::completed_bound) superseded members
+  /// ([`superseded`](RegionalConfiguration::superseded)), the one admitted again earliest let go first (the id breaking a
+  /// tie): its let-go costs a stranger one forward refused, never a wrong owner (the field's doc).
+  fn bound_superseded(&mut self) {
+    let mut kept: Vec<(u64, HostId)> = self
+      .superseded
+      .iter()
+      .map(|(host, version)| (*version, *host))
+      .collect();
+    let excess = kept.len().saturating_sub(self.completed_bound());
+    kept.sort_unstable_by_key(|(version, host)| (*version, host.0));
+    for (_, host) in kept.into_iter().take(excess) {
+      self.superseded.remove(&host);
     }
   }
 
@@ -7416,6 +7450,56 @@ mod tests {
       (before, after),
       (false, false),
       "two of the cohort's three hosts gone: past tolerance, and the returning host does not change it"
+    );
+  }
+
+  /// A-921 part 2's skip (main 01a20182's ruling of 2026-11-27 20:48): a member admitted again after its takeover
+  /// completed is kept superseded, so routing still knows its objects from before went to successors, while the
+  /// completion record goes (A-309). Do: in a five-member `f = 1` region take a member over, have every survivor confirm,
+  /// then admit it again under its id. Expect no completion record of it and a superseded entry at the admitting version.
+  #[test]
+  fn a_member_admitted_again_after_its_completed_takeover_stays_superseded() {
+    let (mut regional, scatter) = wide_region();
+    let returning = HostId(1);
+    regional.take_over(returning, scatter);
+    for survivor in regional.survivors_of(returning) {
+      regional.confirm(returning, survivor);
+    }
+    assert!(
+      regional.completed.contains_key(&returning),
+      "the takeover completed"
+    );
+    assert!(regional.admit(returning, None, scatter), "admitted again");
+    assert!(
+      !regional.completed.contains_key(&returning),
+      "A-309: its record goes"
+    );
+    assert_eq!(
+      regional.superseded.get(&returning),
+      Some(&regional.version),
+      "superseded at the version that admitted it"
+    );
+  }
+
+  /// A-921 part 2's skip, its bound: at most `completed_bound` superseded members are kept, the earliest admitted let go
+  /// first. Do: keep one more than the bound, each at a later version. Expect the bound kept and the earliest gone.
+  #[test]
+  fn superseded_members_are_bounded_the_earliest_let_go_first() {
+    let (mut regional, _) = wide_region();
+    let bound = regional.completed_bound();
+    for (version, host) in (0..=bound).map(|index| {
+      (
+        u64::try_from(index).unwrap(),
+        HostId(100 + u64::try_from(index).unwrap()),
+      )
+    }) {
+      regional.superseded.insert(host, version);
+    }
+    regional.bound_superseded();
+    assert_eq!(regional.superseded.len(), bound);
+    assert!(
+      !regional.superseded.contains_key(&HostId(100)),
+      "the earliest let go"
     );
   }
 

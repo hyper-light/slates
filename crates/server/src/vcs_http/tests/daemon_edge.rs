@@ -2515,7 +2515,8 @@ fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_
 
 /// Goal 93, main's ruling (b) (content kept once, on arrival, as stock's revlog chunks). Do: through a two-shard daemon's
 /// edge, push one changeset whose file is twice a request's room and compresses (every byte odd); stream-clone it; clone
-/// it. Expect: the push's segment made into chunks as it landed, no step compressing past the copy slice it was given;
+/// it. Expect: the push's segment made into chunks as it landed, no step compressing past the copy slice it was given, and
+/// its revisions sized there (`vcs_store.hg_sized.revisions`; goal 93, cut 2), so the stream's count stage took no step;
 /// the stream sending the file's chunk byte for byte with nothing compressed again (its count and send passes' zstd at
 /// zero), its copy counted (`vcs_store.hg_stream_send_kept_bytes` at least the chunk's length); the clone's
 /// changegroup carrying the file's bytes whole, its chunk decoded on the shard (non-vacuity: the decoded bytes at least
@@ -2575,6 +2576,10 @@ fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
     REPOSITORY,
     crate::vcs_store::hg_view::STREAM_SEND_KEPT_BYTES,
   );
+  // Goal 93, cut 2: the push's revisions sized where it landed, so the stream walked no count before its head.
+  let sized = counted_on(&daemon, REPOSITORY, crate::vcs_store::hg_sized::SIZED);
+  let [count_steps, index_steps, ..] = crate::vcs_store::hg_view::STREAM_STEPS_BY_STAGE
+    .map(|name| counted_on(&daemon, REPOSITORY, name));
   let tip = crate::verbs::hex_of(&made[0].node);
   let cloned = hg_getbundle(edge, &name, &tip);
   let decoded = counted_on(
@@ -2603,6 +2608,12 @@ fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
     "the stream carries the file's chunk"
   );
   assert_eq!(recompressed, 0, "the stream compressed nothing again");
+  assert!(sized > 0, "the push's revisions sized where they landed");
+  assert_eq!(
+    (count_steps, index_steps > 0),
+    (0, true),
+    "no count walk, the index rows written: {count_steps} count steps, {index_steps} index steps"
+  );
   assert!(
     kept >= chunk.len() as u64,
     "the stream copied the file's chunk as the store keeps it: {kept} bytes counted, the chunk {}",

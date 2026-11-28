@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::mem::size_of;
 
 use slates_vcs::{ContentId, ContentRefused, ContentStore, Index, IndexRefused};
@@ -233,6 +233,10 @@ pub struct StoreCounters {
   /// Chain records and head-map entries the commits read to make and charge their versions (P2, CLAUDE.md §3 bounded
   /// work): each commit's own moves' worth, whatever the repository's other greens and their histories hold.
   pub commit_walked: u64,
+  /// Positions mapped to the move that brought them (the landing map's runs, [`Repository::bringer_of`]): by a commit's
+  /// step only for one move's landing, whose one run maps them all at once; a landing of several moves is mapped a
+  /// position a unit by [`Repository::settle_landings_turn`]'s turns, never in its step (P2 piece 2).
+  pub landing_mapped: u64,
 }
 
 /// The entry a path names in a version's tree.
@@ -635,8 +639,9 @@ pub(crate) struct CommitState {
   chains_charged: u64,
   head_entries: usize,
   largest_pack: u64,
-  landings: BTreeMap<u64, (u64, u64, u64)>,
+  landings: BTreeMap<u64, Landed>,
   landings_charged: u64,
+  unsettled: VecDeque<u64>,
   kinds: BTreeMap<u64, (u64, Kind)>,
   packs: BTreeMap<ContentId, u64>,
   used: u64,
@@ -707,9 +712,14 @@ pub struct Repository {
   /// objects positions by type, then id, so each type's are one run). A position's type is read here, with no row read
   /// (`kind_at`; A-722 part 3's partial clone read two rows an object for it). A run a type each landing brought.
   kinds: BTreeMap<u64, (u64, Kind)>,
-  landings: BTreeMap<u64, (u64, u64, u64)>,
+  landings: BTreeMap<u64, Landed>,
   /// What the landing map charges the store.
   landings_charged: u64,
+  /// The first positions of the landings of several moves still to be mapped by position, oldest first
+  /// ([`Repository::settle_landings_turn`]).
+  unsettled: VecDeque<u64>,
+  /// The oldest of them's mapping, under way.
+  settling: Option<Settling>,
   counters: Cell<StoreCounters>,
   window: Window,
   levels: Levels,
@@ -758,6 +768,8 @@ impl Repository {
       quiet: Cell::new(None),
       largest: 0,
       landings_charged: 0,
+      unsettled: VecDeque::new(),
+      settling: None,
       counters: Cell::new(StoreCounters::default()),
       window: Window::default(),
       levels: Levels::default(),
@@ -774,8 +786,8 @@ impl Repository {
   /// The green and that green's version that brought the object at `position` (A-722: the landing map's, the rows no
   /// longer carry it); `None` for a position no landing gave.
   pub fn bringer_of(&self, position: u64) -> Option<(u64, u64)> {
-    let (_, (end, green, version)) = self.landings.range(..=position).next_back()?;
-    (position < *end).then_some((*green, *version))
+    let (base, landed) = self.landings.range(..=position).next_back()?;
+    landed.bringer((*base, position))
   }
 
   /// git's naming in the repository's format.
@@ -997,6 +1009,7 @@ impl Repository {
       largest_pack: self.largest_pack,
       landings: self.landings.clone(),
       landings_charged: self.landings_charged,
+      unsettled: self.unsettled.clone(),
       kinds: self.kinds.clone(),
       packs: self.packs.clone(),
       used: store.used(),
@@ -1687,7 +1700,7 @@ impl Repository {
     };
     // Refused before its adoption, the stage's fork is given back with whatever else the commit took, so a refused
     // commit leaves the store as it was (P2's oracle: it was dropped holding its tables, 598 bytes a refusal).
-    let prepared = match self.prepared(store, moves, (first, base, &positions, kinds.len())) {
+    let prepared = match self.prepared(store, moves, (base, &positions, kinds.len())) {
       Ok(prepared) => prepared,
       Err(refused) => {
         let _ = fork.release(store);
@@ -1723,7 +1736,12 @@ impl Repository {
     }
     // Nothing of the repository changed before this point; nothing refuses after it but a discharge or a release past
     // what was held, which no commit's own charge and holds can be.
-    self.landings.extend(landed);
+    if let Some(landed) = landed {
+      if matches!(landed, Landed::Moves(_)) {
+        self.unsettled.push_back(base);
+      }
+      self.landings.insert(base, landed);
+    }
     if !positions.is_empty()
       && let Some((pack, len)) = push.stored_pack()
     {
@@ -1757,6 +1775,9 @@ impl Repository {
     self.charged = exact;
     self.count(|counters| counters.positions = counters.positions.saturating_add(given));
     self.depth.seen(push.deepest());
+    // The positions the stage gave, one entry an object, are given up with the push's maps, freed after the step (P2
+    // piece 3, `Shedding`).
+    push.shed_positions(positions);
     push.release_holds(store)?;
     // The push's objects read lately go with it, their charge given back (A-861).
     push.release_recent(store);
@@ -1779,9 +1800,9 @@ impl Repository {
     self.index.adopt(store, fork)
   }
 
-  /// What `commit` makes before its stage is adopted, changing nothing of the repository: the landing map's runs for
-  /// the stage's `positions` from `base` (`first` bringing what no other move did), each move's planned version
-  /// ([`Repository::plan`]), their values put, the head map's entries once moved, and the records' and the landing
+  /// What `commit` makes before its stage is adopted, changing nothing of the repository: each move's planned version
+  /// ([`Repository::plan`]), their values put, the landing map's entry for the stage's `positions` from `base`
+  /// ([`Repository::landed`]), the head map's entries once moved, and the records' and the landing
   /// map's charges taken. Each move adds one version record to its chain (a new version keeps no fragment) and notes at
   /// most one commit more in the peeled map and one green more in the holders' map, so the records are charged by that
   /// difference at that bound, never by summing every chain again (P2: 22,021 chain records and head entries read for
@@ -1791,14 +1812,20 @@ impl Repository {
     &self,
     store: &mut ContentStore,
     moves: &[Move],
-    (first, base, positions, kinds): (&Move, u64, &BTreeMap<ObjectId, u64>, usize),
+    (base, positions, kinds): (u64, &BTreeMap<ObjectId, u64>, usize),
   ) -> Result<Prepared, StoreRefused> {
-    let landed = self.landed_runs(moves, first, (base, positions));
-    let (planned, entries) = self.plan(store, moves, (base, positions))?;
+    let (mut planned, entries) = self.plan(store, moves, (base, positions))?;
     let before = store.used();
     let values = at_point(store, CommitPoint::Values, |store| {
       put_values(store, &planned)
     })?;
+    let landed = match self.landed(store, moves, &mut planned, (base, positions)) {
+      Ok(landed) => landed,
+      Err(refused) => {
+        give_back(store, &values.iter().flatten().copied().collect::<Vec<_>>())?;
+        return Err(refused);
+      }
+    };
     let put: Vec<ContentId> = values.iter().flatten().copied().collect();
     let added = store.used().saturating_sub(before);
     let chains = self
@@ -1812,7 +1839,10 @@ impl Repository {
       give_back(store, &put)?;
       return Err(refused.into());
     }
-    let landings = bytes(landed.len().saturating_add(kinds), LANDING_BYTES);
+    let landings = landed
+      .as_ref()
+      .map_or(0, Landed::cost)
+      .saturating_add(bytes(kinds, LANDING_BYTES));
     if let Err(refused) = at_point(store, CommitPoint::Landings, |store| store.charge(landings)) {
       store.discharge(records)?;
       give_back(store, &put)?;
@@ -2020,70 +2050,159 @@ impl Repository {
     Ok(None)
   }
 
-  /// The landing map's runs for a commit's fresh objects (`Repository::landings`): each object's position, given from
-  /// `base` on, with the green and version that brought it (the first move whose walk met it, else `first`'s),
-  /// consecutive positions of one pair joined into one run. The positions a stage gives run from its base with no gap,
-  /// so each object's pair is kept by position: one slot an object, no map and no sort.
-  fn landed_runs(
+  /// The landing map's entry for a commit's fresh objects, the stage's `positions` from `base` ([`Landed`]): none where
+  /// the stage gives none; for one move, one run of them all; for several, each move's brought set taken from its plan
+  /// (its value put, nothing reads the set after) in the moves' order, a position none of them holds going to the
+  /// first move, as A-722's map gives it, to be mapped by position later, a slice a turn
+  /// ([`Repository::settle_landings_turn`]). The step walks no position: it walked every position the stage gave,
+  /// and each move's brought set (P2 piece 2: 599 for a push of 599 commits moving two greens). A move with no sets
+  /// planned (a create, a rewrite, one whose sets are unknown) has its walk's members taken as positions.
+  fn landed(
     &self,
+    store: &ContentStore,
     moves: &[Move],
-    first: &Move,
+    planned: &mut [Planned],
     (base, positions): (u64, &BTreeMap<ObjectId, u64>),
-  ) -> Vec<(u64, (u64, u64, u64))> {
-    let version_of = |green: u64| {
-      self.chains.get(&green).map_or(0, |chain| {
-        u64::try_from(chain.versions.len()).unwrap_or(u64::MAX)
-      })
+  ) -> Result<Option<Landed>, StoreRefused> {
+    let given = to_u64(positions.len());
+    let Some(first) = moves.first().filter(|_| given > 0) else {
+      return Ok(None);
     };
-    let otherwise = (first.green, version_of(first.green));
-    // One move brings every fresh object or leaves it to the first move, itself: one run.
+    let end = base.saturating_add(given);
+    let pair = |green: u64| {
+      let version = self
+        .chains
+        .get(&green)
+        .map_or(0, |chain| to_u64(chain.versions.len()));
+      (green, version)
+    };
     if moves.len() == 1 {
-      let given = u64::try_from(positions.len()).unwrap_or(u64::MAX);
-      return (given > 0)
-        .then(|| (base, (base.saturating_add(given), otherwise.0, otherwise.1)))
-        .into_iter()
-        .collect();
+      let (green, version) = pair(first.green);
+      return Ok(Some(Landed::Runs(vec![(base, end, green, version)])));
     }
-    let mut by: Vec<Option<(u64, u64)>> = vec![None; positions.len()];
-    let mut give = |position: u64, pair: (u64, u64)| {
-      let slot = usize::try_from(position.saturating_sub(base))
-        .ok()
-        .filter(|_| position >= base)
-        .and_then(|at| by.get_mut(at));
-      if let Some(slot @ None) = slot {
-        *slot = Some(pair);
+    let mut brought = Vec::with_capacity(moves.len());
+    for (movement, plan) in moves.iter().zip(planned.iter_mut()) {
+      let set = match plan.sets.take() {
+        Some(sets) => sets.brought,
+        None => self.members_positions(store, &movement.brought, (base, positions))?,
+      };
+      brought.push((pair(movement.green), set));
+    }
+    Ok(Some(Landed::Moves(Box::new(LandedMoves {
+      end,
+      brought,
+      otherwise: pair(first.green),
+    }))))
+  }
+
+  /// Whether a landing of several moves still awaits its map by position ([`Repository::settle_landings_turn`]).
+  pub fn landings_unsettled(&self) -> bool {
+    !self.unsettled.is_empty()
+  }
+
+  /// Derived: the most the oldest unsettled landing's runs could charge the store once mapped
+  /// ([`Repository::settle_landings_turn`]): a run's record a position it gave, at most. None with none unsettled.
+  pub fn settle_room(&self) -> u64 {
+    self
+      .unsettled
+      .front()
+      .and_then(|base| match self.landings.get(base) {
+        Some(Landed::Moves(moves)) => {
+          let given = usize::try_from(moves.end.saturating_sub(*base)).unwrap_or(usize::MAX);
+          Some(bytes(given, LANDING_BYTES))
+        }
+        _ => None,
+      })
+      .unwrap_or(0)
+  }
+
+  /// One turn of mapping the landings of several moves by position, oldest first (P2 piece 2): a position a unit, its
+  /// bringer the first of its landing's moves whose brought set holds it, joined into runs, until the quantum is spent,
+  /// a unit at least; a landing mapped whole has its runs put in place of its moves' sets and the store's charge moved
+  /// by the difference. Whether none is left. Refused only by the store's charge for a landing's runs, which leaves it
+  /// unsettled, answered by its moves' sets meanwhile, for a later turn.
+  pub fn settle_landings_turn(
+    &mut self,
+    store: &mut ContentStore,
+    quantum: Quantum<'_>,
+  ) -> Result<bool, StoreRefused> {
+    let deadline = quantum.clock.now_ns().saturating_add(quantum.ns);
+    let mut mapped = 0_u64;
+    let settled = loop {
+      match self.settle_unit(store) {
+        Ok(SettleUnit::Done) => break Ok(true),
+        Ok(SettleUnit::Mapped) => mapped = mapped.saturating_add(1),
+        Ok(SettleUnit::Settled) => {}
+        Err(refused) => break Err(refused),
+      }
+      if quantum.clock.now_ns() >= deadline {
+        break Ok(false);
       }
     };
-    for movement in moves {
-      let pair = (movement.green, version_of(movement.green));
-      match &movement.brought.staged {
-        Some(staged) if staged.stage == (base, positions.len()) => {
-          staged
-            .positions
-            .iter()
-            .for_each(|position| give(position, pair));
-        }
-        _ => movement
-          .brought
-          .new
-          .iter()
-          .filter_map(|id| positions.get(id))
-          .for_each(|position| give(*position, pair)),
-      }
+    self.count(|counters| counters.landing_mapped = counters.landing_mapped.saturating_add(mapped));
+    settled
+  }
+
+  /// One unit of [`Repository::settle_landings_turn`]: the oldest unsettled landing's next position mapped, or, mapped
+  /// whole, its runs put in its moves' place ([`Repository::settled_runs`]).
+  fn settle_unit(&mut self, store: &mut ContentStore) -> Result<SettleUnit, StoreRefused> {
+    let Some(base) = self.unsettled.front().copied() else {
+      return Ok(SettleUnit::Done);
+    };
+    let Some(Landed::Moves(moves)) = self.landings.get(&base) else {
+      self.unsettled.pop_front();
+      self.settling = None;
+      return Ok(SettleUnit::Settled);
+    };
+    let settling = match &mut self.settling {
+      Some(settling) if settling.base == base => settling,
+      other => other.insert(Settling {
+        base,
+        next: base,
+        runs: Vec::new(),
+      }),
+    };
+    if settling.next < moves.end {
+      let position = settling.next;
+      settling.map(position, moves.bringer(position));
+      return Ok(SettleUnit::Mapped);
     }
-    let mut runs: Vec<(u64, (u64, u64, u64))> = Vec::new();
-    for (position, pair) in (base..).zip(by) {
-      let (green, version) = pair.unwrap_or(otherwise);
-      match runs.last_mut() {
-        Some((_, (end, run_green, run_version)))
-          if *end == position && (*run_green, *run_version) == (green, version) =>
-        {
-          *end = position.saturating_add(1);
-        }
-        _ => runs.push((position, (position.saturating_add(1), green, version))),
+    self.settled_runs(store, base)?;
+    Ok(SettleUnit::Settled)
+  }
+
+  /// Puts the runs mapped for the landing at `base` in place of its moves' sets, the store's charge moved from the
+  /// sets' bytes to the runs'. Refused that charge, the runs are kept for a later turn and nothing changed.
+  fn settled_runs(&mut self, store: &mut ContentStore, base: u64) -> Result<(), StoreRefused> {
+    let was = match self.landings.get(&base) {
+      Some(Landed::Moves(moves)) => moves.cost(),
+      _ => 0,
+    };
+    let runs = self
+      .settling
+      .as_mut()
+      .map(|settling| core::mem::take(&mut settling.runs))
+      .unwrap_or_default();
+    let now = bytes(runs.len(), LANDING_BYTES);
+    let moved = if now > was {
+      store.charge(now.saturating_sub(was))
+    } else {
+      store.discharge(was.saturating_sub(now))
+    };
+    if let Err(refused) = moved {
+      if let Some(settling) = self.settling.as_mut() {
+        settling.runs = runs;
       }
+      return Err(refused.into());
     }
-    runs
+    self.landings_charged = self
+      .landings_charged
+      .saturating_sub(was)
+      .saturating_add(now);
+    self.landings.insert(base, Landed::Runs(runs));
+    self.unsettled.pop_front();
+    self.settling = None;
+    Ok(())
   }
 
   /// The position of `id`: given now, or its row's.
@@ -2451,6 +2570,9 @@ impl Repository {
       quiet: Cell::new(None),
       largest: self.largest,
       landings_charged: self.landings_charged,
+      // The fork reads its landings as they stand; the repository maps the unsettled ones, never the fork.
+      unsettled: VecDeque::new(),
+      settling: None,
       counters: Cell::new(StoreCounters::default()),
       window: self.window.clone(),
       levels: self.levels.clone(),
@@ -2504,10 +2626,112 @@ impl Repository {
   }
 }
 
-/// What a commit makes before its stage is adopted ([`Repository::prepared`]): the landing map's runs, each move's
+/// One landing's entry in the landing map (A-722: the version that brought each position, kept beside the rows, which
+/// no longer carry it), keyed by its first position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Landed {
+  /// Mapped by position: runs `[start, end)`, ascending and apart, each with the green and the version that brought it.
+  Runs(Vec<LandedRun>),
+  /// As a commit of several moves leaves it, before its turns map it ([`Repository::settle_landings_turn`]).
+  Moves(Box<LandedMoves>),
+}
+
+/// A landing's run: its first position, its end (exclusive), and the green and version that brought it.
+type LandedRun = (u64, u64, u64, u64);
+
+/// A landing of several moves as its commit leaves it ([`Landed::Moves`]): its end (exclusive), each move's green and
+/// version with the set its walk brought, in the commit's order, and the first move's pair, for a position none holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LandedMoves {
+  end: u64,
+  brought: Vec<((u64, u64), Positions)>,
+  otherwise: (u64, u64),
+}
+
+impl LandedMoves {
+  /// The green and version that brought `position`, within the landing: the first move whose set holds it, else the
+  /// first move's (A-722's rule, as the runs map it).
+  fn bringer(&self, position: u64) -> (u64, u64) {
+    self
+      .brought
+      .iter()
+      .find(|(_, set)| set.contains(position))
+      .map_or(self.otherwise, |(pair, _)| *pair)
+  }
+
+  /// What it charges the store: each move's set by its form's bytes and its pair a run's record.
+  fn cost(&self) -> u64 {
+    self.brought.iter().fold(
+      bytes(self.brought.len(), LANDING_BYTES),
+      |total, (_, set)| total.saturating_add(set.bytes()),
+    )
+  }
+}
+
+impl Landed {
+  /// The green and version that brought `position`, if this landing gave it.
+  fn bringer(&self, (base, position): (u64, u64)) -> Option<(u64, u64)> {
+    match self {
+      Landed::Runs(runs) => {
+        let after = runs.partition_point(|run| run.0 <= position);
+        let (_, end, green, version) = runs.get(after.checked_sub(1)?)?;
+        (position < *end).then_some((*green, *version))
+      }
+      Landed::Moves(moves) => {
+        (base <= position && position < moves.end).then(|| moves.bringer(position))
+      }
+    }
+  }
+
+  /// What it charges the store: a run's record a run, or its moves' sets ([`LandedMoves::cost`]).
+  fn cost(&self) -> u64 {
+    match self {
+      Landed::Runs(runs) => bytes(runs.len(), LANDING_BYTES),
+      Landed::Moves(moves) => moves.cost(),
+    }
+  }
+}
+
+/// A landing's mapping under way ([`Repository::settle_landings_turn`]): its first position, the next to map, and the
+/// runs mapped so far.
+#[derive(Debug)]
+struct Settling {
+  base: u64,
+  next: u64,
+  runs: Vec<LandedRun>,
+}
+
+impl Settling {
+  /// Maps `position`, the next, to the green and `version` that brought it: the last run grown where it ends there with
+  /// the same pair, else a run of its own.
+  fn map(&mut self, position: u64, (green, version): (u64, u64)) {
+    let after = position.saturating_add(1);
+    match self.runs.last_mut() {
+      Some((_, end, run_green, run_version))
+        if *end == position && (*run_green, *run_version) == (green, version) =>
+      {
+        *end = after;
+      }
+      _ => self.runs.push((position, after, green, version)),
+    }
+    self.next = after;
+  }
+}
+
+/// What one unit of a landing's mapping did ([`Repository::settle_landings_turn`]).
+enum SettleUnit {
+  /// None is left to map.
+  Done,
+  /// A position mapped.
+  Mapped,
+  /// A landing's runs put in place, or an entry no longer of moves passed over.
+  Settled,
+}
+
+/// What a commit makes before its stage is adopted ([`Repository::prepared`]): the landing map's entry, each move's
 /// planned version and its value, the head map's entries once moved, and what was charged.
 struct Prepared {
-  landed: Vec<(u64, (u64, u64, u64))>,
+  landed: Option<Landed>,
   planned: Vec<Planned>,
   values: Vec<Option<ContentId>>,
   entries: usize,

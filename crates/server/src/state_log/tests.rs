@@ -7,7 +7,7 @@ use slates_db::catalog::{
 };
 use slates_db::register::{HostId, ObjectId, Record};
 
-use super::{PartRefusal, StateLogs, judge, record_of, value_of};
+use super::{PartRefusal, StateLogs, Waited, judge, record_of, value_of};
 
 /// A repository on a partition, its id's last byte `serial`.
 fn repository(serial: u8) -> RepositoryId {
@@ -235,7 +235,7 @@ fn a_push_is_held_until_every_green_it_moved_is_placed_through_its_version() {
   });
   logs.note_greens(&third);
   let placed = |main_at: u64, topic_at: u64| {
-    move |green: VolumeId| if green == main { main_at } else { topic_at }
+    move |green: VolumeId| Some(if green == main { main_at } else { topic_at })
   };
   assert!(
     !logs.greens_placed(pushed, placed(1, 0)),
@@ -257,6 +257,19 @@ fn a_push_is_held_until_every_green_it_moved_is_placed_through_its_version() {
     logs.greens_placed(repository(2), placed(0, 0)),
     "nothing noted"
   );
+}
+
+/// Never placed is not placed at version 0 (main 01a20182's ruling of 2026-11-27 21:11): a green owed at version 0 none
+/// of whose versions placed stays owed, and is placed once version 0 is. Do: note a part moving a green to version 0;
+/// judge it never placed, then placed at 0. Expect owed, then placed. Before, a never-placed green read as placed at 0.
+#[test]
+fn a_green_never_placed_is_owed_even_at_version_zero() {
+  let pushed = repository(3);
+  let root = green(3);
+  let mut logs = StateLogs::default();
+  logs.note_greens(&push_part(pushed, (0, 1), (root, 0, 0)));
+  assert!(!logs.greens_placed(pushed, |_| None), "never placed: owed");
+  assert!(logs.greens_placed(pushed, |_| Some(0)), "placed at 0");
 }
 
 /// A-921's second mode (main 01a20182's ruling of 2026-11-26): an owner's parts ride its shard's recovery image and are
@@ -526,4 +539,27 @@ fn a_log_kept_for_its_newest_part_is_forgettable_only_once_every_candidate_holds
   }
   assert!(owed_positions(&logs, names_register).is_empty());
   assert_eq!(logs.bytes(), value_of(&phases).len());
+}
+
+/// A-936's replay half, the barrier's rule (main 01a20182's ruling of 2026-11-27 20:19): a push's barrier is not given up
+/// while what it waits for moves, and is once it stands still a whole window. Do: a window of 10; a mark rising by one
+/// every 6 (a replica build's work done rising as its store's replay fetches a name a second, run 2's shape), then the
+/// same wait with the mark flat (the work done as it was before the replay counted). Expect the rising one never
+/// expired over 60, and the flat one expired at 10.
+#[test]
+fn a_barrier_is_not_given_up_while_its_mark_rises_and_is_once_it_stands_still() {
+  let window = 10;
+  let mut rising = Waited::begun_at(0, 0);
+  for step in 1..=10u64 {
+    assert!(
+      !rising.expired_at((step, window), step * 6),
+      "rising at {step}"
+    );
+  }
+  let mut flat = Waited::begun_at(0, 0);
+  assert!(!flat.expired_at((0, window), 6), "within the window");
+  assert!(
+    flat.expired_at((0, window), 10),
+    "a whole window standing still"
+  );
 }

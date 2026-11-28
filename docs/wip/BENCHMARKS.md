@@ -19596,6 +19596,44 @@ What it says:
   24× to 2.1×, and the dump stays about 3×: both w-svn's.
 - **svnsync's row overlapped another round on the box,** so its times are not comparable with the rest of the table.
 
+## The svn writing session with git-2000: slates ahead of stock svnserve, HTTP 1.49× and svn:// 1.21× faster (goal 93; main 01a20182's round, 2026-11-27, b5ea7ecee)
+
+- **What.** The use test's writing session, measured a phase at a time by `an_svn_writing_session_measured`
+  (`crates/cli/tests/svn_interop.rs`, w-svn's be16a2521). Each leg imports git-2000.dump, then runs stock `svn` 1.15:
+  a checkout `--depth immediates`, a commit adding a file, a copy of the root, a merge (update, add, commit, update,
+  `merge -c HEAD`, status, `revert -R`) and a revision-property set. Stock svnserve (`svnserve -t` over the dump loaded
+  by `svnadmin`) runs the same session in the same run. The use test's `merge -c HEAD` and its hookless revprop change
+  fail on all three servers alike, so their seconds are each server's refusal.
+- **Machine, date, load, build.** This Mac (M-series, 18 cores, 128 GB), 2026-11-27 21:17:57-21:23:51 PST, load
+  45.10 / 37.29 / 35.13 at its start, release at b5ea7ecee (exe aa7e16be2150), stock Subversion 1.15. One run, so no
+  best. Its git-2000 fixture is the rebuilt `git_to_svn_dump.py src.git f7de81456940dd6f3274e461149bba12965de609 2000`,
+  sha256 e005db1c373feb5bd8d6a42052c27f8ba582181619ec9dfc6c7d82ccee8aa8c3, checked against this file's figures.
+- **Command.** `SLATES_SVN_WRITES_DUMP=<git-2000.dump> cargo test --release -p slates-cli --test svn_interop --
+  --ignored an_svn_writing_session_measured --nocapture`. Log: main 01a20182's
+  `~/.local/state/main-01a20182/rounds/svn-rel/an_svn_writing_session_measured.log`.
+
+Seconds per phase:
+
+| phase | stock svnserve | slates HTTP | slates svn:// |
+|---|---|---|---|
+| checkout | 0.98 | 0.37 | 0.76 |
+| commit | 1.07 | 0.37 | 0.99 |
+| copy | 0.53 | 0.04 | 0.12 |
+| merge | 4.07 | 3.89 | 3.71 |
+| propset | 0.36 | 0.02 | 0.22 |
+| **session** | **7.01** | **4.69 (1.49× faster)** | **5.80 (1.21× faster)** |
+
+What it says:
+- **The 11-24 row is closed, with slates ahead.** That round had the writing session at 14.2 s against stock's 6.8 s,
+  2.1× slower (the section above). Since then the import's slicing (A-920) and its r593 fix (912d891c9, which let
+  git-2000 import at all on this binary) are in.
+- **Most of the session is the `svn` client's own work.** The merge phase is about 3.7-4.1 s on every server; it is
+  mostly the client's local verbs (update, status, `revert -R`).
+- **The import against `svnadmin load`:** slates imported the dump in 8-10 s a leg against stock's 309.5 s load in the
+  same run.
+- **Debug, the day before the fix, for comparison (w-svn):** on the local 300-revision history the session was HTTP
+  5.75 s, svn:// 5.51 s, stock 7.50 s; on git-2000 in debug, HTTP 5.42 s, svn:// 5.82 s, stock 5.82 s.
+
 ## A Subversion repository's bytes on the changeset store against FSFS's: git-2000, 9.2 times (goal 93 perf; main 01a20182's order, 2026-11-24)
 
 - **What, and why.** Item 4 of main's note of 11-21 21:50: the storage half of "an order of magnitude faster", taken as a
@@ -20089,3 +20127,44 @@ it is real capacity on git/git: fewer roots inflated and steps rebuilt, more hit
   gain if anything.
 - **What is left:** git/git's working set is 2,511 MiB of trees inflated against this 12 MB budget (the GAPS entry "The
   fetch's read cache on git/git"); this piece takes the budget's own idle share back, not the working set.
+
+## The hg leg at 343703bd7, three runs: the stream clone 1.60× stock at best, its count stage 55 % of its steps (goal 93 perf; main 01a20182's hg_scale round, 2026-11-27 19:18 to 20:29 PST; recorded with cut 2, A-937)
+
+The round main ran once piece 2 of the stream's cuts (the index rows a run a step, c5862b6a0) was in, before cut 2 (the
+kept rendered length, A-937) landed: what cut 2 is measured against.
+
+- **Build.** `cargo build --release --locked -p slates-cli --bin slates` at 343703bd7, binary sha1 157a34b36a5a.
+- **Command**, from the worktree root: `SERVERS="stock slates" SLATES=<that binary>
+  KEEP_LOGS=~/.local/state/main-01a20182/rounds/hg-stream/logs bash crates/cli/bench/hg_scale.sh hg
+  ~/.local/state/main-01a20182/data/hg-src ~/.local/state/main-01a20182/rounds/hg-stream/work 3 3600`: three runs,
+  stock then slates each run, over hg-src (Mercurial's own history: 57,036 changesets, 4,283 files, 73.8 MB), stock
+  Mercurial 7.2.4 (Homebrew) as `hg` and its `hg serve`. Run by `~/slates-work/main-ship/hg-stream-round.sh`.
+- **Machine and load.** adas-macbook-pro-2, 2026-11-27 19:18 to 20:29:07 PST, shared: load 12 to 49 with main's other
+  rounds beside it; run 1 overlapped a release build at nice 15. Loaded points: the counts are the stable signal, the
+  times moved two to three times with load.
+- **The record.** `~/.local/state/main-01a20182/rounds/hg-stream/run.log` (every step's line) and `summary.txt` (each
+  stream's counters moved, from the status files in `logs/`).
+
+**Seconds a step** (each run, and the best of three against stock's):
+
+| step | stock (best) | slates runs 1, 2, 3 | slates best | slates against stock |
+|---|---|---|---|---|
+| stream clone | 3.07 | 15.41, 4.92, 6.25 | 4.92 | 1.60× slower |
+| push (whole history) | 34.3 | | 67.9 | 1.98× slower |
+| clone | 13.9 | | 22.2 | 1.60× slower |
+| incremental push (one changeset after the big push) | 0.375 | 5.03, 4.77, 3.16 | 3.16 | 8.4× slower |
+| incremental pull | 0.303 | | 0.515 | 1.70× slower |
+| 18 concurrent clones | 184 | | 140 | 1.31× faster |
+| 18 concurrent pulls | 1.32 | | 1.48 | 1.12× slower |
+
+**The stream's counters** (`vcs_store.hg_stream_steps.*` and `hg_stream_reads.*`), identical in all three runs: 842,218
+steps, of them count 464,254 (55 %), index 238,557 and data 139,403; the content store's reads, count 541,331 and index
+524,131. Run 1's two clocks (hg's own transfer line, 11.6 s at 6.34 MB/s, against a 15.4 s wall) put about 3.8 s before
+the first byte, the count stage and the head.
+
+- **What it decided** (main's reading of 20:30): cut 2 (A-937) removes the count stage, so a stream's head is named
+  from what the index kept and its first byte comes with no walk; then the data stage a run a step (73.8 MB over 139,403
+  steps, 529 bytes a step, about 30 µs a step: bound by the per-step cost, not by bytes); and the index stage's 524,131
+  reads on this layout, against 0.37 a revision on piece 2's red, are owed an explanation first. After those, the
+  one-changeset push right after the big push (8.4×), logs first: the big push's background let-go or publication,
+  or a fixed cost a push.

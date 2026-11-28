@@ -113,6 +113,7 @@ pub(crate) mod git_replay;
 pub(crate) mod hg_import;
 pub(crate) mod hg_made;
 pub(crate) mod hg_named;
+pub(crate) mod hg_sized;
 pub(crate) mod hg_tags;
 pub(crate) mod hg_view;
 pub(crate) mod homes;
@@ -273,6 +274,11 @@ pub(crate) struct VcsStores {
   /// lent to nothing ([`VcsStores::git`], [`VcsStores::subversion`] and their kin answer none) until the last record is
   /// replayed; bounded by the partition's repositories.
   rebuild_turns: BTreeMap<RepositoryId, (u64, usize)>,
+  /// The names each repository's rebuild fetched from the region so far (A-936's replay half, main 01a20182's ruling of
+  /// 2026-11-27 20:11): with the records it replayed, its progress ([`VcsStores::rebuild_steps`]), which a replica build
+  /// waiting on it reports so a push's barrier sees it move. Reset at each rebuild's start; bounded by the partition's
+  /// repositories.
+  rebuild_fetched: BTreeMap<RepositoryId, u64>,
   /// The last rebuild's generation: a rebuild started again ends the turns of the one before.
   rebuild_generations: u64,
   /// The git records whose replay is under way a turn at a time (A-722 part 4, [`git_replay`]): at most one a
@@ -353,6 +359,15 @@ pub(crate) struct VcsStores {
   /// Landed packs being let go a slice of windows a turn ([`LettingGo`]), and whether the task that turns them runs:
   /// bounded by the packs owed a let-go.
   letting_go: (std::collections::VecDeque<LettingGo>, bool),
+  /// The git repositories whose landings of several moves a task maps by position now ([`settle_landings_sliced`]):
+  /// bounded by the partition's repositories.
+  settling_landings: std::collections::BTreeSet<RepositoryId>,
+  /// Landed pushes' maps by object being freed a slice a turn ([`shed_sliced`]), and whether the task that frees them
+  /// runs: bounded by the pushes landed since it last ran.
+  shedding: (
+    std::collections::VecDeque<slates_git::store::Shedding>,
+    bool,
+  ),
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
@@ -365,6 +380,9 @@ pub(crate) struct VcsStores {
   /// Each repository's index merge under way between its slices ([`index_upkeep`]): one a repository, so bounded by the
   /// partition's repositories.
   index_upkeep: index_upkeep::Upkeep,
+  /// Each Mercurial repository's recount of its kept rendered length under way after a rebuild ([`hg_sized`]): one a
+  /// repository, so bounded by the partition's repositories.
+  pub(crate) hg_recounts: hg_sized::Recounts,
   /// Each HTTP commit under way (A-681 part C: a transaction a POST made, between its requests), by repository and
   /// transaction name, with the key of the principal that made it and the monotonic instant of its last step: at most
   /// one a repository and principal, a new POST replacing the older ([`VcsStores::begin_dav_commit`]), so bounded by the
@@ -830,6 +848,14 @@ impl VcsStores {
   /// What the stores hold of the shard's budget.
   pub(crate) fn charged(&self) -> u64 {
     self.charged
+  }
+
+  /// Repository `id`'s rebuild's progress while it runs: the records it replayed and the names it fetched from the
+  /// region, rising as it moves; `None` with no rebuild under way.
+  pub(crate) fn rebuild_steps(&self, id: RepositoryId) -> Option<u64> {
+    let (_, replayed) = self.rebuild_turns.get(&id)?;
+    let replayed = u64::try_from(*replayed).unwrap_or(u64::MAX);
+    Some(replayed.saturating_add(self.rebuild_fetched.get(&id).copied().unwrap_or(0)))
   }
 
   /// Whether repository `id`'s store is being made again from its records, lent to nothing until it is whole.
@@ -2765,6 +2791,9 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   })?;
   sealed.objects = RecordWriter::default();
   sealed.homed_committed();
+  settle_landings_sliced(state, repository);
+  let shedding = sealed.push.take_shedding();
+  shed_sliced(state, shedding);
   // A synchronous audit shard's history can bring nothing back (a bring-back awaits the node's store), so its landed
   // packs stay resident ([`KEEP_LANDED`]); a daemon's edges and tasks, and every let-go test, let them go.
   #[cfg(test)]
@@ -2789,6 +2818,147 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   }
   Ok(())
 }
+
+/// Starts the task that maps repository `id`'s landings of several moves by position a slice a turn
+/// ([`slates_git::store::Repository::settle_landings_turn`], P2 piece 2), where it has any and no task maps them yet:
+/// never in the landing's step, whose commit records each move's brought set and maps no position. Unspawned, counted
+/// [`LANDINGS_UNSETTLED_UNSPAWNED`], they wait for the repository's next commit to start one; meanwhile a look-up reads
+/// the moves' sets.
+fn settle_landings_sliced(state: &mut ShardState, id: RepositoryId) {
+  let unsettled = state
+    .vcs_stores
+    .git_ref(id)
+    .is_some_and(|(_, store)| store.repository.landings_unsettled());
+  if !unsettled || !state.vcs_stores.settling_landings.insert(id) {
+    return;
+  }
+  let turns = async move {
+    loop {
+      // Each slice waits while a publication of the shard's image is owed past its bound (A-870 piece 2), as the
+      // landed let-go's do.
+      crate::content_holder::image_resumed().await;
+      if crate::state::with_state_counted(|state| settle_landings_turn(state, id)) != Some(false) {
+        break;
+      }
+      slates_rt::futures::yield_now().await;
+    }
+    let _ =
+      crate::state::with_state_counted(|state| state.vcs_stores.settling_landings.remove(&id));
+  };
+  let spawned = slates_rt::futures::spawn(turns).and_then(slates_rt::futures::detach);
+  if spawned.is_err() {
+    state.vcs_stores.settling_landings.remove(&id);
+    state.count(LANDINGS_UNSETTLED_UNSPAWNED, 1);
+  }
+}
+
+impl VcsStores {
+  /// Whether a task maps repository `id`'s landings of several moves now ([`settle_landings_sliced`]).
+  #[cfg(test)]
+  pub(crate) fn settles(&self, id: RepositoryId) -> bool {
+    self.settling_landings.contains(&id)
+  }
+
+  /// The landed pushes' maps by object still queued to be freed ([`shed_sliced`]), and whether its task runs.
+  #[cfg(test)]
+  pub(crate) fn sheds(&self) -> (usize, bool) {
+    (self.shedding.0.len(), self.shedding.1)
+  }
+}
+
+/// One turn of repository `id`'s landings mapped by position, for the shard's step quantum, a unit at least: whether
+/// they are all mapped, or its store gone. A refusal of the store's room for a landing's runs ends the task, counted
+/// [`LANDINGS_SETTLE_REFUSED`]: the landing stays answered by its moves' sets, for the next commit's task.
+fn settle_landings_turn(state: &mut ShardState, id: RepositoryId) -> bool {
+  let ns = state.config.step_quantum_ns();
+  let room = state
+    .vcs_stores
+    .git_ref(id)
+    .map_or(0, |(_, store)| store.repository.settle_room());
+  let settled = within_budget(state, room, |stores| {
+    let (content, store) = stores.git(id)?;
+    let mut clock = crate::git_push::ShardClock;
+    let quantum = slates_git::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns,
+    };
+    Some(store.repository.settle_landings_turn(content, quantum))
+  });
+  match settled {
+    Some(Ok(done)) => done,
+    None => true,
+    Some(Err(_)) => {
+      state.count(LANDINGS_SETTLE_REFUSED, 1);
+      true
+    }
+  }
+}
+
+/// Queues what a landed push gave up of its maps by object (`slates_git::store::Shedding`, P2 piece 3) to be freed a
+/// slice a turn, never in the landing's step, and starts the task that frees the queue where none runs. Unspawned,
+/// counted [`SHED_UNSPAWNED`], the queue waits for the next landing to start one.
+fn shed_sliced(state: &mut ShardState, shedding: slates_git::store::Shedding) {
+  if shedding.is_empty() {
+    return;
+  }
+  state.vcs_stores.shedding.0.push_back(shedding);
+  if state.vcs_stores.shedding.1 {
+    return;
+  }
+  state.vcs_stores.shedding.1 = true;
+  let turns = async {
+    loop {
+      // Each slice waits while a publication of the shard's image is owed past its bound (A-870 piece 2), as the
+      // landed let-go's do.
+      crate::content_holder::image_resumed().await;
+      if crate::state::with_state_counted(shed_turn) != Some(false) {
+        break;
+      }
+      slates_rt::futures::yield_now().await;
+    }
+    let _ = crate::state::with_state_counted(|state| state.vcs_stores.shedding.1 = false);
+  };
+  let spawned = slates_rt::futures::spawn(turns).and_then(slates_rt::futures::detach);
+  if spawned.is_err() {
+    state.vcs_stores.shedding.1 = false;
+    state.count(SHED_UNSPAWNED, 1);
+  }
+}
+
+/// One turn of the queue [`shed_sliced`] keeps: the oldest landed push's maps freed an entry a unit for the shard's
+/// step quantum, a unit at least, counted [`SHED_ENTRIES`]. Whether the queue is empty.
+fn shed_turn(state: &mut ShardState) -> bool {
+  let ns = state.config.step_quantum_ns();
+  let mut clock = crate::git_push::ShardClock;
+  let queue = &mut state.vcs_stores.shedding.0;
+  let Some(oldest) = queue.front_mut() else {
+    return true;
+  };
+  let (done, freed) = oldest.turn(slates_git::store::hook_view::Quantum {
+    clock: &mut clock,
+    ns,
+  });
+  if done {
+    queue.pop_front();
+  }
+  let empty = queue.is_empty();
+  state.count(SHED_ENTRIES, freed);
+  empty
+}
+
+/// Format: the status counter of the entries of landed pushes' maps by object freed after their landings' steps
+/// (`shed_turn`).
+pub(crate) const SHED_ENTRIES: &str = "vcs_store.landed.shed_entries";
+
+/// Format: the status counter of the tasks to free landed pushes' maps that could not be spawned (`shed_sliced`).
+pub(crate) const SHED_UNSPAWNED: &str = "vcs_store.landed.shed_unspawned";
+
+/// Format: the status counter of the tasks to map a repository's landings of several moves that could not be spawned
+/// (`settle_landings_sliced`): the landings wait for the repository's next commit.
+pub(crate) const LANDINGS_UNSETTLED_UNSPAWNED: &str = "vcs_store.landings.unsettled_unspawned";
+
+/// Format: the status counter of the turns refused the store's room for a landing's runs (`settle_landings_turn`).
+pub(crate) const LANDINGS_SETTLE_REFUSED: &str = "vcs_store.landings.settle_refused";
 
 // The tests' switch, kept on the shard that serves the history, so a test's daemon alone meets it.
 #[cfg(test)]
@@ -4628,13 +4798,16 @@ fn svn_texts_inline(revision: &slates_svn::commit::revision::Revision) -> bool {
     })
 }
 
-/// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]); a
+/// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]), and a
+/// Mercurial one's kept rendered length recounted ([`hg_sized::rebuilt`]); a
 /// Mercurial store's revisions its replays kept from texts the node's changeset store gave noted for a home and let go,
 /// a turn at a time, as a landed push's are ([`let_go_brought_back`]). A Subversion repository's stored texts are not
 /// held again: they are its changesets' on the node's store, read through it (C2 stage B part 2 (b)). A git store's
 /// rebuild holds what its records name, as its live store does: nothing brought back to let go.
 fn replay_ended(state: &mut ShardState, id: RepositoryId) {
   index_upkeep::built(state, id);
+  // A replay names no chunk length: a Mercurial index rebuilt serves no stream until its recount ends.
+  hg_sized::rebuilt(state, id);
   let brought_back = match state.vcs_stores.entries.get_mut(&id) {
     Some(RepositoryStore::Mercurial(store)) => core::mem::take(&mut store.brought_back),
     _ => return,
@@ -5428,6 +5601,7 @@ fn rebuild_sliced_from(state: &mut ShardState, record: &RepositoryRecord) {
   let generation = state.vcs_stores.rebuild_generations.wrapping_add(1);
   state.vcs_stores.rebuild_generations = generation;
   state.vcs_stores.rebuild_turns.insert(id, (generation, 0));
+  state.vcs_stores.rebuild_fetched.insert(id, 0);
   state.vcs_stores.rebuilding.insert(id);
   let task =
     slates_rt::futures::spawn(rebuild_turns(id, generation)).and_then(slates_rt::futures::detach);
@@ -5503,6 +5677,9 @@ async fn names_fetched_for_rebuild(id: RepositoryId, generation: u64) {
     let put = crate::state::with_state(|state| match fetched {
       Some(bytes) if put_names_whole(state, &bytes) == Some(identity) => {
         state.count(NAMES_FETCHED, 1);
+        if let Some(fetched) = state.vcs_stores.rebuild_fetched.get_mut(&id) {
+          *fetched = fetched.saturating_add(1);
+        }
         true
       }
       _ => {
