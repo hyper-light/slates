@@ -958,3 +958,7 @@
   packed::Recent for the 772-787 MiB entry: budget the largest pack, charged, given back at idle (A-860); the question
   for main's figure is whether the test reads before or after the idle give-back. WAITING: main's v2.0.0 run (encode
   spin, deepen row) and the resident figure.
+- 11-28 01:53 PST: BUILT, NOT LANDED: the intake's reused buffers 13fc3d487 (agents/w-git-intake-buffers): 20,192,853 bytes
+  allocated reading 16,384,000 of objects before, 516,949 now. Held: git_push's mid-derivation test failed its time
+  check twice with it (80.4/39.3, 74.3/34.5 ms) and passed twice without (54.8/49.4, 48.1/46.7); main's A/B asked
+  (10 an arm, interleaved). Local worktree w-git-p2 carries the commit unpushed to main.
