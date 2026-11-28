@@ -64196,6 +64196,20 @@ daemon}.rs`, `crates/server/src/vcs_http/{git,hg,svn,daemon_edge}.rs`, `crates/s
   limit: a forward's first try may go to a readmitted creator, costing a redirect, never a wrong answer. Keeping a fact
   past A-309's removal to close it is a design change of its own.
 
+- **Readmission keeps what the skip reads (2026-11-27, w-shared for main 01a20182, its ruling of 20:48; diag 12's
+  x86_64 red).** The creator skip (`owner_location`'s `known_owner`: a first owner the configuration keeps a retirement or
+  a completed takeover of is not offered) read nothing once the host was admitted again: `admit` drops the completion
+  record (A-309, rightly: kept, a later takeover of the id that never completed would settle its lines), and the
+  retirement had gone at the completion. A stranger with no route of its own offered the readmitted creator. Now `admit`
+  moves the fact to `RegionalConfiguration::superseded` (host to the admitting version), read by routing alone, so
+  A-309's lineage concern and the routing concern stay apart. An ObjectId carries no incarnation, so the skip cannot tell
+  the host's objects from before and after; one it made after takes the location round, which finds it, while the entry
+  is kept. Bound: at most `completed_bound`, the earliest admitted let go first; a let-go entry costs a stranger one
+  forward refused as not the owner's, never a wrong owner. Regional layout 8 carries it; layout 7 is read with none.
+  Tests: fleet `a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it` asks the stranger's
+  direct route of an unrouted object of a's (red first: it named a); units `a_member_admitted_again_after_its_completed_takeover_stays_superseded`,
+  `superseded_members_are_bounded_the_earliest_let_go_first`, `raft_wire::tests::a_superseded_member_round_trips_and_layout_seven_reads_none`.
+
 ### A-925 — A node announces its own version-control edges to its peers, as a client reaches them (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; A-921 part 2's prerequisite)
 
 - **Why.** A-921's product half answers a request at a node that is not a repository's owner with where to go. A node

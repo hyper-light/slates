@@ -569,7 +569,13 @@
 >     from version 0). Both are reached now. Red first: a successor holding none of the green's records gave it up after
 >     37 attempts; it adopts it in 7 now, and takes a push. A-918 B's newcomer half is closed below. **Owed (main):**
 >     gate 24.
->   - **KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
+>   - **FIXED (w-shared, 2026-11-27; main 01a20182's ruling of 20:48; diag 12's x86_64 red): readmission no longer
+>     clears what the creator skip reads.** `RegionalConfiguration::admit` still drops a readmitted host's completion
+>     record (A-309) and now keeps the fact for routing alone (`superseded`, regional layout 8; at most `completed_bound`,
+>     the earliest let go first, a let-go costing one refused forward), which `owner_location`'s skip reads. Red first on
+>     the Mac: a921's forwarded test asks the stranger's direct route of an object of a's it has no route for; it named a,
+>     and the volume's own route named it too in that run; now none. The entry below stays as the record.
+>   - **Was a KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
 >     A readmission drops the host's completed takeover (`RegionalConfiguration::admit`, A-309) and its retirement is
 >     gone once that completes, so A-921 part 2's creator skip has nothing to read for it: a node that has not yet
 >     learned an object's adopter offers the readmitted creator first. It costs a redirect, never a wrong answer. The

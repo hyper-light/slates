@@ -39815,6 +39815,11 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
   // What the node holding none of it would try first: never a, the stale creator (the skip); before, a.
   let tried_first = daemons[stranger].known_owner(object);
   let route_view = daemons[stranger].route_view(object);
+  // An object of a's from before its false death that the stranger has no route of its own for, one nobody holds: its
+  // direct route comes from the configuration alone, which must still say a lost it (A-921 part 2's skip, main's ruling
+  // of 2026-11-27 20:48). Before, a's readmission dropped what the skip read, and this named a.
+  let unrouted = ObjectId::new(owner, ObjectId(id.bytes).local().wrapping_add(1));
+  let unrouted_first = daemons[stranger].known_owner(unrouted);
   let asked_a_before = summed_count(&daemons[0], "fleet.forward.refused.not_owner_here");
   let mut forwarded = Client::connect(daemons[stranger].instance());
   let served = poll_until(&observed, RETIREMENT_DEADLINE, || {
@@ -39832,7 +39837,7 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
   eprintln!(
     "victims-volume: holders {holders:?}, stranger {stranger}; cut {cut} taken {taken} healed {healed} readmitted \
      {readmitted}; served {served}; a asked {asked_a}; the stranger's claims {claims}; tried first {tried_first:?}, \
-     the stranger's route view then {route_view:?}"
+     the stranger's route view then {route_view:?}; an unrouted object of a's first tried {unrouted_first:?}"
   );
   assert!(
     placed && taken && readmitted,
@@ -39848,6 +39853,12 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
       .as_ref()
       .is_ok_and(|owner| *owner != Some(owner_host_of_a)),
     "the direct route never names a: {tried_first:?}"
+  );
+  assert!(
+    unrouted_first
+      .as_ref()
+      .is_ok_and(|owner| *owner != Some(owner_host_of_a)),
+    "a stranger's direct route, from the configuration alone, never names a: {unrouted_first:?}"
   );
 }
 
