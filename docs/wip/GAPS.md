@@ -1235,6 +1235,17 @@
 > green (the landing's structures in the shard's arena, so a free never hands pages back mid-step). Unexplained, logged,
 > not attributed: one run's 5,025 µs in a step whose footprint did not fall.
 
+> **FIXED 2026-11-27 (w-svn; main's ruling of 21:46): the greens' pending holds were copied whole every step.**
+> `name_holds::apply_some` took the whole owed list, applied a few holds before its step was spent and rebuilt the
+> rest, so a landing's 9,000-text holds were copied and regrown each step: 22.4 GB freed over 16,000 steps of one wide
+> copy import (debug; A-920 7c, 829985455). `Greens` now keeps them as two queues, takes and gives, each in order; a
+> step applies from the front and moves no hold it does not apply (`merge.name_hold.requeued`, 7,998,000 for 4,000
+> owed before, 0 after). The wide copy test runs in 8.5-9.6 s, from 14-17 s; the ~50 MB page return remains (3.2-4.6 ms
+> off the CPU in a step whose footprint fell 41-42 MB, 2 of 3 runs), so the arena piece stands. Siblings of the shape,
+> owed their own look: the import's read buffer drained from its front at every consume (`Importing::consume`,
+> `buffer.drain(..consumed)`, the rest moved each time) and a landing's pending section drained a store piece at a
+> time (`landing::sent_piece`, `pending.drain(..take)`).
+
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
