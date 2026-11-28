@@ -298,9 +298,9 @@ impl Store for Probed {
     u64::MAX
   }
 
-  /// Shape: a stream over this store steps unbounded at Apple M-series' 128-byte line, its rows at their first cost.
+  /// Shape: a stream over this store steps unbounded at Apple M-series' 128-byte line, its rows at their held form.
   fn step_copy(&self) -> slates_hg::render::StepCopy {
-    slates_hg::render::StepCopy::derived(u64::MAX, 128)
+    slates_hg::render::StepCopy::unlearned(u64::MAX, 128)
   }
 
   fn changeset_text(
@@ -1658,9 +1658,9 @@ impl Store for Grown {
     u64::MAX
   }
 
-  /// Shape: a stream over this store steps unbounded at Apple M-series' 128-byte line, its rows at their first cost.
+  /// Shape: a stream over this store steps unbounded at Apple M-series' 128-byte line, its rows at their held form.
   fn step_copy(&self) -> slates_hg::render::StepCopy {
-    slates_hg::render::StepCopy::derived(u64::MAX, 128)
+    slates_hg::render::StepCopy::unlearned(u64::MAX, 128)
   }
 
   /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole (every file holds

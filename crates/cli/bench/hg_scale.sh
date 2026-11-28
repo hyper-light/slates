@@ -259,7 +259,14 @@ incremental() {
   h -R "$scratch" commit -q -A -u "a-699 <scale@slates.invalid>" -d "2026-11-27 00:00 +0000" -m "one more changeset" \
     "$scratch/a-699-scale.txt"
   new=$(h -R "$scratch" log -r . -T '{node}')
+  # Slates' daemon's counters around its incremental push, every one that moved listed (goal 93: the one-changeset push
+  # after the whole-history push, 8.4 to 12.2 times stock's, read by its counters first; main 01a20182's order).
+  [ "$server" = slates ] && counters_at before incremental-push "$run"
   timed "$server incremental-push $run" "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} -R "$scratch" push -q -r "$new" "$URL"
+  if [ "$server" = slates ]; then
+    counters_at after incremental-push "$run"
+    counters_moved incremental-push "$run"
+  fi
   timed "$server incremental-pull $run" "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} -R "$clone" pull -q "$URL"
   if [ "$(h -R "$clone" log -r "$new" -T '{node}' 2> /dev/null)" != "$new" ]; then
     echo "$server incremental check MISSED" | tee -a "$RESULTS"
@@ -359,6 +366,33 @@ def walk(node):
             walk(value)
 walk(json.load(open(sys.argv[1])))
 print(" ".join(f"{name.split('vcs_store.')[-1]}={sums[name]}" for name in names))
+PY
+}
+
+# Every counter of slates' daemon that moved over step $1 of run $2 (its status files before and after, counters_at),
+# each summed over every shard's report of it, the largest first: one line, read outside the step's timing.
+counters_moved() {
+  local before="$WORK/status.before-$1-$2.json" after="$WORK/status.after-$1-$2.json"
+  [ -f "$before" ] && [ -f "$after" ] || return 0
+  python3 -I - "$before" "$after" << 'PY' | sed "s/^/slates moved $1 $2: /" | tee -a "$RESULTS"
+import json, sys
+def sums(path):
+    out = {}
+    def walk(node):
+        if isinstance(node, dict):
+            kind = node.get("kind")
+            if isinstance(kind, str) and isinstance(node.get("count"), int):
+                out[kind] = out.get(kind, 0) + node["count"]
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(json.load(open(path)))
+    return out
+before, after = sums(sys.argv[1]), sums(sys.argv[2])
+moved = sorted(((after[k] - before.get(k, 0), k) for k in after if after[k] != before.get(k, 0)), reverse=True)
+print(" ".join(f"{k}={d}" for d, k in moved))
 PY
 }
 

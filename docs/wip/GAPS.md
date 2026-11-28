@@ -1293,6 +1293,50 @@
 > `buffer.drain(..consumed)`, the rest moved each time) and a landing's pending section drained a store piece at a
 > time (`landing::sent_piece`, `pending.drain(..take)`).
 
+> **Finding, not worked under the freeze (w-svn, 2026-11-28; main's ruling of 00:03): the shard's budget does not count
+> a green's current maps.** `Green::retention_charge` (`crates/merge/src/engine.rs`), which
+> `merge_service::settle_green_retention` charges against the shard's budget, is the content and IPC histories beyond
+> the current values, the change index and the rejected cache; its doc and the settle's say it charges what the green
+> holds beyond its current files. No accounting charges the current maps' structure (content's `Files`, dirs, modes,
+> symlinks, hardlinks, specials, `links_to`, xattrs): about 0.5-1 MB at 9,000 paths (the retired member's measured
+> 9,002 labels in 402 KB and 903 child lists in 255 KB, debug), before A-920 arena unit 0 and after. They are bounded
+> by the paths a verdict's reservation, an import batch's room and the repository's chain caps admit, each refusing
+> typed (stated on `ptrie::Nodes`). The honest charge, when taken: a structure term in `retention_charge` from each
+> `Dim`'s exact run bytes, a verdict's reservation admitting its growth; it moves every green's retention and the caps.
+
+> **A-920 arena unit 0 BUILT (w-svn, 2026-11-27; main's rulings of 23:06, 23:08 and 23:25): a radix tree's labels and
+> child lists are runs in its arena.** `ptrie::store::Store` (chunks never reallocated, power-of-two classes with free
+> lists; under 2 × Σ peak live + classes × chunk, Wilson et al. 1995; runs reused, bumped and chunks added counted) holds
+> every node's label and child list, so a release gives them back to the arena, never to the heap: a 9,000-path map's
+> release freed 11,485 heap blocks for its 10,235 nodes before, at most its walk stack's 64 doublings after; the ptrie
+> oracle unchanged. A label of up to 15 bytes is kept inline in its node, a longer one a run (`ptrie::label`; main's
+> ruling of 2026-11-28 00:38), so a lookup reads no store for a short label: warmed, `get` at 9,000 keys had run at
+> about 1.16 times the tree's median before the arena with every label a run (52.9 against 45.6 ns); the node stays
+> 56 bytes (the inline form's 4 bytes past a run's fall in padding the node had). Its bound is stated on `ptrie::Nodes` (main's ruling of 00:03: no accounting charges the current
+> maps, the finding above, so (a) the retention charge is not owed under the freeze). Next, unit 1 (main's ruling of
+> 2026-11-28 01:04): `Green::content_history` joins the lineage's `dims::Arenas` like the green's other maps, one arena
+> a lineage, released into it a node a step and reused by the next member, so no chunk is freed on any landing; then the
+> remains' other fields by bytes. (b), narrowed: on the landing path a retired member releases into the lineage's
+> arenas, which live on, so the remains the reaper gets hold no chunks; chunks die only where a whole lineage is reaped
+> (`greens.rs`, `reaped.whole(Box::new(lineage))` once a repository's last member goes) and where a lone green is
+> dropped. Worked only if a figure shows either in a step; a lineage's reap is a cross-thread free of all its chunks,
+> so a round that drops a large repository is where it would show.
+
+> **A-920 arena unit 1 BUILT (w-svn, 2026-11-28; main's ruling of 01:04 and order of 01:09): a green's content history
+> is a map in its lineage's arenas.** `Green::content_history` was an ordered map of path strings the retired member's
+> remains dropped whole on the reaper; it is a `dims::Dim` of each path's entries (`history::Entries`) whose nodes live
+> in `dims::Arenas::content_history`, lent, swapped and released a node a step with the other maps (`Ptrie::get_mut`
+> added for the in-place changes, made copy-on-write as an insert is and held to the ptrie oracle). A released node's
+> entries go to the `Reaped`'s own list, so the history's keys and tree nodes free nothing to the heap: a retired
+> member that one revision of 9,000 new files made freed 28,499 heap blocks with its history before (the same count
+> the server's 9,000-path copy showed), 18,001 after, its entry lists and their values' piece lists (debug,
+> `a_retired_members_content_history_frees_no_key_or_tree_node_to_the_heap`). Page return, one debug run each of the server's wide tests (a point, not a judged figure): the copy's landing
+> step most off its CPU 3.9 µs, 20,054,184 bytes returned over 23 steps, none in a step whose footprint fell; the
+> move's 3.13 ms, in a step whose footprint fell 114,557,048 bytes (185,811,088 returned over 126 steps), so the
+> move's remains still return pages inside a step. Next, unit
+> 1b: the entry lists as runs of a lineage store (about 9,000 fewer), then 1c: the values' pieces (about 9,000 fewer);
+> the 1 ms assert returns with the piece after which the remains' drop frees nothing large.
+
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
@@ -5301,8 +5345,25 @@
 > `a_streams_gathering_steps_are_held_to_their_slice_at_the_learned_row_cost` (red: 16,156 ns against 1,660). Measured
 > after, the cost learned online over 8 streams (release, load 15 to 37, slice 2,428 ns at 39.0 GB/s): p50 1,250 to
 > 2,500 ns and p90 2,000 to 3,791 ns once learned; the first stream, at the derived first value (640 B, about ten
-> times low), p50 11,792 ns. Owed: the first value's derivation undercounts a row's work about ten times, so a shard's
-> first stream runs past its slices until its first step is measured.
+> times low), p50 11,792 ns. Then the first value, BUILT (2026-11-28, w-interop; main's ruling of 00:46: a measured
+> gap, fixed now): measured at the start beside the memcpy rate (`config::hg_gather_row_ns`, the boot probe's history
+> gathered whole, `slates_hg::gather_probe`, noted in the boot profile with its inputs), no longer derived from a row's
+> cache lines. The probe gathers its history as a shard's streams do, in steps of the copy slice over a few rounds,
+> each at what the one before measured, and keeps the last round's (a walk of the whole history in one go missed the
+> walks' restart a step pays). Held by `a_shards_first_gathering_steps_are_held_to_their_slice_at_the_probes_first_cost`
+> (hg), `t_first_cost_a_fresh_daemons_first_stream_is_held_to_its_slice` (a fresh daemon's first stream, its median
+> gathering step) and `the_boot_profile_measures_a_gathered_rows_cost_with_its_inputs`. OPEN: one release run before
+> main's 01:19 ruling (the measurement is main's) read the probe at 739 ns a row against about 84 learned online, so a
+> shard's first stream is held to its slices but about a row a step until it learns; main's release run is requested
+> (run-requests.md) to read the probe against the learned cost.
+> OPEN (main's hg round 3 at 47e37df66, 2026-11-28 01:47; the read charge in, the row cost not; record
+> `~/.local/state/main-01a20182/rounds/hg-stream-3/`): the stream clone 4.717 s best against stock's 1.482 (3.18x;
+> stock's own fell 3.046, 2.274, 1.482 s run to run), clone even, push 1.98x, incremental push 12.2x. The count stage is
+> gone and data steps 680, 595, 240 (from 139,403). Two readings, main's, inferred: runs 1 and 2 still took 238,558 and
+> 182,834 index steps (reads 1,331,345 and 1,052,756) against run 3's 10,613 (28,856), so the index's run count right
+> after a push drives the stage (the run merge's timing, below); and the server's own span (0.94 to 1.99 s, store waits
+> 0.49 to 0.63 s) is well under the client's 4.7 to 6.4 s, hg reporting 13 to 18 MB/s from slates against 37 to 77 from
+> stock: the stream's write path (the socket, the write slices, the chunks' sizes sent) is where the wall's time is.
 > OPEN, on the index's run merge: an index of many unmerged runs makes every restart costly. On the tests' 4 KiB layout
 > (55 runs, each one table holding a slice of every log) at a 94,797-byte step, 999 index steps and 31,888 reads for
 > 1,200 revisions: a restart opens about 32 tables, about 4.2 KB each, more than a step, so a step moves one row. The

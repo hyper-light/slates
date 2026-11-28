@@ -146,6 +146,7 @@ impl Green {
     self.hardlinks.swap_arena(&mut arenas.hardlinks);
     self.xattrs.swap_arena(&mut arenas.xattrs);
     self.links_to.swap_arena(&mut arenas.links_to);
+    self.content_history.swap_arena(&mut arenas.content_history);
   }
 
   /// Exchanges every map's arena with `other`'s.
@@ -158,6 +159,7 @@ impl Green {
     self.hardlinks.lend(&mut other.hardlinks);
     self.xattrs.lend(&mut other.xattrs);
     self.links_to.lend(&mut other.links_to);
+    self.content_history.lend(&mut other.content_history);
   }
 
   /// Every map's hold on its nodes, to give back a node a step in the lineage's arenas ([`Lineage::release_step`]):
@@ -172,6 +174,7 @@ impl Green {
       hardlinks: self.hardlinks.releasing(),
       xattrs: self.xattrs.releasing(),
       links_to: self.links_to.releasing(),
+      content_history: self.content_history.releasing(),
     }
   }
 

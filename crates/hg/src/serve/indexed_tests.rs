@@ -1972,7 +1972,7 @@ fn a_streams_gathering_steps_are_held_to_their_slice_at_the_learned_row_cost() {
   let (window, unlearned) = SERVER_LAYOUT;
   let line = unlearned.line;
   let copy = crate::render::StepCopy {
-    row: cost.row_bytes(line, (rate, unlearned.bytes)),
+    row: cost.row_bytes(0, (rate, unlearned.bytes)),
     ..unlearned
   };
   let streamed = stock_streamed_at(&mut dot, (window, copy));
@@ -1996,6 +1996,109 @@ fn a_streams_gathering_steps_are_held_to_their_slice_at_the_learned_row_cost() {
       "a gathering step past its slice: {took} ns at the measured costs against {slice_ns} ns ({step:?})"
     );
   }
+}
+
+/// The tests' clock in nanoseconds, from its first reading: what a timed stream's steps are timed by
+/// (`render::StepCopy::clock`).
+fn test_now_ns() -> u64 {
+  static BEGAN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+  let elapsed = BEGAN.get_or_init(std::time::Instant::now).elapsed();
+  u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// This machine's memcpy rate, bytes a second: the best of eight copies of 64 MiB, as the boot profile measures one.
+fn memcpy_rate() -> u64 {
+  let (source, mut target) = (vec![7_u8; 64 << 20], vec![0_u8; 64 << 20]);
+  let best = (0..8)
+    .map(|_| {
+      let began = std::time::Instant::now();
+      target.copy_from_slice(&source);
+      std::hint::black_box(&target);
+      began.elapsed().as_nanos()
+    })
+    .min()
+    .unwrap();
+  u64::try_from((64_u128 << 20) * 1_000_000_000 / best.max(1)).unwrap()
+}
+
+/// The boot probe's first cost a row, nanoseconds, measured as the daemon measures it (`config::hg_gather_row_ns`):
+/// the probe history in `window`'s windows gathered in steps of `copy` at the copy rate `rate`
+/// ([`crate::gather_probe::GatherProbe::learn`]), timed by the tests' clock.
+fn probe_row_ns(window: usize, copy: crate::render::StepCopy, rate: u64) -> u64 {
+  let probe = crate::gather_probe::GatherProbe::new(window).unwrap();
+  let timed = crate::render::StepCopy {
+    clock: Some(test_now_ns),
+    ..copy
+  };
+  probe.learn(timed, rate).unwrap().ns_a_row().unwrap()
+}
+
+/// Goal 93, the row cost's first value (main 01a20182's ruling of 2026-11-28 00:46: a measured gap fixed now; its red, a
+/// fresh daemon's first gathering step held to its slice plus one row's cost). Do: measure the boot probe's cost a row
+/// ([`probe_row_ns`], `gather_probe`) and this machine's copy rate; stream a history stock `hg` makes at the server's
+/// layout, a fresh shard's first stream (no step of its own measured), each row charged the probe's cost, every step
+/// timed. Expect the gathering steps its budget ended to take, at their median, their slice (94,797 B at the copy rate)
+/// and one row's probed cost at most. Red before: the first value derived from a row's cache lines (640 B), about ten
+/// times low, the first stream's p50 11,792 ns against a 2,428 ns slice (release, the MacBook). Skips, saying so, where
+/// stock `hg` does not run.
+#[test]
+fn a_shards_first_gathering_steps_are_held_to_their_slice_at_the_probes_first_cost() {
+  let Some(mut dot) = stock_history("first-cost") else {
+    eprintln!(
+      "SKIPPED a_shards_first_gathering_steps_are_held_to_their_slice_at_the_probes_first_cost: no `hg` here"
+    );
+    return;
+  };
+  let (window, base) = SERVER_LAYOUT;
+  let rate = memcpy_rate();
+  let first_ns = probe_row_ns(window, base, rate);
+  let copy = crate::render::StepCopy {
+    row: crate::render::RowCost::default().row_bytes(first_ns, (rate, base.bytes)),
+    clock: Some(test_now_ns),
+    ..base
+  };
+  let mut store = ContentStore::new(1 << 26, window).unwrap();
+  let mut imported = import(&mut dot, &mut store, Admission::new(1 << 26)).unwrap();
+  sized_by(&mut imported.index, &mut store, &|index, store| {
+    Box::new(whole_texts(index, store))
+  });
+  imported.index.rows().seal_all(&mut store).unwrap();
+  let mut streaming = crate::render::Streaming::default();
+  streaming.set_step_copy(copy);
+  let mut source = whole_texts(&imported.index, &store);
+  let (mut out, mut timed) = (Vec::new(), Vec::new());
+  loop {
+    crate::render::answer_want(&mut streaming, &mut source).unwrap();
+    let began = test_now_ns();
+    let more = streaming
+      .step(&imported.index, &store, &mut room(), &mut out)
+      .unwrap();
+    let took = test_now_ns() - began;
+    let budgeted = streaming
+      .take_gather_trace()
+      .iter()
+      .any(|step| step.ended == crate::render::GatherEnd::Budget);
+    if budgeted {
+      timed.push(took);
+    }
+    if !more {
+      break;
+    }
+  }
+  timed.sort_unstable();
+  let slice_ns = base.bytes * 1_000_000_000 / rate;
+  let p50 = timed[timed.len() / 2];
+  eprintln!(
+    "first cost: {first_ns} ns a row ({} B at {rate} B/s); {} budget-ended gathering steps, p50 {p50} ns, most {:?}; \
+     the slice {slice_ns} ns",
+    copy.row,
+    timed.len(),
+    timed.last()
+  );
+  assert!(
+    p50 <= slice_ns + first_ns,
+    "a fresh shard's gathering steps past their slice: p50 {p50} ns against {slice_ns} ns and a row's {first_ns}"
+  );
 }
 
 /// Goal 93, hg's whole-history gap (main 01a20182's ruling of 2026-11-27 22:13: hg-src's index stage took a step a row,

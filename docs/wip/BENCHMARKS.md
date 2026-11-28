@@ -20168,3 +20168,30 @@ the first byte, the count stage and the head.
   reads on this layout, against 0.37 a revision on piece 2's red, are owed an explanation first. After those, the
   one-changeset push right after the big push (8.4×), logs first: the big push's background let-go or publication,
   or a fixed cost a push.
+
+## A radix tree's labels and child lists as runs in its arena: insert, fork and remove 19-41 % faster, get no slower (A-920 arena unit 0; main 01a20182's A/B, 2026-11-28 01:46 to 01:58 PST)
+
+- **What.** `ptrie_bench` (`crates/merge/examples/ptrie_bench.rs`, warmed: `WARM_UP_MS` 50, `ROUNDS` 50, every round
+  printed) and `verdict_bench`, A = main 13330837e (no arena), B = agents/w-svn-arena-unit0 3becc31b7 (unit 0: every
+  node's label and child list a run of its arena's stores, a label of up to 15 bytes kept in its node; GAPS, "A-920
+  arena unit 0 BUILT"). Same bench file in both arms (checked by `cmp`).
+- **Machine, date, load, build.** This Mac (M-series, 18 cores, 128 GB), 2026-11-28 01:46:50-01:58 PST, load 23.26 /
+  25.50 / 27.51 at the runs' start (the fleet's agents running). Each arm release in a worktree and a target of its own:
+  A's ptrie_bench 8fbfbf5e0ea2, B's 983b770aee85.
+- **Command.** main 01a20182's `~/slates-work/main-ship/ptrie-ab2.sh` (`RUNS=6`): ptrie_bench ABAB × 6, verdict_bench
+  ABAB × 3. Record: `~/.local/state/main-01a20182/rounds/ptrie-ab-2/` (`summary.txt`, every run's output beside it).
+
+Medians, ns a key, A / B (B/A):
+
+| n | get | insert | fork + insert | remove |
+|---|---|---|---|---|
+| 9,000 | 51.9 / 49.1 (0.95) | 124.3 / 94.5 (0.76) | 156.6 / 96.8 (0.62) | 228.9 / 136.0 (0.59) |
+| 100,000 | 160.1 / 154.4 (0.96) | 173.9 / 141.2 (0.81) | 291.8 / 234.0 (0.80) | 373.1 / 245.6 (0.66) |
+
+What it says:
+- **Get no longer regresses.** With every label a run, get at 9,000 keys had been about 1.16 times A's (w-svn's
+  warmed table: 52.9 against 45.6 ns); the inline labels bring it to 0.95.
+- **Insert, fork and remove are 19-41 % faster**: a node's label and child list come from the arena's free lists, never
+  the allocator.
+- **verdict_bench is even within its spread:** the median of the shapes' B/A medians is 1.05 (0.61-1.74), each arm
+  spreading up to 2× on its own.

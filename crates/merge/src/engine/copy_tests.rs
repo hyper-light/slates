@@ -2704,7 +2704,7 @@ fn every_key_by_a_whole_walk(green: &Green, root: &str) -> Vec<super::IdentityKe
   use super::{IdentityKey, union_keys};
   let inside = |path: &String| in_tree(path, root);
   let mut keys = Vec::new();
-  let files = union_keys(green.content.keys(), green.content_history.keys().cloned());
+  let files = union_keys(green.content.keys(), green.content_history.keys());
   keys.extend(files.filter(inside).map(IdentityKey::File));
   let specials = union_keys(green.specials.keys(), green.special_history.keys().cloned());
   keys.extend(specials.filter(inside).map(IdentityKey::Special));

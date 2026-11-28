@@ -1158,7 +1158,10 @@ pub enum CheckpointStep {
   Built(Box<crate::checkpoint::Checkpoint>),
 }
 
-type ContentHistory = BTreeMap<String, Vec<(u64, Option<crate::history::Value>)>>;
+/// The content history: each path's [`crate::history::Entries`], a persistent map whose nodes live in the lineage's
+/// arena (A-920 unit 1, [`crate::dims::Arenas`]), so a retired member's history frees no key or tree node to the heap.
+/// A green's history is never shared with another green (a branch's starts empty), so its nodes are never copied.
+type ContentHistory = crate::dims::Dim<crate::history::Entries>;
 
 /// A per-path value history for a namespace dimension: the value at each version the path changed,
 /// `None` marking a removal (mode, symlink target, hard-link target). Reconstructs a base version.
@@ -2022,15 +2025,14 @@ pub struct ChangeAt<'a> {
 
 /// The paths of a per-path history that changed at a version in `(from, to]` (the model's, `test-model`).
 #[cfg(feature = "test-model")]
-fn paths_changed_in<T>(
-  histories: &BTreeMap<String, Vec<(u64, T)>>,
+fn paths_changed_in<'a, T: 'a, K: Into<String>>(
+  histories: impl Iterator<Item = (K, &'a Vec<(u64, T)>)> + 'a,
   from: u64,
   to: u64,
-) -> impl Iterator<Item = String> + '_ {
+) -> impl Iterator<Item = String> + 'a {
   histories
-    .iter()
     .filter(move |(_, history)| history_touches(history, from, to))
-    .map(|(path, _)| path.clone())
+    .map(|(path, _)| path.into())
 }
 
 /// Whether a `(version, present)` history has the entity present at `version`: the last entry at or
@@ -3988,12 +3990,12 @@ impl Green {
   #[cfg(feature = "test-model")]
   pub fn changed_between_by_histories(&self, from: u64, to: u64) -> Vec<String> {
     let mut changed: BTreeSet<String> = BTreeSet::new();
-    changed.extend(paths_changed_in(&self.content_history, from, to));
-    changed.extend(paths_changed_in(&self.special_history, from, to));
-    changed.extend(paths_changed_in(&self.dir_history, from, to));
-    changed.extend(paths_changed_in(&self.mode_history, from, to));
-    changed.extend(paths_changed_in(&self.symlink_history, from, to));
-    changed.extend(paths_changed_in(&self.hardlink_history, from, to));
+    changed.extend(paths_changed_in(self.content_history.iter(), from, to));
+    changed.extend(paths_changed_in(self.special_history.iter(), from, to));
+    changed.extend(paths_changed_in(self.dir_history.iter(), from, to));
+    changed.extend(paths_changed_in(self.mode_history.iter(), from, to));
+    changed.extend(paths_changed_in(self.symlink_history.iter(), from, to));
+    changed.extend(paths_changed_in(self.hardlink_history.iter(), from, to));
     changed.extend(
       self
         .xattr_history
@@ -4693,7 +4695,7 @@ impl Green {
     // symlinks, hard links and xattrs from a value history (a removal is a `None` entry). A key with
     // no history has held its current value since version 0, so each dimension's keys are its current
     // keys and its history's together (the one history rule, A-534).
-    let files = union_keys(self.content.keys(), self.content_history.keys().cloned())
+    let files = union_keys(self.content.keys(), self.content_history.keys())
       .filter_map(|path| {
         let len = self.content_len_at(&path, version)?;
         Some((path, len as u64))
@@ -4927,7 +4929,7 @@ impl Green {
         .map(|(path, bytes)| (path, Cow::Borrowed(bytes)))
         .collect();
     }
-    union_keys(self.content.keys(), self.content_history.keys().cloned())
+    union_keys(self.content.keys(), self.content_history.keys())
       .filter_map(|path| {
         let bytes = self.content_ref_at_bytes(&path, version)?;
         Some((path, bytes))
@@ -5063,7 +5065,7 @@ impl Green {
         .map(|(path, content)| (path, usize::try_from(content.len()).unwrap_or(usize::MAX)))
         .collect();
     }
-    union_keys(self.content.keys(), self.content_history.keys().cloned())
+    union_keys(self.content.keys(), self.content_history.keys())
       .filter_map(|path| {
         let len = self.content_len_at(&path, version)?;
         Some((path, len))
@@ -5095,7 +5097,7 @@ impl Green {
   ) {
     let mut carried = Vec::new();
     let mut named = Vec::new();
-    for (path, entries) in &self.content_history {
+    for (path, entries) in self.content_history.iter() {
       let Some((version, value)) = entries.iter().rev().find(|(v, _)| *v <= at) else {
         continue;
       };
@@ -5147,11 +5149,12 @@ impl Green {
       self.history_lists = self.history_lists.saturating_add(value.list_bytes());
       self.history_current = self.history_current.saturating_add(current_bytes(value));
     }
-    self
-      .content_history
-      .entry(path)
-      .or_default()
-      .push((version, value));
+    match self.content_history.get_mut(&path) {
+      Some(history) => history.push((version, value)),
+      None => {
+        self.content_history.insert(path, vec![(version, value)]);
+      }
+    }
   }
 
   /// Before `path`'s first recorded content change since it held bytes it did not record (a change at `version`),
@@ -7102,8 +7105,8 @@ impl Green {
   /// Each path's last change after the origin in any dimension, read off the histories' last entries.
   fn last_changes_after_origin(&self) -> BTreeMap<String, u64> {
     let mut last: BTreeMap<String, u64> = BTreeMap::new();
-    for (path, history) in &self.content_history {
-      note_last(&mut last, path, history.last().map(|(v, _)| *v));
+    for (path, history) in self.content_history.iter() {
+      note_last(&mut last, &path, history.last().map(|(v, _)| *v));
     }
     for (path, history) in &self.special_history {
       note_last(&mut last, path, history.last().map(|(v, _)| *v));
@@ -9198,15 +9201,15 @@ impl Green {
       return 0;
     }
     let every: BTreeSet<String> = self
-      .content_history
+      .special_history
       .keys()
-      .chain(self.special_history.keys())
       .chain(self.mode_history.keys())
       .chain(self.symlink_history.keys())
       .chain(self.hardlink_history.keys())
       .chain(self.dir_history.keys())
       .chain(self.xattr_history.keys().map(|(path, _)| path))
       .cloned()
+      .chain(self.content_history.keys())
       .collect();
     self.fold_paths_before(floor, &every)
   }

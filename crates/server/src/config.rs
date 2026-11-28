@@ -459,6 +459,12 @@ pub struct DaemonConfig {
   /// second. A §4.6 L2 shift is a block copy, so this is what sizes its slice against the shard's live step
   /// quantum ([`DaemonConfig::copy_slice_bytes`]) — the hash rate would be the wrong question for it.
   pub memcpy_bytes_per_second: u64,
+  /// Measured: a Mercurial stream's gathering a row, nanoseconds, timed at the start over the boot probe's history
+  /// (`slates_hg::gather_probe`) in the shard's content window, the median of a step budget's runs: a shard's learned row
+  /// cost's first value (`slates_hg::render::RowCost`; main 01a20182's ruling of 2026-11-28 00:46), until its streams'
+  /// own steps are measured. Zero where the probe could not be made, which leaves a row its held form's charge until
+  /// then.
+  pub hg_gather_row_ns: u64,
   /// Derived: the compress-or-not cost model each sealed chunk is stored under (§4.11, D-17): the boot
   /// profile's measured codec points (LZ4 and each zstd level's compress and decompress throughput and
   /// ratio over the probe corpus) as the policy's candidates; a byte's neutral worth = its measured
@@ -1053,6 +1059,7 @@ impl DaemonConfig {
     );
     derivations.push(note("archive_slice_bytes", &archive_slice_bytes));
     let svn_digest_bytes_per_second = svn_digest_rate(runtime.step_budget_ns);
+
     // The boot value, for the record: an export sizes each piece by the live quantum, as an archive's slice is.
     let svn_text_piece_bytes: Derived<u64> = derived!(
       copy_bound_bytes(svn_digest_bytes_per_second, runtime.step_budget_ns),
@@ -1079,6 +1086,23 @@ impl DaemonConfig {
       ["memcpy", "rt.step_budget_ns"]
     );
     derivations.push(note("copy_slice_bytes", &copy_slice_bytes));
+    let content_window =
+      slates_vfs::content::chunk_bytes(usize::try_from(page).unwrap_or(usize::MAX)).get();
+    let hg_copy = slates_hg::render::StepCopy {
+      bytes: copy_slice_bytes.get().max(1),
+      line: profile.facts.cache_line.max(1),
+      row: 0,
+      clock: Some(slates_machine::clock::monotonic_ns),
+    };
+    let hg_gather_row_ns = hg_gather_row_ns(content_window, hg_copy, memcpy_bytes_per_second.get());
+    derivations.push(format!(
+      "hg_gather_row_ns = {hg_gather_row_ns}: measured, the boot probe's history gathered as a shard's streams gather it, \
+       in steps of the copy slice, its time over its rows (inputs: a {content_window}-byte content window, a {}-byte \
+       step at a {}-byte line, {} memcpy bytes a second)",
+      hg_copy.bytes,
+      hg_copy.line,
+      memcpy_bytes_per_second.get()
+    ));
     let git_rates = git_rates();
     derivations.push(format!(
       "git_rates = deflate ns a KiB by level {:?}, saving {:?} thousandths of its input by level, delta search {} ns a \
@@ -1346,6 +1370,7 @@ impl DaemonConfig {
       blake3_bytes_per_second: profile.hash.blake3_bytes_per_second,
       svn_digest_bytes_per_second,
       memcpy_bytes_per_second: memcpy_bytes_per_second.get(),
+      hg_gather_row_ns,
       codec,
       git_rates,
       telemetry_spans_per_reply: telemetry_spans_per_reply.get(),
@@ -1703,6 +1728,21 @@ fn svn_digest_rate(step_budget_ns: u64) -> u64 {
   bytes
     .saturating_mul(NANOS_PER_SECOND)
     .checked_div(measured.median_ns())
+    .unwrap_or(0)
+}
+
+/// Measures a Mercurial stream's gathering a row, nanoseconds (goal 93; main 01a20182's ruling of 2026-11-28 00:46): the
+/// boot probe's history (`slates_hg::gather_probe::GatherProbe`) made in a store of `window`-byte windows and gathered as
+/// a shard's streams gather, in steps of `copy` at the copy rate `bytes_per_second` (`GatherProbe::learn`), its time over
+/// its rows. Zero where the probe history cannot be made or gathered.
+fn hg_gather_row_ns(
+  window: usize,
+  copy: slates_hg::render::StepCopy,
+  bytes_per_second: u64,
+) -> u64 {
+  slates_hg::gather_probe::GatherProbe::new(window)
+    .and_then(|probe| probe.learn(copy, bytes_per_second))
+    .and_then(|cost| cost.ns_a_row())
     .unwrap_or(0)
 }
 
@@ -2360,6 +2400,26 @@ mod tests {
   /// Shape: a Windows CI runner's measured reserve per shard (main's diag CI 2, run 45986066740: its effective capacity
   /// of 17,174,360,064 bytes over one shard and its memory classes), no multiple of four pages.
   const WINDOWS_RESERVE: u64 = 5_724_786_688;
+
+  /// Goal 93, the row cost's first value (main 01a20182's ruling of 2026-11-28 00:46: measured at the start, beside the
+  /// memcpy rate, in the boot profile with its inputs). Do: derive a config. Expect a Mercurial gathering's cost a row
+  /// measured (`hg_gather_row_ns`, nonzero: the boot probe's history made and timed) and noted in the boot profile's
+  /// derivations with its inputs: the content window, the step and its line, the memcpy rate.
+  #[test]
+  fn the_boot_profile_measures_a_gathered_rows_cost_with_its_inputs() {
+    let profile = crate::daemon::test_profile();
+    let config = DaemonConfig::derive(&profile, "hg-gather-row", Some(1));
+    assert!(config.hg_gather_row_ns > 0, "the boot probe measured a row");
+    let noted = config
+      .derivations
+      .iter()
+      .find(|line| line.starts_with("hg_gather_row_ns = "))
+      .expect("noted in the boot profile");
+    assert!(
+      noted.contains("content window") && noted.contains("step at") && noted.contains("memcpy"),
+      "{noted}"
+    );
+  }
 
   /// Main's Windows CI red of 2026-11-27 (run 45986066740): the write log is a quarter of the reserve, so with Windows'
   /// reserve the checkpoint slots and the delta log began 1,024 bytes past a page, and a give-back could take no page

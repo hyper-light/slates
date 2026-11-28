@@ -1917,7 +1917,7 @@ impl Green {
     let mut keys: Vec<IdentityKey> = Vec::new();
     let files = union_keys(
       self.content.keys_with_prefix(root),
-      recorded_from(&self.content_history, root),
+      self.content_history.prefix(root).map(|(key, _)| key),
     );
     keys.extend(files.filter(inside).map(IdentityKey::File));
     let specials = union_keys(

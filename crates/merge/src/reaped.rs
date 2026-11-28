@@ -9,7 +9,7 @@
 //!
 //! **What.** So the release frees nothing of its own on the shard. Each unit's walk is done there (a node's hold given
 //! back, its slot freed, its children queued, its block's holder let go), and what the unit frees is moved into a
-//! [`Reaped`] instead: the node's label and child list, its value's heap, a block's bytes, an owned history chunk, and
+//! [`Reaped`] instead: its value's heap, a block's bytes, an owned history chunk, and
 //! once the holds are back, the retired green's remains whole. The caller hands the [`Reaped`] to a thread of its
 //! own (the server's reaper), which drops it there; with no such thread it drops it in place, as before.
 //!
@@ -23,12 +23,14 @@ use std::collections::BTreeSet;
 /// buffers, child lists and strings each in a list of their kind, anything else whole. [`Reaped::taken`] counts them.
 #[derive(Default)]
 pub struct Reaped {
-  /// Nodes' labels, blocks' bytes, owned history chunks and byte values.
+  /// Blocks' bytes, owned history chunks and byte values (a node's label and child list are its arena's runs since
+  /// A-920 unit 0, given back to the arena, not taken here).
   bytes: Vec<Vec<u8>>,
-  /// Nodes' child lists.
-  children: Vec<Vec<(u8, usize)>>,
   /// String values.
   strings: Vec<String>,
+  /// Content histories' entry lists (A-920 unit 1: a retired member's content history is released into its lineage's
+  /// arena a node a step, and each path's entries are moved here, not dropped on the shard).
+  histories: Vec<crate::history::Entries>,
   /// Anything else, whole: a retired green's remains, an emptied lineage, an arena's emptied lists, rarer values.
   whole: Vec<Box<dyn Any + Send>>,
   /// The things taken, in all.
@@ -62,20 +64,26 @@ impl Reaped {
     }
   }
 
-  /// A node's child list taken, when it holds an allocation.
-  pub(crate) fn children(&mut self, children: Vec<(u8, usize)>) {
-    if children.capacity() > 0 {
-      self.children.push(children);
-      self.taken = self.taken.saturating_add(1);
-    }
-  }
-
   /// `string` taken, when it holds an allocation.
   pub(crate) fn string(&mut self, string: String) {
     if string.capacity() > 0 {
       self.strings.push(string);
       self.taken = self.taken.saturating_add(1);
     }
+  }
+
+  /// A path's content history `entries` taken, when they hold an allocation.
+  pub(crate) fn history(&mut self, entries: crate::history::Entries) {
+    if entries.capacity() > 0 {
+      self.histories.push(entries);
+      self.taken = self.taken.saturating_add(1);
+    }
+  }
+
+  /// The content histories taken so far, out of this `Reaped`: what a test drops on its own to count the frees.
+  #[cfg(test)]
+  pub(crate) fn take_histories(&mut self) -> Vec<crate::history::Entries> {
+    std::mem::take(&mut self.histories)
   }
 
   /// `thing` taken whole: dropped with the rest, wherever the holder sends it.
@@ -116,6 +124,12 @@ impl Reapable for BTreeSet<String> {
     if !self.is_empty() {
       reaped.whole(Box::new(self));
     }
+  }
+}
+
+impl Reapable for crate::history::Entries {
+  fn reap(self, reaped: &mut Reaped) {
+    reaped.history(self);
   }
 }
 
