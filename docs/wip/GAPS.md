@@ -1303,6 +1303,21 @@
 > dropped. Worked only if a figure shows either in a step; a lineage's reap is a cross-thread free of all its chunks,
 > so a round that drops a large repository is where it would show.
 
+> **A-920 arena unit 1 BUILT (w-svn, 2026-11-28; main's ruling of 01:04 and order of 01:09): a green's content history
+> is a map in its lineage's arenas.** `Green::content_history` was an ordered map of path strings the retired member's
+> remains dropped whole on the reaper; it is a `dims::Dim` of each path's entries (`history::Entries`) whose nodes live
+> in `dims::Arenas::content_history`, lent, swapped and released a node a step with the other maps (`Ptrie::get_mut`
+> added for the in-place changes, made copy-on-write as an insert is and held to the ptrie oracle). A released node's
+> entries go to the `Reaped`'s own list, so the history's keys and tree nodes free nothing to the heap: a retired
+> member that one revision of 9,000 new files made freed 28,499 heap blocks with its history before (the same count
+> the server's 9,000-path copy showed), 18,001 after, its entry lists and their values' piece lists (debug,
+> `a_retired_members_content_history_frees_no_key_or_tree_node_to_the_heap`). Page return, one debug run each of the server's wide tests (a point, not a judged figure): the copy's landing
+> step most off its CPU 3.9 µs, 20,054,184 bytes returned over 23 steps, none in a step whose footprint fell; the
+> move's 3.13 ms, in a step whose footprint fell 114,557,048 bytes (185,811,088 returned over 126 steps), so the
+> move's remains still return pages inside a step. Next, unit
+> 1b: the entry lists as runs of a lineage store (about 9,000 fewer), then 1c: the values' pieces (about 9,000 fewer);
+> the 1 ms assert returns with the piece after which the remains' drop frees nothing large.
+
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history

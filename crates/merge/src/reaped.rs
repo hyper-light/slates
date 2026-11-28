@@ -28,6 +28,9 @@ pub struct Reaped {
   bytes: Vec<Vec<u8>>,
   /// String values.
   strings: Vec<String>,
+  /// Content histories' entry lists (A-920 unit 1: a retired member's content history is released into its lineage's
+  /// arena a node a step, and each path's entries are moved here, not dropped on the shard).
+  histories: Vec<crate::history::Entries>,
   /// Anything else, whole: a retired green's remains, an emptied lineage, an arena's emptied lists, rarer values.
   whole: Vec<Box<dyn Any + Send>>,
   /// The things taken, in all.
@@ -69,6 +72,20 @@ impl Reaped {
     }
   }
 
+  /// A path's content history `entries` taken, when they hold an allocation.
+  pub(crate) fn history(&mut self, entries: crate::history::Entries) {
+    if entries.capacity() > 0 {
+      self.histories.push(entries);
+      self.taken = self.taken.saturating_add(1);
+    }
+  }
+
+  /// The content histories taken so far, out of this `Reaped`: what a test drops on its own to count the frees.
+  #[cfg(test)]
+  pub(crate) fn take_histories(&mut self) -> Vec<crate::history::Entries> {
+    std::mem::take(&mut self.histories)
+  }
+
   /// `thing` taken whole: dropped with the rest, wherever the holder sends it.
   pub fn whole(&mut self, thing: Box<dyn Any + Send>) {
     self.whole.push(thing);
@@ -107,6 +124,12 @@ impl Reapable for BTreeSet<String> {
     if !self.is_empty() {
       reaped.whole(Box::new(self));
     }
+  }
+}
+
+impl Reapable for crate::history::Entries {
+  fn reap(self, reaped: &mut Reaped) {
+    reaped.history(self);
   }
 }
 

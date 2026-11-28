@@ -93,6 +93,12 @@ impl<V: Clone> Dim<V> {
     self.root.contains_key(&self.nodes, key.as_ref())
   }
 
+  /// The value under `key`, to change in place: the nodes on its path made this map's own first, so no other map that
+  /// shares them sees the change ([`crate::ptrie::Ptrie::get_mut`]).
+  pub(crate) fn get_mut(&mut self, key: impl AsRef<[u8]>) -> Option<&mut V> {
+    self.root.get_mut(&mut self.nodes, key.as_ref(), &mut Plain)
+  }
+
   /// Sets `key` to `value`; the value it replaced.
   pub(crate) fn insert(&mut self, key: impl AsRef<[u8]>, value: V) -> Option<V> {
     self
@@ -962,7 +968,7 @@ impl Xattrs {
   }
 }
 
-/// A green's eight maps' holds being given back a node a step (A-575: a green retired from its lineage), each map's in
+/// A green's nine maps' holds being given back a node a step (A-575: a green retired from its lineage), each map's in
 /// its own arena ([`Arenas::release_step`]).
 #[derive(Debug, Default)]
 pub(crate) struct GreenRelease {
@@ -974,6 +980,8 @@ pub(crate) struct GreenRelease {
   pub(crate) hardlinks: Releasing,
   pub(crate) xattrs: Releasing,
   pub(crate) links_to: Releasing,
+  /// The content history's (A-920 unit 1).
+  pub(crate) content_history: Releasing,
 }
 
 impl GreenRelease {
@@ -988,13 +996,16 @@ impl GreenRelease {
       &self.hardlinks,
       &self.xattrs,
       &self.links_to,
+      &self.content_history,
     ]
     .iter()
     .all(|releasing| releasing.is_done())
   }
 }
 
-/// The arenas a lineage's greens share (module docs, "Arenas are lent"): one per dimension, and the files' blocks.
+/// The arenas a lineage's greens share (module docs, "Arenas are lent"): one per dimension, the files' blocks, and the
+/// content history's (A-920 unit 1: its keys and nodes the arena's runs and slots, so a retired member's history frees
+/// no key or tree node to the heap; only its entry lists go to the reaper).
 #[derive(Debug, Default)]
 pub(crate) struct Arenas {
   pub(crate) files: Nodes<Block>,
@@ -1006,6 +1017,7 @@ pub(crate) struct Arenas {
   pub(crate) hardlinks: Nodes<String>,
   pub(crate) xattrs: Nodes<Vec<u8>>,
   pub(crate) links_to: Nodes<BTreeSet<String>>,
+  pub(crate) content_history: Nodes<crate::history::Entries>,
 }
 
 impl Arenas {
@@ -1042,7 +1054,10 @@ impl Arenas {
         .release_step(&mut release.xattrs, &mut ReapValues(&mut *reaped))
       || self
         .links_to
-        .release_step(&mut release.links_to, &mut ReapValues(reaped))
+        .release_step(&mut release.links_to, &mut ReapValues(&mut *reaped))
+      || self
+        .content_history
+        .release_step(&mut release.content_history, &mut ReapValues(reaped))
   }
 
   /// The nodes walks of every dimension visited: what a branch must leave unmoved (A-534's non-vacuity count).
@@ -1056,6 +1071,7 @@ impl Arenas {
       self.hardlinks.visited(),
       self.xattrs.visited(),
       self.links_to.visited(),
+      self.content_history.visited(),
     ]
     .into_iter()
     .fold(0u64, u64::saturating_add)
@@ -1072,6 +1088,7 @@ impl Arenas {
       self.hardlinks.copied(),
       self.xattrs.copied(),
       self.links_to.copied(),
+      self.content_history.copied(),
     ]
     .into_iter()
     .fold(0u64, u64::saturating_add)
@@ -1088,6 +1105,7 @@ impl Arenas {
       self.hardlinks.live(),
       self.xattrs.live(),
       self.links_to.live(),
+      self.content_history.live(),
     ]
     .into_iter()
     .fold(0usize, usize::saturating_add)
@@ -1104,6 +1122,7 @@ impl Arenas {
       self.hardlinks.missing(),
       self.xattrs.missing(),
       self.links_to.missing(),
+      self.content_history.missing(),
     ]
     .into_iter()
     .fold(0u64, u64::saturating_add)

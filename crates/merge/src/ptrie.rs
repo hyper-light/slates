@@ -483,6 +483,32 @@ impl<V: Clone> Ptrie<V> {
     replaced
   }
 
+  /// The value under `key`, to change in place: every node on its path made this map's own first, as an insert makes
+  /// them ([`unique`]), so the change shows in no other map that shares them. A key the map does not hold copies
+  /// nothing.
+  pub fn get_mut<'a>(
+    &mut self,
+    nodes: &'a mut Nodes<V>,
+    key: &[u8],
+    holders: &mut impl Holders<V>,
+  ) -> Option<&'a mut V> {
+    let root = self.root?;
+    if !self.contains_key(nodes, key) {
+      return None;
+    }
+    let root = unique_path(nodes, root, key, holders);
+    self.root = Some(root);
+    let mut at = root;
+    let mut rest = key;
+    while let Some(first) = rest.first() {
+      let node = nodes.node(at)?;
+      let (_, child) = child_of(nodes, node, *first)?;
+      rest = rest.strip_prefix(nodes.labels.get(&nodes.node(child)?.label))?;
+      at = child;
+    }
+    nodes.node_mut(at)?.value.as_mut()
+  }
+
   /// Takes `key` out, its value back to the caller with its hold. A key the map does not hold copies nothing.
   pub fn remove(
     &mut self,
@@ -721,6 +747,31 @@ fn copy_of<V: Clone>(
   }
   hold_children(nodes, copy.children);
   copy
+}
+
+/// The node at `slot` and every node below it on `rest`'s path made the referrer's own ([`unique`]), each made child
+/// linked from its made parent: the path a change in place of `rest`'s value writes ([`Ptrie::get_mut`], which checks
+/// first that the map holds `rest`).
+fn unique_path<V: Clone>(
+  nodes: &mut Nodes<V>,
+  slot: Slot,
+  rest: &[u8],
+  holders: &mut impl Holders<V>,
+) -> Slot {
+  let slot = unique(nodes, slot, holders);
+  let Some(first) = rest.first().copied() else {
+    return slot;
+  };
+  let found = nodes
+    .node(slot)
+    .and_then(|node| child_of(nodes, node, first));
+  if let Some((index, child)) = found {
+    let skip = nodes.node(child).map_or(0, |node| node.label.len());
+    let below = rest.get(skip..).unwrap_or_default();
+    let child = unique_path(nodes, child, below, holders);
+    set_child(nodes, slot, index, child);
+  }
+  slot
 }
 
 /// Points the child at `index` of the node at `slot` at `child`: the node's slot is unique-made already, so the
@@ -1209,6 +1260,11 @@ mod tests {
       map: usize,
       key: Vec<u8>,
     },
+    Change {
+      map: usize,
+      key: Vec<u8>,
+      value: u32,
+    },
     Fork {
       map: usize,
     },
@@ -1242,6 +1298,7 @@ mod tests {
     prop_oneof![
       5 => (0..MAPS, key(), 0u32..64).prop_map(|(map, key, value)| Step::Insert { map, key, value }),
       2 => (0..MAPS, key()).prop_map(|(map, key)| Step::Remove { map, key }),
+      2 => (0..MAPS, key(), 0u32..64).prop_map(|(map, key, value)| Step::Change { map, key, value }),
       1 => (0..MAPS).prop_map(|map| Step::Fork { map }),
       1 => (0..MAPS).prop_map(|map| Step::Release { map }),
       1 => (0..MAPS, key(), 0..MAPS, key()).prop_map(|(from, src, to, dst)| Step::Graft { from, src, to, dst }),
@@ -1306,39 +1363,6 @@ mod tests {
     }
   }
 
-  /// The frees made on each thread of this test binary, so a test counts its own (A-920 unit 0).
-  mod counting {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
-
-    struct Counting;
-
-    std::thread_local! {
-      static FREES: Cell<u64> = const { Cell::new(0) };
-    }
-
-    /// The frees the calling thread has made so far.
-    pub(super) fn frees() -> u64 {
-      FREES.try_with(Cell::get).unwrap_or(0)
-    }
-
-    // SAFETY: every call is passed on to the system allocator unchanged; only a thread-local count is kept beside it.
-    unsafe impl GlobalAlloc for Counting {
-      unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller's contract, passed on.
-        unsafe { System.alloc(layout) }
-      }
-      unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let _ = FREES.try_with(|frees| frees.set(frees.get() + 1));
-        // SAFETY: the caller's contract, passed on.
-        unsafe { System.dealloc(ptr, layout) }
-      }
-    }
-
-    #[global_allocator]
-    static COUNTING: Counting = Counting;
-  }
-
   /// Shape: the paths of A-920's wide revision, whose retired member's release this test stands for.
   const WIDE_PATHS: usize = 9000;
 
@@ -1363,9 +1387,9 @@ mod tests {
     }
     let live = nodes.live();
     let mut releasing = map.releasing();
-    let before = counting::frees();
+    let before = crate::counting::frees();
     while nodes.release_step(&mut releasing, &mut Plain) {}
-    let freed = counting::frees() - before;
+    let freed = crate::counting::frees() - before;
     assert_eq!(nodes.live(), 0, "every node freed");
     assert!(
       freed <= u64::from(usize::BITS),
@@ -1507,8 +1531,8 @@ mod tests {
   proptest! {
     #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(400), ..ProptestConfig::default() }))]
 
-    /// A-534, A-586. Do: run generated histories of inserts, removes, forks, releases, grafts and cuts over several maps
-    /// sharing one arena. Expect: every map reads as its own copied ordered map would after every step (each key, the byte
+    /// A-534, A-586, A-920 unit 1 (a value changed in place). Do: run generated histories of inserts, removes, changes in
+    /// place, forks, releases, grafts and cuts over several maps sharing one arena. Expect: every map reads as its own copied ordered map would after every step (each key, the byte
     /// order, every prefix, the length), the tree's shape holds, a change to one map never shows in another, a graft into
     /// an occupied prefix is refused and changes nothing, a cut takes exactly the keys that start with its prefix (held as
     /// a subtree of that many values, nothing when none does), and once every map is released the arena holds no node and
@@ -1546,6 +1570,23 @@ mod tests {
               prop_assert_eq!(removed, held);
               if let Some(removed) = removed {
                 counted.freed(removed);
+              }
+            }
+          }
+          Step::Change { map, key, value } => {
+            if let Some((trie, model)) = maps[map].as_mut() {
+              let copied = nodes.copied();
+              let held = model.get_mut(&key);
+              // A key the map does not hold copies nothing; a held one is changed in this map alone.
+              match (trie.get_mut(&mut nodes, &key, &mut counted), held) {
+                (Some(slot), Some(modeled)) => {
+                  counted.freed(*slot);
+                  counted.put(value);
+                  *slot = value;
+                  *modeled = value;
+                }
+                (None, None) => prop_assert_eq!(nodes.copied(), copied, "changing absent {:?} copied a node", key),
+                (found, modeled) => prop_assert!(false, "{:?} found {:?}, the model {:?}", key, found, modeled),
               }
             }
           }
