@@ -56,10 +56,11 @@ use std::mem::{size_of, take};
 use std::ops::Bound;
 
 use crate::content::{ContentId, ContentRefused, ContentStore, Stored};
-use crate::filter::{KeyFilter, KeyHash};
+use crate::filter::{KeyFilter, KeyHash, bytes_per_key_most};
 use crate::rule::Compaction;
 use crate::table::{
-  RowRef, TABLE_FRAME_BYTES, TableBuilder, TableRefused, TableView, encode_body, row_bytes,
+  RowRef, TABLE_FRAME_BYTES, TableBuilder, TableRefused, TableView, body_len, encode_body,
+  row_bytes, row_len,
 };
 
 /// Shape: what one tail row costs the budget beyond its key's and its body's bytes: its boxed key and boxed body, the
@@ -80,6 +81,19 @@ pub const TIER_BASE: u64 = TIER_RATIO.saturating_add(1);
 /// Shape: what one table of a run costs the budget beside the store beyond its first key's bytes: its fence's record.
 /// Derived from the type.
 pub const FENCE_SLOT_BYTES: usize = size_of::<Fence>();
+
+/// Derived: the most bytes one sealed row holds in the store, its key `key_len` bytes and its body naming `contents`
+/// contents with a `payload_len`-byte payload: its bytes in a table ([`crate::table::row_len`] of its key and of
+/// [`crate::table::body_len`]) and its key's bits in its run's filter at the most a key takes
+/// (`crate::filter::bytes_per_key_most`). A run's fences and its filter's rounding to words are a table's and a run's,
+/// not a row's, and a tail row's slot ([`TAIL_SLOT_BYTES`]) is the tail's, a window's rows at most: neither grows with
+/// the rows, so neither is here. `None` past the integers. What a repository's held cost a row is read from (C5's `R`,
+/// `slates_git::store::rows::held_bytes_per_object`).
+pub fn held_bytes_per_row(key_len: usize, contents: usize, payload_len: usize) -> Option<u64> {
+  let body = body_len(contents, payload_len)?;
+  let row = u64::try_from(row_len(key_len, body)?).ok()?;
+  row.checked_add(bytes_per_key_most())
+}
 
 /// Why the index refused a request. Each leaves the index and the store as they were, unless it says otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

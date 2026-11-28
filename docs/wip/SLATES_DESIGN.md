@@ -58825,7 +58825,11 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > the `Repository` keeps the first such miss (`Repository::waiting`), and `vcs_store::read_through::bring_back` reads the
 > window from the node's store (`StoreHandle::piece`, the payload by its BLAKE3, `ContentStore::object_identity`) and puts
 > it back (`ContentStore::bring_back`); the driver takes the step again (w-git's, in upload and the encoding). The
-> let-go after a landing itself is item 2b, owed.
+> let-go after a landing itself is item 2b: lifted 2026-11-27 (`vcs_store::LANDED_LET_GO`, GAPS "LIFTED"), once every
+> reader that meets a let-go window stops and has it brought back, and an unlanded push's windows are pinned against
+> another push's let-go of the same bytes (`ContentStore::pin_unlanded`). A warm restart keeps every window's
+> published let-go number, a landed pack's too: the replay that reads a landed pack back lets its windows go again at
+> the image's numbers (`ContentStore::let_go_landed_again`), so no page of the Aways family moves (A-923).
 
 > **Status (2026-11-20, C5's store side: git's pack read from the store).** `crates/server/src/vcs_store/store_packs.rs`
 > (`StorePacks`): git's synchronous `PackSource::piece` over the store, which only its owner thread reads. An awaited
@@ -61669,8 +61673,8 @@ Applied in the same change to: `crates/git/src/store/packed.rs` (`PackSource::aw
 `away`), `crates/vcs/src/content.rs` (`away_window`, `object_identity`), `crates/server/src/vcs_store/read_through.rs`
 (`bring_back`), `crates/cli/tests/git_interop.rs` (the RSS test prints the memory gauges at each reading), the C5 status.
 
-Status: built 2026-11-22, macOS arm64 (focused tests); the drivers' wait (w-git) and the let-go after a landing (item 2b)
-owed.
+Status: built 2026-11-22, macOS arm64 (focused tests); the drivers' wait (w-git) built since, and the let-go after a
+landing (item 2b) lifted 2026-11-27 (GAPS "LIFTED").
 - Why: a landed push's pack is held in RAM twice, its staged copy on the repository's shard and its windows homed in
   the region (61.3 and 53.9 MB for git/git v2.0.0), while the node's store holds it durably as the changeset's
   `Payload`. Letting the windows go (A-724 piece 4's `Kept::Away`) needs a read that meets one to bring it back: a let-go

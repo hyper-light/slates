@@ -10400,7 +10400,12 @@ mod tests {
     assert!(windows.len() > 1, "the file past one window");
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut daemon = first;
+    // The landed pack's windows the replays let go again at their numbers, all rounds told: the rule's non-vacuity.
+    let mut packs_let_go_again = 0u64;
     for _round in 0..3 {
+      // The file's own windows, which the remake brings back; any other let go is a landed pack's (the flip's).
+      let file: std::collections::BTreeSet<slates_vcs::ContentId> =
+        windows.iter().copied().collect();
       let windows = windows.clone();
       let mut picked = seed;
       let published = daemon
@@ -10438,21 +10443,46 @@ mod tests {
               count(crate::vcs_store::paths::REMAKE_BROUGHT_BACK),
               count(crate::vcs_store::paths::REMAKE_KEPT),
             ),
+            (
+              count(crate::vcs_store::REPLAY_LET_GO_AGAIN),
+              count(crate::vcs_store::REPLAY_KEPT_AGAIN),
+            ),
           )
         })
         .unwrap();
       assert!(published.1.is_some(), "the predecessor's green has a map");
-      // Every window let go is the file's, so the remake brought each back to hash it and let each go again.
-      let away = published
-        .0
-        .as_ref()
-        .map_or(0, |(aways, _, _)| u64::try_from(aways.len()).unwrap());
+      // The file's windows let go the remake brought back to hash the file and let go again; the landed pack's,
+      // which the flip let go, the replay read back and let go again at the numbers the image had them at
+      // (`vcs_store::let_go_owed_now`, main 01a20182's ruling of 2026-11-27 17:22), none renumbered.
+      let (file_away, pack_away) = published.0.as_ref().map_or((0, 0), |(aways, _, _)| {
+        let file_away = aways
+          .iter()
+          .filter(|(at, _)| file.contains(&at.identity))
+          .count();
+        let pack_away = aways.len() - file_away;
+        (
+          u64::try_from(file_away).unwrap(),
+          u64::try_from(pack_away).unwrap(),
+        )
+      });
       assert_eq!(
         seen,
-        (published.0, 0, 0, published.1, (away, 0)),
+        (
+          published.0,
+          0,
+          0,
+          published.1,
+          (file_away, 0),
+          (pack_away, 0)
+        ),
         "the store whole as published, none refused, the green's map made again to the same tree"
       );
+      packs_let_go_again += pack_away;
     }
+    assert!(
+      packs_let_go_again > 0,
+      "a landed pack's window let go again at its number by a replay"
+    );
     let blob_back = blob.clone();
     let after = daemon
       .observe(daemon.shards.first().copied(), move |state| {

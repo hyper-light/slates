@@ -91,11 +91,17 @@ pub(crate) const REMADE: &str = "vcs_paths.remade";
 /// The status count of the steps refused (module docs), each logged with its green and why.
 pub(crate) const REFUSED: &str = "vcs_paths.refused";
 /// The status count of windows let go that a recovery's remake brought back from its green's own bytes to read a head
-/// file whole ([`put_file_whole`]; A-767 C1, main's ruling of 2026-11-27 11:09), each let go again at its end.
+/// file whole ([`put_file`]; A-767 C1, main's ruling of 2026-11-27 11:09), each let go again at its end.
 pub(crate) const REMAKE_BROUGHT_BACK: &str = "vcs_paths.remake_brought_back";
 /// The status count of those not let go again, held in RAM until their pack's next let-go: zero in every correct use,
 /// each logged.
 pub(crate) const REMAKE_KEPT: &str = "vcs_paths.remake_kept";
+/// The status count of windows let go that a live build brought back from its green's own bytes to read a file whole
+/// ([`put_file`]; the live whole builds' sibling of A-767 C1, main's order of 2026-11-27), each let go again at the
+/// build's end ([`let_go_again_after_build`]).
+pub(crate) const BUILD_BROUGHT_BACK: &str = "vcs_paths.build_brought_back";
+/// The status count of those not let go again: zero in every correct use, each logged.
+pub(crate) const BUILD_KEPT: &str = "vcs_paths.build_kept";
 /// Counter: a git green's file held by its content-plane object alone, which git's map does not read (A-760 (b) 4b;
 /// never met, since only a Subversion green holds a file so). Format: a counter name in the status report.
 pub(crate) const NAMED_UNREAD: &str = "vcs_paths.named_unread";
@@ -363,7 +369,7 @@ pub(crate) async fn remake_green_sliced(
         repository,
         (key, version),
         Plan::Put(entries),
-        held,
+        (held, &mut brought),
       ),
       Err(refused) => {
         give_back(lent.stores, repository, &held);
@@ -380,7 +386,7 @@ pub(crate) async fn remake_green_sliced(
   let_go_brought_again(state, green, brought, slices).await;
 }
 
-/// Lets go again, a unit of the recovery's slices each, the windows [`put_file_whole`] brought back for a remake, each
+/// Lets go again, a unit of the recovery's slices each, the windows [`put_file`] brought back for a remake, each
 /// at its own let-go number (`ContentStore::let_go_again`; A-767 C1, main's ruling of 2026-11-27 11:09): the warm
 /// restart keeps out of RAM what its predecessor let go, and the image's aways are as it published them. Counted
 /// [`REMAKE_BROUGHT_BACK`]; one not let go again counted [`REMAKE_KEPT`] and logged.
@@ -398,26 +404,75 @@ async fn let_go_brought_again(
     u64::try_from(brought.len()).unwrap_or(u64::MAX),
   );
   for at in brought {
-    let refused = super::within_budget(state, 0, |stores| match stores.content_mut() {
-      Some(content) => content.let_go_again(at).err(),
-      None => Some(slates_vcs::LetGoRefused::NotHeld),
-    });
-    if let Some(refused) = refused {
-      state.count(REMAKE_KEPT, 1);
-      slates_machine::log_line!(
-        "slates-server: git map of green {}: a window its remake brought back was not let go again ({refused:?}): held \
-         until its pack's next let-go",
-        crate::verbs::hex_of(&green.bytes)
-      );
-    }
+    let_go_one_again(state, (green, "remake"), at, REMAKE_KEPT);
     slices
       .unit_done("a remade file's window let go again")
       .await;
   }
 }
 
+/// Puts `bytes` as an object, each of its windows the store holds let go brought back from them, which are the caller's
+/// own and the object's (`ContentStore::put_object_whole`), so the object reads whole by its identity; each brought
+/// back noted in `brought` at its let-go number (`ContentStore::aways_of`, taken before the put), for the caller to let
+/// go again once it has read what it must ([`let_go_again_after_build`]). The one bring-back from bytes in hand for
+/// every reader of a git green's files that must read one whole (main's ruling of 2026-11-27 16:06): the map's builds
+/// and remakes here, and the git make's (`commits`).
+pub(crate) fn put_object_bringing_back(
+  content: &mut ContentStore,
+  bytes: &[u8],
+  brought: &mut Vec<slates_vcs::AwayAt>,
+) -> Result<ContentId, slates_vcs::ContentRefused> {
+  let away = content.aways_of(&ContentId::of(bytes));
+  let id = content.put_object_whole(bytes)?;
+  brought.extend(away);
+  Ok(id)
+}
+
+/// Lets go again the windows a live build of `green` brought back to read its files whole ([`put_file`]), each at its
+/// own let-go number, at the build's end, refused or kept: what was let go stays out of RAM. Counted
+/// [`BUILD_BROUGHT_BACK`]; one not let go again counted [`BUILD_KEPT`] and logged. In the build's last unit, which
+/// hashed the files whose windows these are already, so it adds no work of another order to it.
+pub(crate) fn let_go_again_after_build(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  brought: Vec<slates_vcs::AwayAt>,
+) {
+  if brought.is_empty() {
+    return;
+  }
+  state.count(
+    BUILD_BROUGHT_BACK,
+    u64::try_from(brought.len()).unwrap_or(u64::MAX),
+  );
+  for at in brought {
+    let_go_one_again(state, (green, "build"), at, BUILD_KEPT);
+  }
+}
+
+/// Lets go again the window `at` names, which `green`'s `what` (a remake or a build) brought back; refused, counted
+/// `kept` and logged, the window held until its pack's next let-go.
+fn let_go_one_again(
+  state: &mut ShardState,
+  (green, what): (DbVolumeId, &str),
+  at: slates_vcs::AwayAt,
+  kept: &'static str,
+) {
+  let refused = super::within_budget(state, 0, |stores| match stores.content_mut() {
+    Some(content) => content.let_go_again(at).err(),
+    None => Some(slates_vcs::LetGoRefused::NotHeld),
+  });
+  if let Some(refused) = refused {
+    state.count(kept, 1);
+    slates_machine::log_line!(
+      "slates-server: git map of green {}: a window its {what} brought back was not let go again ({refused:?}): held \
+       until its pack's next let-go",
+      crate::verbs::hex_of(&green.bytes)
+    );
+  }
+}
+
 /// Puts each of `files` in `repository`'s content store, a recovery's unit each, noting each hold and each window let
-/// go that a put brought back ([`put_file_whole`]).
+/// go that a put brought back ([`put_file`]).
 async fn put_sliced(
   stores: &mut VcsStores,
   repository: RepositoryId,
@@ -428,7 +483,7 @@ async fn put_sliced(
   let mut entries = BTreeMap::new();
   for (name, file) in files {
     let (content, _) = stores.git(repository).ok_or(StepRefused::NoMap)?;
-    entries.insert(name, put_file_whole(content, &file, (held, brought))?);
+    entries.insert(name, put_file(content, &file, (held, brought))?);
     slices.unit_done("a path index's put").await;
   }
   Ok(entries)
@@ -502,6 +557,7 @@ fn step(
   let repository = git_repository_of(state, green)?;
   let key = super::green_key(green);
   let source = branch_source(state, green);
+  let mut brought = Vec::new();
   let (answer, charged_whole) = {
     let ShardState {
       store,
@@ -516,7 +572,7 @@ fn step(
     stepped(
       &engine,
       (store, vcs_stores),
-      repository,
+      (repository, &mut brought),
       (key, version, whole),
       source,
     )
@@ -524,6 +580,7 @@ fn step(
   if !charged_whole {
     state.count(super::CHARGE_SHORT, 1);
   }
+  let_go_again_after_build(state, green, brought);
   Some(answer)
 }
 
@@ -677,11 +734,12 @@ pub(crate) fn git_repository_of(state: &ShardState, green: DbVolumeId) -> Option
 }
 
 /// Plans the step, lends the stores its room, makes and keeps the map, and settles (module docs): the answer, and
-/// whether the shard took every byte the step left held.
+/// whether the shard took every byte the step left held; each window let go its puts brought back noted in `brought`,
+/// for the caller to let go again ([`let_go_again_after_build`]).
 fn stepped(
   engine: &Green,
   (store, stores): (&mut Store, &mut VcsStores),
-  repository: RepositoryId,
+  (repository, brought): (RepositoryId, &mut Vec<slates_vcs::AwayAt>),
   (key, version, whole): (u64, u64, bool),
   source: Option<(u64, u64)>,
 ) -> (Result<Stepped, StepRefused>, bool) {
@@ -692,7 +750,13 @@ fn stepped(
   super::lend(store, stores, plan_bytes(&plan));
   let answer = {
     let lent = super::Lent::new(&mut *store, stores);
-    made(lent.stores, repository, (key, version), plan)
+    made_holding(
+      lent.stores,
+      repository,
+      (key, version),
+      plan,
+      (Vec::new(), brought),
+    )
   };
   let charged_whole = super::settle_in(store, stores);
   (answer, charged_whole)
@@ -902,24 +966,16 @@ fn plan_bytes(plan: &Plan<'_>) -> u64 {
 
 /// Makes the planned map and trees and keeps them as the green's (module docs): each content put, the map made, the
 /// trees made over the same files, both roots kept in place of the ones before, then every other hold the step took
-/// given back, whatever the answer, so a refused step leaves the store as it was.
-fn made(
-  stores: &mut VcsStores,
-  repository: RepositoryId,
-  (key, version): (u64, u64),
-  plan: Plan<'_>,
-) -> Result<Stepped, StepRefused> {
-  made_holding(stores, repository, (key, version), plan, Vec::new())
-}
-
-/// [`made`], with the holds `held` the plan's files took already (a sliced build's, [`Plan::Put`]) given back with the
-/// step's own.
+/// given back, whatever the answer, so a refused step leaves the store as it was. The holds `held` the plan's files
+/// took already (a sliced build's, [`Plan::Put`]) are given back with the step's own; each window let go a put brought
+/// back is noted in `brought` beside those noted already, for the caller to let go again once the trees are made
+/// ([`let_go_again_after_build`]).
 fn made_holding(
   stores: &mut VcsStores,
   repository: RepositoryId,
   (key, version): (u64, u64),
   plan: Plan<'_>,
-  mut held: Vec<ContentId>,
+  (mut held, brought): (Vec<ContentId>, &mut Vec<slates_vcs::AwayAt>),
 ) -> Result<Stepped, StepRefused> {
   let Some((content, git)) = stores.git(repository) else {
     give_back(stores, repository, &held);
@@ -935,7 +991,7 @@ fn made_holding(
     give_back(stores, repository, &held);
     return Err(StepRefused::NoMap);
   };
-  let answer = make(content, (paths, trees), plan, &mut held);
+  let answer = make(content, (paths, trees), plan, (&mut held, brought));
   if let Ok(Some((root, tree_root, _))) = &answer {
     let made = Head {
       version,
@@ -964,18 +1020,18 @@ fn made_holding(
 /// when the green's map is of the version already.
 type Made = Option<(ContentId, ContentId, Stepped)>;
 
-/// [`made`]'s work: the new map and trees ([`Made`]); every other hold it takes is noted in `held`, for [`made`] to give
-/// back.
+/// [`made_holding`]'s work: the new map and trees ([`Made`]); every other hold it takes is noted in `held`, for
+/// [`made_holding`] to give back, and each window let go its puts brought back in `brought`.
 fn make(
   content: &mut ContentStore,
   (paths, trees): (&mut GreenPaths, &mut GreenTrees),
   plan: Plan<'_>,
-  held: &mut Vec<ContentId>,
+  (held, brought): (&mut Vec<ContentId>, &mut Vec<slates_vcs::AwayAt>),
 ) -> Result<Made, StepRefused> {
   match plan {
     Plan::Kept => Ok(None),
     Plan::Change(before, files) => {
-      let change = put_change(content, files, held)?;
+      let change = put_change(content, files, (held, brought))?;
       let root = paths
         .apply(content, Some(before.root), &change)
         .map_err(StepRefused::Paths)?;
@@ -983,7 +1039,7 @@ fn make(
       with_trees(made, root, held).map(|(root, trees)| Some((root, trees, Stepped::Derived)))
     }
     Plan::Whole(files) => {
-      let entries = put_whole(content, files, held)?;
+      let entries = put_whole(content, files, (held, brought))?;
       build_whole(content, (paths, trees), &entries, held)
     }
     Plan::Put(entries) => build_whole(content, (paths, trees), &entries, held),
@@ -1034,67 +1090,51 @@ fn with_trees(
   }
 }
 
-/// Puts each file of a change, noting each hold, and gives the change the map reads.
+/// Puts each file of a change, noting each hold and each window let go a put brought back, and gives the change the map
+/// reads.
 fn put_change(
   content: &mut ContentStore,
   files: Vec<(Vec<u8>, Option<GitFile<'_>>)>,
-  held: &mut Vec<ContentId>,
+  (held, brought): (&mut Vec<ContentId>, &mut Vec<slates_vcs::AwayAt>),
 ) -> Result<Change, StepRefused> {
   let mut change = Change::new();
   for (name, file) in files {
     let entry = file
-      .map(|file| put_file(content, &file, held))
+      .map(|file| put_file(content, &file, (&mut *held, &mut *brought)))
       .transpose()?;
     change.insert(name, entry);
   }
   Ok(change)
 }
 
-/// Puts each file of the whole head, noting each hold, and gives the files the map is built of.
+/// Puts each file of the whole head, noting each hold and each window let go a put brought back, and gives the files
+/// the map is built of.
 fn put_whole(
   content: &mut ContentStore,
   files: Vec<(Vec<u8>, GitFile<'_>)>,
-  held: &mut Vec<ContentId>,
+  (held, brought): (&mut Vec<ContentId>, &mut Vec<slates_vcs::AwayAt>),
 ) -> Result<BTreeMap<Vec<u8>, Entry>, StepRefused> {
   let mut entries = BTreeMap::new();
   for (name, file) in files {
-    entries.insert(name, put_file(content, &file, held)?);
+    entries.insert(name, put_file(content, &file, (&mut *held, &mut *brought))?);
   }
   Ok(entries)
 }
 
-/// [`put_file`] for a recovery's remake ([`remake_green_sliced`]): each window of the file the store holds let go
-/// (restored let go from the image, A-767 C1) brought back from the file's bytes, which are the green's own
+/// Puts `file`'s bytes as an object, as the git store keeps a blob's (A-664 part 2), noting the hold: each window of it
+/// the store holds let go brought back from the file's bytes, which are the green's own
 /// (`ContentStore::put_object_whole`), so its trees hash the file whole, and noted in `brought` to be let go again once
-/// the remake ends ([`let_go_brought_again`]). Since 11168fab3 a let-go window refused the remake's hash
-/// (`TreesRefused::Content(Missed)`), and the recovery freed the file (t_c1); before it, the hash ran over the short
-/// file and named another tree.
-fn put_file_whole(
+/// the map is made ([`let_go_brought_again`] for a recovery's remake, [`let_go_again_after_build`] for a live build).
+/// A warm restart leaves a head file so (A-767 C1: the image restores its windows let go). Since 11168fab3 a let-go
+/// window refused the hash (`TreesRefused::Content(Missed)`): a recovery's remake, which then freed the file (t_c1,
+/// fixed in d4e851d61), and a live build of every kind, whole, over a change or sliced (main's order of 2026-11-27);
+/// before it, the hash ran over the short file and named another tree.
+fn put_file(
   content: &mut ContentStore,
   file: &GitFile<'_>,
   (held, brought): (&mut Vec<ContentId>, &mut Vec<slates_vcs::AwayAt>),
 ) -> Result<Entry, StepRefused> {
-  let away = content.aways_of(&ContentId::of(&file.bytes));
-  let id = content
-    .put_object_whole(&file.bytes)
-    .map_err(StepRefused::Content)?;
-  held.push(id);
-  brought.extend(away);
-  Ok(Entry {
-    class: file.class.class(),
-    content: id,
-  })
-}
-
-/// Puts `file`'s bytes as an object, as the git store keeps a blob's (A-664 part 2), noting the hold.
-fn put_file(
-  content: &mut ContentStore,
-  file: &GitFile<'_>,
-  held: &mut Vec<ContentId>,
-) -> Result<Entry, StepRefused> {
-  let id = content
-    .put_object(&file.bytes)
-    .map_err(StepRefused::Content)?;
+  let id = put_object_bringing_back(content, &file.bytes, brought).map_err(StepRefused::Content)?;
   held.push(id);
   Ok(Entry {
     class: file.class.class(),

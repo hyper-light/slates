@@ -676,6 +676,21 @@ pub(crate) fn keep_landed(daemon: &crate::Daemon) {
   });
 }
 
+/// [`keep_landed`] on the shard serving `partition`: for a test whose repository lives on a partition other than the
+/// first shard's (a two-shard daemon's edge tests, `name_on_the_repositorys_partition`).
+pub(crate) fn keep_landed_on(daemon: &crate::Daemon, partition: usize) {
+  crate::daemon::observe_at(daemon, partition, |_| {
+    crate::vcs_store::KEEP_LANDED.with(|keep| keep.set(true));
+  });
+}
+
+/// [`keep_landed`] from a history running as a task on the shard ([`run_on_stored_shard`], `made_pushing`): the shard
+/// it runs on keeps its pushes' landed packs resident, for a history whose observations read through the store's own
+/// synchronous calls, which bring no let-go window back.
+pub(crate) fn keep_landed_here() {
+  crate::vcs_store::KEEP_LANDED.with(|keep| keep.set(true));
+}
+
 /// [`crate::daemon::audit_daemon_of`] holding a fresh store: the store first, so a test binding both as
 /// `let (_store, daemon)` drops the daemon first.
 pub(crate) fn audit_daemon_of_stored(shards: u16) -> (TestStore, crate::Daemon) {

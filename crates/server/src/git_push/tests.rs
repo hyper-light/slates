@@ -5143,6 +5143,10 @@ async fn stepped_drive(repository: RepositoryId, request: &[u8]) -> Result<Vec<V
 fn t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once()
 {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  // Kind (3) (main's rule of 2026-11-27 10:33): its fetches are answered in one synchronous step, which cannot await a
+  // bring-back, and its point is each object brought once; the fetch over let-go windows:
+  // `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+  crate::test_store::keep_landed(&daemon);
   let (objects, named) = r16_history();
   assert_eq!(
     named.len(),
