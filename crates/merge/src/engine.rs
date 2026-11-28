@@ -1468,7 +1468,7 @@ pub struct Green {
   /// them), a running total: what [`Green::history_bytes`] leaves out, as the current values were always left out.
   specials: Dim<SpecialNode>,
   special_history: ValueHistory<SpecialNode>,
-  special_changed: BTreeMap<String, u64>,
+  special_changed: last_changes::Published<String>,
   dirs: Dim<()>,
   modes: Dim<u32>,
   symlinks: Dim<String>,
@@ -1495,11 +1495,14 @@ pub struct Green {
   /// fold floor meets it too. One entry a path the green ever removed a file at, as `last_changed`
   /// holds one a path it ever changed; empty in a green restored from a checkpoint or made as a
   /// branch, whose bases are never before its first version.
-  file_removed: BTreeMap<String, u64>,
-  mode_changed: BTreeMap<String, u64>,
-  symlink_changed: BTreeMap<String, u64>,
-  hardlink_changed: BTreeMap<String, u64>,
-  xattr_changed: BTreeMap<(String, String), u64>,
+  file_removed: last_changes::Published<String>,
+  mode_changed: last_changes::Published<String>,
+  symlink_changed: last_changes::Published<String>,
+  hardlink_changed: last_changes::Published<String>,
+  xattr_changed: last_changes::Published<(String, String)>,
+  /// The last changes the commit under way wrote, moved into the six maps above at its publish (A-752 part 3c U4,
+  /// [`last_changes`]): written, never read.
+  aside: last_changes::Aside,
   /// Every accepted increment's identity and the version it committed: the idempotency record a
   /// retry of an accepted submit is answered from. Bounded by the chain (one entry per committed
   /// version), which the partition caps in bytes; recovery rebuilds it by replaying the chain.
@@ -1526,6 +1529,9 @@ pub struct Green {
   /// Rejected results evicted or never retained for want of budget — the non-vacuity counter the
   /// bound's regression asserts.
   rejected_evicted: u64,
+  /// While a verdict is staged ([`Green::begin_staging`]), where each history it appends in place stood before its
+  /// first touch, so a refusal takes the stage's entries back (A-752 part 3c U1). None otherwise.
+  stage_marks: Option<Box<staging::Marks>>,
   history_current: usize,
   /// The bytes the IPC (special node) history retains beyond the current values, a running total: with the content
   /// history's chunks and lists less its current values, [`Green::history_bytes`].
@@ -1868,11 +1874,21 @@ impl Recorded for bool {
   }
 }
 
-/// A history's last entry: its version, and whether it records the key's removal. `None` for a key with no history.
-fn last_entry<T: Recorded>(history: Option<&Vec<(u64, T)>>) -> Option<(u64, bool)> {
+/// A history's latest entry at or below `at`: its version, and whether it records the key's removal. `None` for a key
+/// with none there. A reader names its version, the head (A-752 part 3c U0): an entry a commit appends before it
+/// publishes is above the head, and no reader at the head takes it for the head's; the commit's own reads name its
+/// version.
+fn last_entry<T: Recorded>(history: Option<&Vec<(u64, T)>>, at: u64) -> Option<(u64, bool)> {
   history
-    .and_then(|history| history.last())
+    .and_then(|history| entries_to(history, at).last())
     .map(|(version, value)| (*version, value.removed()))
+}
+
+/// A history's entries at or below `at`: the prefix a reader at version `at` reads (A-752 part 3c U0).
+fn entries_to<T>(history: &[(u64, T)], at: u64) -> &[(u64, T)] {
+  history
+    .get(..history.partition_point(|(recorded, _)| *recorded <= at))
+    .unwrap_or_default()
 }
 
 /// Where a file's bytes at a version are read from ([`Green::content_read`]).
@@ -2942,6 +2958,10 @@ struct CommitRun {
   changed: ChangedPaths,
   /// The version's change entries recorded so far, in path order.
   entries: Vec<ChangeEntry>,
+  /// The earlier entries its paths' change makes no longer their paths' last, each its version and path: marked at its
+  /// publish, so no reader at the head sees the walk change before the head does (A-752 part 3c U3). Bounded by the
+  /// paths it changed.
+  unmarked: Vec<(u64, String)>,
   phase: CommitPhase,
 }
 
@@ -3524,7 +3544,7 @@ impl Green {
 
   fn restore_mode(&mut self, changed: &crate::checkpoint::Changed<String, u32>) {
     self.place_mode(&changed.key, changed.value);
-    self.mode_changed.insert(changed.key.clone(), changed.at);
+    self.mode_changed.restore(changed.key.clone(), changed.at);
     self
       .mode_history
       .insert(changed.key.clone(), vec![(changed.at, changed.value)]);
@@ -3537,7 +3557,7 @@ impl Green {
     } else {
       (&mut self.hardlink_changed, &mut self.hardlink_history)
     };
-    changed_map.insert(changed.key.clone(), changed.at);
+    changed_map.restore(changed.key.clone(), changed.at);
     history.insert(
       changed.key.clone(),
       vec![(changed.at, changed.value.clone())],
@@ -3546,7 +3566,9 @@ impl Green {
 
   fn restore_special(&mut self, changed: &crate::checkpoint::Changed<String, SpecialNode>) {
     self.place_special(&changed.key, changed.value);
-    self.special_changed.insert(changed.key.clone(), changed.at);
+    self
+      .special_changed
+      .restore(changed.key.clone(), changed.at);
     self
       .special_history
       .insert(changed.key.clone(), vec![(changed.at, changed.value)]);
@@ -3555,7 +3577,7 @@ impl Green {
   fn restore_xattr(&mut self, changed: &crate::checkpoint::Changed<(String, String), Vec<u8>>) {
     let (path, name) = &changed.key;
     self.place_xattr(path, name, changed.value.as_deref());
-    self.xattr_changed.insert(changed.key.clone(), changed.at);
+    self.xattr_changed.restore(changed.key.clone(), changed.at);
     self.xattr_history.insert(
       changed.key.clone(),
       vec![(changed.at, changed.value.clone())],
@@ -3787,7 +3809,8 @@ impl Green {
     current: Option<&T>,
     version: u64,
   ) -> Option<T> {
-    match self.covered_since(path, last_entry(history)) {
+    let head = self.head();
+    match self.covered_since(path, last_entry(history, head), head) {
       Some(since) if version >= since => current.cloned(),
       Some(_) => history.and_then(|history| history_at(history, version)),
       None => value_at(history, current, version),
@@ -3807,7 +3830,7 @@ impl Green {
   /// Whether a directory stood at `path` at `version`, by the module's one history rule and its copies (A-534, A-586).
   fn dir_at(&self, path: &str, version: u64) -> bool {
     let history = self.dir_history.get(path);
-    match self.covered_since(path, last_entry(history)) {
+    match self.covered_since(path, last_entry(history, self.head()), self.head()) {
       Some(since) if version >= since => self.dirs.contains_key(path),
       Some(_) => history.is_some_and(|history| present_at(history, version)),
       None => match history {
@@ -4505,23 +4528,30 @@ impl Green {
       Some((at, passed)) if at > version => (at, passed),
       _ => (version.saturating_add(1), 0),
     };
-    self.changes.range(start..).flat_map(move |(at, entries)| {
-      let from = if *at == start {
-        entries.partition_point(|entry| usize::try_from(entry.index).unwrap_or(usize::MAX) < skip)
-      } else {
-        0
-      };
-      entries
-        .get(from..)
-        .unwrap_or_default()
-        .iter()
-        .map(move |entry| ChangeAt {
-          version: *at,
-          index: usize::try_from(entry.index).unwrap_or(usize::MAX),
-          path: &entry.path,
-          last: entry.last,
-        })
-    })
+    // At or below the head (A-752 part 3c U0): a version a commit records before it publishes is above it.
+    let head = self.head();
+    let below = move |(at, _): &(&u64, &Vec<ChangeEntry>)| **at <= head;
+    self
+      .changes
+      .range(start..)
+      .take_while(below)
+      .flat_map(move |(at, entries)| {
+        let from = if *at == start {
+          entries.partition_point(|entry| usize::try_from(entry.index).unwrap_or(usize::MAX) < skip)
+        } else {
+          0
+        };
+        entries
+          .get(from..)
+          .unwrap_or_default()
+          .iter()
+          .map(move |entry| ChangeAt {
+            version: *at,
+            index: usize::try_from(entry.index).unwrap_or(usize::MAX),
+            path: &entry.path,
+            last: entry.last,
+          })
+      })
   }
 
   /// The changed paths commits put in a tree set of their own ([`Green::commit_tree_paths`]'s field, A-920 3m).
@@ -4939,7 +4969,8 @@ impl Green {
   /// the copy's version on), else the history's value in effect, else nowhere.
   fn content_read(&self, path: &str, version: u64) -> ContentRead<'_> {
     let history = self.content_history.get(path);
-    let covered = self.covered_since(path, last_entry(history));
+    let head = self.head();
+    let covered = self.covered_since(path, last_entry(history, head), head);
     if covered.is_some_and(|since| version >= since) {
       return ContentRead::Head;
     }
@@ -4956,7 +4987,8 @@ impl Green {
     else {
       return ContentRead::Absent;
     };
-    let latest = covered.is_none() && index.saturating_add(1) == history.len();
+    // The head's value is the latest at or below the head, never an entry above it (A-752 part 3c U0).
+    let latest = covered.is_none() && index.saturating_add(1) == entries_to(history, head).len();
     match history.get(index) {
       Some((_, Some(_))) if latest => ContentRead::Head,
       Some((_, Some(value))) => ContentRead::Value(value),
@@ -5130,9 +5162,9 @@ impl Green {
   /// version of the copy that gave them (A-586), so the change's value shares its runs as every later one does. A path
   /// whose history holds them, or with no bytes, records nothing, and neither does a change in its copy's own version.
   fn seed_content(&mut self, path: &str, version: u64) {
-    let own_last = last_entry(self.content_history.get(path));
+    let own_last = last_entry(self.content_history.get(path), version);
     let Some(since) = self
-      .seed_since(path, own_last)
+      .seed_since(path, own_last, version)
       .filter(|since| *since != version)
     else {
       return;
@@ -5300,7 +5332,14 @@ impl Green {
       return digest == head;
     }
     let history = self.content_history.get(path);
-    let Some(history) = history.filter(|_| self.covered_since(path, last_entry(history)).is_none())
+    let at = self.head();
+    let Some(history) = history
+      .filter(|_| {
+        self
+          .covered_since(path, last_entry(history, at), at)
+          .is_none()
+      })
+      .map(|history| entries_to(history, at))
     else {
       // No history, or a copy's value (A-586), whose history's last value is no head's: the bytes at the base against
       // the head's (at the base they are the head's, unless a copy since replaced them).
@@ -6410,6 +6449,7 @@ impl Green {
 
   /// Keep the superseded IPC value for pinned readers before setting the new value.
   fn commit_special(&mut self, path: String, node: SpecialNode, version: u64) {
+    self.mark_special(&path);
     let at = self.seed_of(&self.special_history, &path, &path, version);
     seed(
       &mut self.special_history,
@@ -6422,7 +6462,7 @@ impl Green {
         .special_history_bytes
         .saturating_add(SPECIAL_NODE_BYTES);
     }
-    self.special_changed.insert(path.clone(), version);
+    self.aside.special(path.clone(), version);
     self
       .special_history
       .entry(path)
@@ -6432,8 +6472,9 @@ impl Green {
 
   /// Remove the live inode and its metadata while retaining their historical values.
   fn remove_special(&mut self, path: String, version: u64) {
-    self.file_removed.insert(path.clone(), version);
+    self.aside.removed(path.clone(), version);
     // The inode's own key is marked by its effect; its mode and attributes go with it and are marked here.
+    self.mark_special(&path);
     let at = self.seed_of(&self.special_history, &path, &path, version);
     seed(
       &mut self.special_history,
@@ -6446,7 +6487,7 @@ impl Green {
         .special_history_bytes
         .saturating_add(SPECIAL_NODE_BYTES);
     }
-    self.special_changed.insert(path.clone(), version);
+    self.aside.special(path.clone(), version);
     self.drop_metadata(&path, version);
     self
       .special_history
@@ -6460,6 +6501,7 @@ impl Green {
   /// directory's and link's once nothing stands at the path, and a replaced tree's (A-626).
   fn drop_metadata(&mut self, path: &str, version: u64) {
     let owned = path.to_owned();
+    self.mark_mode(path);
     let at = self.seed_of(&self.mode_history, &owned, path, version);
     seed(
       &mut self.mode_history,
@@ -6471,7 +6513,7 @@ impl Green {
       self
         .identity_dirty
         .insert(IdentityKey::Mode(path.to_owned()));
-      self.mode_changed.insert(path.to_owned(), version);
+      self.aside.mode(path.to_owned(), version);
       self
         .mode_history
         .entry(path.to_owned())
@@ -6486,12 +6528,13 @@ impl Green {
     for (name, value) in attributes {
       self.xattrs.remove(path, &name);
       let key = (path.to_owned(), name);
+      self.mark_xattr(&key);
       let at = self.seed_of(&self.xattr_history, &key, path, version);
       seed(&mut self.xattr_history, &key, Some(Some(value)), at);
       self
         .identity_dirty
         .insert(IdentityKey::Xattr(key.0.clone(), key.1.clone()));
-      self.xattr_changed.insert(key.clone(), version);
+      self.aside.xattr(key.clone(), version);
       self
         .xattr_history
         .entry(key)
@@ -6510,7 +6553,7 @@ impl Green {
     version: u64,
   ) -> Seed {
     Seed {
-      since: self.seed_since(path, last_entry(history.get(key))),
+      since: self.seed_since(path, last_entry(history.get(key), version), version),
       version,
     }
   }
@@ -6592,6 +6635,40 @@ impl Green {
   /// Takes `run` on an effect, a staged removal or a staged file at a time, at least one, until `spent` says its caller's
   /// slice is spent: whether it has ended (its delta pushed and its changes recorded). No count of units: a file set
   /// costs many times a removal, so the caller's clock, not a number, ends the slice.
+  /// Publishes an ended commit run of increment `id` (A-752 part 3c U1): its delta pushed, which moves the head to its
+  /// version, and the increment accepted as it, both last, so no reader at the head saw any of it before. Its version.
+  fn publish_run(&mut self, run: &mut CommitRun, id: [u8; 32]) -> u64 {
+    // Each earlier entry its paths' change made no longer their last: a seek in that version's sorted list (A-752 part
+    // 3c U3).
+    for (earlier, path) in core::mem::take(&mut run.unmarked) {
+      if let Some(entries) = self.changes.get_mut(&earlier)
+        && let Ok(at) = entries.binary_search_by(|entry| entry.path.as_str().cmp(&path))
+        && let Some(entry) = entries.get_mut(at)
+      {
+        entry.last = false;
+      }
+    }
+    core::mem::take(&mut self.aside).publish_into(last_changes::Targets {
+      removed: &mut self.file_removed,
+      modes: &mut self.mode_changed,
+      symlinks: &mut self.symlink_changed,
+      hardlinks: &mut self.hardlink_changed,
+      xattrs: &mut self.xattr_changed,
+      specials: &mut self.special_changed,
+    });
+    self.deltas.push(core::mem::take(&mut run.delta));
+    self.accepted.insert(id, run.version);
+    run.version
+  }
+
+  /// Notes, while a verdict is staged, where `path`'s mode history stood before the stage first touched it (A-752 part
+  /// 3c U1): what a refusal truncates it back to.
+  fn mark_mode(&mut self, path: &str) {
+    if let Some(marks) = self.stage_marks.as_mut() {
+      staging::note(&mut marks.modes, &self.mode_history, path.to_owned());
+    }
+  }
+
   fn commit_step(&mut self, run: &mut CommitRun, spent: &mut dyn FnMut() -> bool) -> bool {
     loop {
       match run.phase {
@@ -6666,10 +6743,8 @@ impl Green {
           self.drop_metadata(&path, run.version);
         }
       }
-      None => {
-        self.deltas.push(core::mem::take(&mut run.delta));
-        run.phase = CommitPhase::Links;
-      }
+      // The version's delta waits for the commit's publish, which moves the head last ([`Green::publish_run`]).
+      None => run.phase = CommitPhase::Links,
     }
   }
 
@@ -6729,15 +6804,8 @@ impl Green {
     let bytes = change_bytes(&path);
     match self.latest_change.insert(path.clone(), version) {
       None => self.changes_bytes = self.changes_bytes.saturating_add(bytes),
-      // The earlier version's entry is no longer the path's last: a seek in that version's sorted list.
-      Some(earlier) => {
-        if let Some(entries) = self.changes.get_mut(&earlier)
-          && let Ok(at) = entries.binary_search_by(|entry| entry.path.as_str().cmp(&path))
-          && let Some(entry) = entries.get_mut(at)
-        {
-          entry.last = false;
-        }
-      }
+      // The earlier version's entry is no longer the path's last, marked so at the publish ([`Green::publish_run`]).
+      Some(earlier) => run.unmarked.push((earlier, path.clone())),
     }
     self.changes_bytes = self.changes_bytes.saturating_add(bytes);
     let index = u32::try_from(run.entries.len()).unwrap_or(u32::MAX);
@@ -6848,6 +6916,7 @@ impl Green {
       // 0 by the one history rule, A-534; since a copy, A-586), then its change.
       Effect::MakeDir(path) => {
         let stood = self.dirs.contains_key(&path).then_some(true);
+        self.mark_dir(&path);
         let at = self.seed_of(&self.dir_history, &path, &path, version);
         seed(&mut self.dir_history, &path, stood, at);
         self.dirs.insert(&path, ());
@@ -6858,9 +6927,10 @@ impl Green {
           .push((version, true));
       }
       Effect::RemoveDir(path) => {
-        self.file_removed.insert(path.clone(), version);
+        self.aside.removed(path.clone(), version);
         staged.emptied.push(path.clone());
         let stood = self.dirs.contains_key(&path).then_some(true);
+        self.mark_dir(&path);
         let at = self.seed_of(&self.dir_history, &path, &path, version);
         seed(&mut self.dir_history, &path, stood, at);
         self.dirs.remove(&path);
@@ -6871,6 +6941,7 @@ impl Green {
           .push((version, false));
       }
       Effect::Mode(path, mode) => {
+        self.mark_mode(&path);
         let at = self.seed_of(&self.mode_history, &path, &path, version);
         seed(
           &mut self.mode_history,
@@ -6879,7 +6950,7 @@ impl Green {
           at,
         );
         self.modes.insert(&path, mode);
-        self.mode_changed.insert(path.clone(), version);
+        self.aside.mode(path.clone(), version);
         self
           .mode_history
           .entry(path)
@@ -6888,13 +6959,13 @@ impl Green {
       }
       Effect::Symlink(path, target) => self.set_symlink(path, Some(target), version),
       Effect::RemoveSymlink(path) => {
-        self.file_removed.insert(path.clone(), version);
+        self.aside.removed(path.clone(), version);
         staged.emptied.push(path.clone());
         self.set_symlink(path, None, version);
       }
       Effect::Hardlink(path, target) => self.set_hardlink(path, Some(target), version),
       Effect::RemoveHardlink(path) => {
-        self.file_removed.insert(path.clone(), version);
+        self.aside.removed(path.clone(), version);
         staged.emptied.push(path.clone());
         self.set_hardlink(path, None, version);
       }
@@ -6907,6 +6978,7 @@ impl Green {
 
   /// Sets or removes (`None`) a symbolic link at `version`, its history recording the change.
   fn set_symlink(&mut self, path: String, target: Option<String>, version: u64) {
+    self.mark_symlink(&path);
     let at = self.seed_of(&self.symlink_history, &path, &path, version);
     seed(
       &mut self.symlink_history,
@@ -6922,7 +6994,7 @@ impl Green {
         self.symlinks.remove(&path);
       }
     }
-    self.symlink_changed.insert(path.clone(), version);
+    self.aside.symlink(path.clone(), version);
     self
       .symlink_history
       .entry(path)
@@ -6933,6 +7005,7 @@ impl Green {
   /// Sets or removes (`None`) a hard link at `version`, the reverse map of links with it and its history recording the
   /// change.
   fn set_hardlink(&mut self, path: String, target: Option<String>, version: u64) {
+    self.mark_hardlink(&path);
     let at = self.seed_of(&self.hardlink_history, &path, &path, version);
     seed(
       &mut self.hardlink_history,
@@ -6945,7 +7018,7 @@ impl Green {
       None => self.hardlinks.remove(&path),
     };
     relink(&mut self.links_to, &path, old.as_deref(), target.as_deref());
-    self.hardlink_changed.insert(path.clone(), version);
+    self.aside.hardlink(path.clone(), version);
     self
       .hardlink_history
       .entry(path)
@@ -6960,9 +7033,10 @@ impl Green {
       None => self.xattrs.remove(&key.0, &key.1),
     }
     .map(Some);
+    self.mark_xattr(&key);
     let at = self.seed_of(&self.xattr_history, &key, &key.0, version);
     seed(&mut self.xattr_history, &key, before, at);
-    self.xattr_changed.insert(key.clone(), version);
+    self.aside.xattr(key.clone(), version);
     self
       .xattr_history
       .entry(key)
@@ -6978,7 +7052,7 @@ impl Green {
     self.content.remove(path);
     self.supersede_latest(path);
     self.last_changed.insert(path.to_owned(), version);
-    self.file_removed.insert(path.to_owned(), version);
+    self.aside.removed(path.to_owned(), version);
     self.push_content(path.to_owned(), version, None);
   }
 
@@ -6994,7 +7068,7 @@ impl Green {
     // A rename onto a file removes it (A-612); onto a path this commit emptied, the removal is recorded already. A file
     // this version's own copy brought and its increment edited (A-586) was no other file: nothing was removed.
     if renamed && self.content.contains_key(&path) && !self.copied_in(&path, version) {
-      self.file_removed.insert(path.clone(), version);
+      self.aside.removed(path.clone(), version);
     }
     // The value this one supersedes stays in the history, sharing every run the new one kept (W2): what the history
     // gains is the bytes the new value added, its piece list, and whatever the old one held that the new one does not,
@@ -7839,8 +7913,7 @@ impl Green {
     if !self.commit_step(commit, spent) {
       return CommitStep::More;
     }
-    let version = commit.version;
-    self.accepted.insert(run.id, version);
+    let version = self.publish_run(commit, run.id);
     CommitStep::Committed(version, core::mem::take(applied))
   }
 
@@ -7987,8 +8060,7 @@ impl Green {
       return self.apply_effects_step(run, inc, applied, spent);
     };
     if self.commit_step(commit, spent) {
-      let version = commit.version;
-      self.accepted.insert(run.id, version);
+      let version = self.publish_run(commit, run.id);
       ApplyStep::Done(version)
     } else {
       ApplyStep::More
@@ -8430,6 +8502,7 @@ impl Green {
             at: [0; 3],
           },
           entries: Vec::new(),
+          unmarked: Vec::new(),
           phase: CommitPhase::Effects,
         });
         return Some(ApplyStep::More);
@@ -8756,9 +8829,15 @@ impl Green {
         .saturating_mul(2)
         .saturating_mul(crate::history::PIECE_BYTES)
     };
+    let head = self.head();
     let history = self.content_history.get(path);
-    let covered = self.covered_since(path, last_entry(history)).is_some();
-    let Some(history) = history.filter(|_| !covered) else {
+    let covered = self
+      .covered_since(path, last_entry(history, head), head)
+      .is_some();
+    let Some(history) = history
+      .filter(|_| !covered)
+      .map(|history| entries_to(history, head))
+    else {
       // A file held by its object's name alone retains no bytes here.
       return self
         .content
@@ -8807,7 +8886,8 @@ impl Green {
 
   /// The content and IPC histories' retained bytes **recounted** from the histories themselves — the oracle
   /// the running totals are checked against (balanced accounting): the distinct chunks the content values name and
-  /// their piece lists, less the current values, and every earlier IPC node.
+  /// their piece lists, less the current values, and every earlier IPC node. Every entry held, bounded by no version (A-752
+  /// part 3c U0): it audits the running totals, which charge an entry a commit appends as it appends it.
   pub fn history_bytes_recounted(&self) -> usize {
     let values = || {
       self
@@ -8830,7 +8910,8 @@ impl Green {
       .saturating_add(self.special_history_recounted())
   }
 
-  /// The IPC history's earlier nodes, recounted: every node but each path's latest.
+  /// The IPC history's earlier nodes, recounted: every node but each path's latest. Every entry held, bounded by no
+  /// version (A-752 part 3c U0): it audits the running totals, which charge an appended entry as it is appended.
   fn special_history_recounted(&self) -> usize {
     self
       .special_history
@@ -9196,15 +9277,19 @@ impl Green {
   /// the head's, and the verdict's head value is the file's bytes either way. A path whose value is a copy's (A-586), or
   /// whose latest value is a removal or names the block already, is left as it is.
   fn rename_alone(&mut self, path: &str) {
+    let head = self.head();
     let history = self.content_history.get(path);
-    if self.covered_since(path, last_entry(history)).is_some() {
+    if self
+      .covered_since(path, last_entry(history, head), head)
+      .is_some()
+    {
       return;
     }
     let Some(block) = self.content.block_of(path) else {
       return;
     };
     let Some(latest) = history
-      .and_then(|history| history.last())
+      .and_then(|history| entries_to(history, head).last())
       .and_then(|(_, value)| value.as_ref())
     else {
       return;
@@ -9757,6 +9842,18 @@ mod copy_restate_tests;
 
 #[cfg(test)]
 mod head_under_tests;
+
+// A held verdict staged a unit a step and published whole (A-752 part 3c).
+mod staging;
+// Each key's last change, written by a commit aside and moved in at its publish (A-752 part 3c U4).
+mod last_changes;
+pub use staging::{Staging, StagingStep};
+
+#[cfg(test)]
+mod head_bound_tests;
+
+#[cfg(test)]
+mod publish_tests;
 
 #[cfg(test)]
 mod tests {

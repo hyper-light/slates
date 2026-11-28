@@ -1382,8 +1382,8 @@ mod tests {
   fn a_released_map_of_a_wide_revisions_paths_frees_no_label_or_child_list_to_the_heap() {
     let mut nodes: Nodes<u32> = Nodes::default();
     let mut map = Ptrie::new();
-    for (at, key) in tree_paths(WIDE_PATHS).iter().enumerate() {
-      map.insert(&mut nodes, key, at as u32, &mut Plain);
+    for (at, key) in (0u32..).zip(&tree_paths(WIDE_PATHS)) {
+      map.insert(&mut nodes, key, at, &mut Plain);
     }
     let live = nodes.live();
     let mut releasing = map.releasing();
@@ -1405,15 +1405,15 @@ mod tests {
     let mut nodes: Nodes<u32> = Nodes::default();
     let keys = tree_paths(WIDE_PATHS);
     let mut first = Ptrie::new();
-    for (at, key) in keys.iter().enumerate() {
-      first.insert(&mut nodes, key, at as u32, &mut Plain);
+    for (at, key) in (0u32..).zip(&keys) {
+      first.insert(&mut nodes, key, at, &mut Plain);
     }
     let bytes = nodes.run_bytes();
     let (reused_before, bumped, _) = nodes.run_counts();
     first.release(&mut nodes, &mut Plain);
     let mut again = Ptrie::new();
-    for (at, key) in keys.iter().enumerate() {
-      again.insert(&mut nodes, key, at as u32, &mut Plain);
+    for (at, key) in (0u32..).zip(&keys) {
+      again.insert(&mut nodes, key, at, &mut Plain);
     }
     let (reused, bumped_after, _) = nodes.run_counts();
     assert!(bumped > 0, "the first making took runs");
@@ -1441,22 +1441,7 @@ mod tests {
   fn labels_at_the_inline_boundary_round_trip_through_insert_fork_and_remove() {
     for len in BOUNDARY {
       let mut nodes: Nodes<u32> = Nodes::default();
-      let mut map = Ptrie::new();
-      let mut model = BTreeMap::new();
-      let base = vec![b'a'; len];
-      for tail in 0u8..8 {
-        let mut key = base.clone();
-        key.push(b'0' + tail);
-        for split in [0, len / 2, len] {
-          let key: Vec<u8> = key[split.min(key.len())..]
-            .iter()
-            .chain(&base)
-            .copied()
-            .collect();
-          map.insert(&mut nodes, &key, u32::from(tail), &mut Plain);
-          model.insert(key, u32::from(tail));
-        }
-      }
+      let (mut map, model) = boundary_map(&mut nodes, len);
       let listed: Vec<(Vec<u8>, u32)> =
         map.iter(&nodes).map(|(key, value)| (key, *value)).collect();
       assert_eq!(
@@ -1467,26 +1452,7 @@ mod tests {
           .collect::<Vec<_>>(),
         "len {len}"
       );
-      let mut fork = map.fork(&mut nodes);
-      for key in model.keys() {
-        fork.insert(&mut nodes, key, u32::MAX, &mut Plain);
-      }
-      for (key, value) in &model {
-        assert_eq!(
-          map.get(&nodes, key),
-          Some(value),
-          "the original at len {len}"
-        );
-        assert_eq!(
-          fork.get(&nodes, key),
-          Some(&u32::MAX),
-          "the fork at len {len}"
-        );
-      }
-      for key in model.keys() {
-        assert_eq!(fork.remove(&mut nodes, key, &mut Plain), Some(u32::MAX));
-      }
-      assert!(fork.is_empty(&nodes), "the fork emptied at len {len}");
+      let mut fork = forked_changed_and_emptied(&mut nodes, &map, &model, len);
       assert_eq!(map.len(&nodes), model.len());
       if let Some(root) = map.root {
         checked(&nodes, root, true);
@@ -1495,6 +1461,61 @@ mod tests {
       map.release(&mut nodes, &mut Plain);
       assert_eq!(nodes.live(), 0);
     }
+  }
+
+  /// The map the inline-boundary test starts from, with its ordered model: for each of eight tails, a key of `len`
+  /// bytes and the tail, taken from three split points and followed by the `len` bytes again, so the keys share
+  /// prefixes and their labels split at and around the boundary of a label's two forms.
+  fn boundary_map(nodes: &mut Nodes<u32>, len: usize) -> Modeled {
+    let mut map = Ptrie::new();
+    let mut model = BTreeMap::new();
+    let base = vec![b'a'; len];
+    for tail in 0u8..8 {
+      let mut key = base.clone();
+      key.push(b'0' + tail);
+      for split in [0, len / 2, len] {
+        let key: Vec<u8> = key[split.min(key.len())..]
+          .iter()
+          .chain(&base)
+          .copied()
+          .collect();
+        map.insert(nodes, &key, u32::from(tail), &mut Plain);
+        model.insert(key, u32::from(tail));
+      }
+    }
+    (map, model)
+  }
+
+  /// The inline-boundary test's fork: every key of `model` changed in a fork of `map`, the original read as `model`
+  /// and the fork as the change after it, then every key removed from the fork. Returns the fork, empty, for the test
+  /// to release after it checks the original.
+  fn forked_changed_and_emptied(
+    nodes: &mut Nodes<u32>,
+    map: &Ptrie<u32>,
+    model: &BTreeMap<Vec<u8>, u32>,
+    len: usize,
+  ) -> Ptrie<u32> {
+    let mut fork = map.fork(nodes);
+    for key in model.keys() {
+      fork.insert(nodes, key, u32::MAX, &mut Plain);
+    }
+    for (key, value) in model {
+      assert_eq!(
+        map.get(nodes, key),
+        Some(value),
+        "the original at len {len}"
+      );
+      assert_eq!(
+        fork.get(nodes, key),
+        Some(&u32::MAX),
+        "the fork at len {len}"
+      );
+    }
+    for key in model.keys() {
+      assert_eq!(fork.remove(nodes, key, &mut Plain), Some(u32::MAX));
+    }
+    assert!(fork.is_empty(nodes), "the fork emptied at len {len}");
+    fork
   }
 
   /// A-920 unit 0's node growth, stated (main's ruling of 2026-11-28 00:38). Do: measure a node's bytes and count a
@@ -1509,8 +1530,8 @@ mod tests {
     for n in [WIDE_PATHS, 100_000] {
       let mut nodes: Nodes<u32> = Nodes::default();
       let mut map = Ptrie::new();
-      for (at, key) in tree_paths(n).iter().enumerate() {
-        map.insert(&mut nodes, key, at as u32, &mut Plain);
+      for (at, key) in (0u32..).zip(&tree_paths(n)) {
+        map.insert(&mut nodes, key, at, &mut Plain);
       }
       eprintln!(
         "NODE n={n}: {} nodes of {} bytes ({} bytes a label, {} a run), {} bytes of nodes, {} bytes of runs",
