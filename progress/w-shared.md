@@ -813,3 +813,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - a494ebac8: the holder answers CatchingUp (kind 12) to a newer-configuration record; the barrier counts each (holder, version, generation) once; install_on_copy ahead of the walk.
 - Stall red 2/3 locally; the remaining red (a build at no turn) is now logged. Units 21/21 + 66/66; fleet 8/8.
 - Next: main's x16; then bound the kept-v1 reships to a holder answering Behind (9 a run).
+
+## 2026-11-27 20:18 PST: A-936 replay half written (local, uncommitted)
+- Main x16 at 69fbc8de0: stall red 16/16, a914 15/16 (run 2, region reads on a dead unsuspected home, 1 s each).
+- (a) written: rebuild_steps + Under::replayed in slices_done. Its red is not deterministic (b held most names locally; one read delayed); asked main for (i) or (ii).
+- Hook added: Daemon::delay_region_reads. Kept-v1 Behind: single digits per run (3, 9).
