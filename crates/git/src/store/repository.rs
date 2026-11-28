@@ -382,7 +382,9 @@ pub(crate) enum CommitPoint {
   Records,
   /// The landing map's runs charged.
   Landings,
-  /// The stage's fork adopted into the index.
+  /// The stage's fork adopted into the index: refused only by the test's hook, since a current fork's adoption charges
+  /// nothing a budget could refuse ([`Repository::adopted`]).
+  #[cfg(test)]
   Adopt,
 }
 
@@ -2643,7 +2645,9 @@ const PEELED_BYTES: usize = size_of::<(u64, (u64, usize))>();
 /// Derived: what one run of the landing map charges the store: its key and its value, four words.
 const LANDING_BYTES: usize = size_of::<(u64, (u64, u64, u64))>();
 
-/// For each commit some green's head names, by its position, those greens.
+/// For each commit some green's head names, by its position, those greens: the shape the store's oracle compares
+/// ([`CommitState`]).
+#[cfg(test)]
 type HeadMap = BTreeMap<u64, BTreeSet<u64>>;
 
 /// A tree's entries that are objects of this repository: name, whether a subtree, id.
