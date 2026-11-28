@@ -395,6 +395,113 @@ fn last_changes_given_up_after(works: &[Changes], turns: u64) -> Result<bool, St
   Ok(staged)
 }
 
+/// Two greens given every path and `works` whole, the second never read since, so its identity holds every key the
+/// works changed unfolded (A-579): the serial twin, folded at its head, and the green a stage runs on.
+fn twins_unfolded(works: &[Changes]) -> (Green, Green) {
+  (
+    submitted_in_every_dimension(works),
+    submitted_in_every_dimension(works),
+  )
+}
+
+/// The identity a reader reads of `green` at its head, folding what is owed ([`Green::head_identity`]), with the fold's
+/// bookkeeping after it.
+fn identity_read(green: &mut Green) -> String {
+  let identity = green.head_identity();
+  format!("{} {identity:?} {:?}", green.head(), green.identity_folded)
+}
+
+/// Stages `inc`'s accepted verdict on `staged` one unit a step, a reader folding its identity between every two steps
+/// from the `from`th on (its first fold the first to meet the stage's in-place writes, so no earlier read drains the
+/// backlog for the stage), each read held to `at_head` (the serial twin's at the head before the stage), then publishes
+/// it: its version, none for any other judgment, and whether a read was made.
+fn identity_unseen(
+  staged: &mut Green,
+  inc: &Increment,
+  (at_head, from): (&str, u64),
+) -> Result<(Option<u64>, bool), String> {
+  let Judgment::Accepted(held) = staged.judge(inc) else {
+    return Ok((None, false));
+  };
+  let mut staging = staged.begin_staging(held);
+  let mut read_once = false;
+  loop {
+    let stepped = staged.staging_step(&mut staging, &mut || true);
+    if staging.units() > from {
+      read_once = true;
+      let read = identity_read(staged);
+      if read != at_head {
+        return Err(format!(
+          "a reader's fold saw the stage at unit {}: {read} against {at_head}",
+          staging.units()
+        ));
+      }
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  Ok((
+    staged.publish(staging).map(|(version, _)| version),
+    read_once,
+  ))
+}
+
+/// [`identity_unseen`] on fresh twins of a green given `before` whole, for `last`, the reader's first fold after the
+/// `from`th step: whether a read was made (`false` once `from` is past the stage's steps).
+fn identity_unseen_from(before: &[Changes], last: &Changes, from: u64) -> Result<bool, String> {
+  let (mut serial, mut staged) = twins_unfolded(before);
+  let at_head = identity_read(&mut serial);
+  let inc = work_in_every_dimension(&serial, last, u64::MAX);
+  let (version, read) = identity_unseen(&mut staged, &inc, (&at_head, from))?;
+  let (outcome, _) = serial.submit_resolved(&inc);
+  let accepted = match outcome {
+    super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+    _ => None,
+  };
+  if version != accepted {
+    return Err(format!("staged {version:?}, serial {accepted:?}"));
+  }
+  let (staged_read, serial_read) = (identity_read(&mut staged), identity_read(&mut serial));
+  if staged_read != serial_read {
+    return Err(format!(
+      "published {staged_read} against the serial twin's {serial_read}"
+    ));
+  }
+  Ok(read)
+}
+
+/// Gives up the stage of `works`' last work after `turns` steps on the unfolded twin of a green given the others, a
+/// reader folding between its steps: whether it finished within its turns, refused where the identity a reader reads
+/// after the refusal is not the serial twin's at the head.
+fn identity_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let (mut serial, mut staged) = twins_unfolded(before);
+  let at_head = identity_read(&mut serial);
+  let inc = work_in_every_dimension(&staged, last, u64::MAX);
+  let Judgment::Accepted(held) = staged.judge(&inc) else {
+    return Ok(true);
+  };
+  let mut staging = staged.begin_staging(held);
+  for _ in 0..turns {
+    if let StagingStep::Staged = staged.staging_step(&mut staging, &mut || true) {
+      return Ok(true);
+    }
+  }
+  staged.abandon_staging(staging);
+  let read = identity_read(&mut staged);
+  if read != at_head {
+    return Err(format!(
+      "a stage given up after {turns} turns left the identity at {read} against {at_head}"
+    ));
+  }
+  Ok(false)
+}
+
 /// The works [`proptest`] generates: one to eight, each of one to four changes.
 fn works() -> impl Strategy<Value = Vec<Changes>> {
   prop::collection::vec(
@@ -545,6 +652,75 @@ proptest! {
           break;
         }
       }
+    }
+  }
+
+  /// A-752 part 3c U5 (the identity, main 01a20182's ruling of 2026-11-28 02:46). Do: give the serial twin and the
+  /// staged green every path and the generated works but the last whole, the staged one never read, so its identity
+  /// owes the keys those works changed (a key the last work changes again among them); fold the serial twin at its head;
+  /// stage the last work's verdict on the other one unit a step, a reader folding its identity between every two
+  /// steps from the first, the second and so on (on fresh twins each time, so a fold first meets the stage after its
+  /// in-place writes); publish it, and give the serial twin the last work whole. Expect every read between the steps the serial
+  /// twin's at the head before the stage (its sum and its fold's bookkeeping), and after the publish the serial twin's
+  /// at the new head. Red before: the commit marked its keys dirty and took their entries out of the sum in place, so a
+  /// reader's fold took the stage's changes into the sum before the head moved; and, with the marks aside but the
+  /// published backlog not drained first, a reader's first fold after the stage wrote a key that backlog held
+  /// recomputed it from the stage's in-place writes.
+  #[test]
+  fn a_readers_fold_between_a_staged_verdicts_turns_reads_the_identity_at_the_head(steps in works()) {
+    let Some((last, before)) = steps.split_last() else {
+      return Ok(());
+    };
+    for from in 0u64.. {
+      if !identity_unseen_from(before, last, from).map_err(TestCaseError::fail)? {
+        break;
+      }
+    }
+  }
+
+  /// A-752 part 3c U5 (the identity, a refusal at every turn). Do: as above, the stage given up after every turn, a
+  /// reader folding between its steps. Expect the identity a reader reads after the refusal the serial twin's at the
+  /// head. Red before: a refusal left the stage's keys dirty and their entries out of the sum.
+  #[test]
+  fn a_stage_given_up_at_any_turn_leaves_the_identity_as_it_was(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if identity_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+}
+
+/// A-752 part 3c U5's move case (main 01a20182's check of 2026-11-28 02:47: a key's fold may read a partner). Do: on the
+/// serial twin and the staged green, every path made; version 2 renames `a` onto `e`, left unfolded on the staged one;
+/// version 3 makes `a` again, staged one unit a step, a reader folding the identity between every two steps from the
+/// first, the second and so on (on fresh twins each time); then published, and the serial twin given it whole. Expect every read between the steps the serial twin's at version 2,
+/// and after the publish its at version 3.
+#[test]
+fn a_readers_fold_between_turns_reads_a_moved_keys_partner_as_at_the_head() {
+  for from in 0u64.. {
+    let (mut serial, mut staged) = (submitted(&[]), submitted(&[]));
+    for green in [&mut serial, &mut staged] {
+      let inc = Work::default()
+        .naming(OpKind::Rename, "e", "a")
+        .at(green.head(), 7);
+      let _ = green.submit_resolved(&inc);
+    }
+    let at_head = identity_read(&mut serial);
+    let inc = Work::default().create("a", b"again").at(serial.head(), 8);
+    let (version, read) = identity_unseen(&mut staged, &inc, (&at_head, from)).unwrap();
+    let (outcome, _) = serial.submit_resolved(&inc);
+    assert!(
+      matches!(outcome, super::Outcome::Accepted { .. }),
+      "{outcome:?}"
+    );
+    assert_eq!(version, Some(serial.head()));
+    assert_eq!(identity_read(&mut staged), identity_read(&mut serial));
+    if !read {
+      break;
     }
   }
 }
